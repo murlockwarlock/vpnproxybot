@@ -1,0 +1,42 @@
+# Environment
+.env
+.env.*
+!.env.example
+!.env.deploy.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Database
+*.db
+*.db-journal
+
+# Logs
+*.log
+
+# ChromaDB
+chroma_db/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+tmp/
+
+# SSH keys
+*.pem
+# Disaster recovery bundles / restored prod data
+ops/nl-stack/data/*
+!ops/nl-stack/data/.gitkeep
+ops/nl-stack/local-packages/
+*.tar.gz

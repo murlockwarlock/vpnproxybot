@@ -1,0 +1,62 @@
+from types import SimpleNamespace
+
+from bot.keyboards.client import payment_kb, tariffs_kb
+
+
+def _button_texts(markup) -> list[str]:
+    return [button.text for row in markup.inline_keyboard for button in row]
+
+
+def test_payment_kb_hides_telegram_pay_for_tariffs_below_70(monkeypatch):
+    monkeypatch.setattr("bot.keyboards.client.settings.telegram_payment_provider_token", "token")
+    monkeypatch.setattr("bot.keyboards.client.settings.yookassa_shop_id", "shop")
+    monkeypatch.setattr("bot.keyboards.client.settings.yookassa_secret_key", "secret")
+
+    markup = payment_kb(
+        tariff_id=1,
+        platform="ios",
+        stars_enabled=True,
+        user_balance=0,
+        tariff_price=59,
+    )
+
+    texts = _button_texts(markup)
+    assert "💳 Оплатить через Telegram Pay" not in texts
+    assert "⭐ Telegram Stars" in texts
+    assert "💳 Оплатить через YooKassa" in texts
+
+
+def test_payment_kb_shows_telegram_pay_for_tariffs_from_70(monkeypatch):
+    monkeypatch.setattr("bot.keyboards.client.settings.telegram_payment_provider_token", "token")
+
+    markup = payment_kb(
+        tariff_id=1,
+        platform="ios",
+        stars_enabled=False,
+        user_balance=0,
+        tariff_price=70,
+    )
+
+    texts = _button_texts(markup)
+    assert "💳 Оплатить через Telegram Pay" in texts
+
+
+def test_tariffs_kb_groups_by_family_and_sorts_by_price():
+    tariffs = [
+        SimpleNamespace(id=4, label="Базовый (90 дней)", days=90, price_rub=659, price_stars=0, tariff_type="VPN"),
+        SimpleNamespace(id=1, label="Лайт (1 месяц)", days=30, price_rub=95, price_stars=0, tariff_type="VPN"),
+        SimpleNamespace(id=3, label="Базовый (14 дней)", days=14, price_rub=125, price_stars=0, tariff_type="VPN"),
+        SimpleNamespace(id=2, label="Лайт (7 дней)", days=7, price_rub=23, price_stars=0, tariff_type="VPN"),
+    ]
+
+    texts = _button_texts(tariffs_kb(tariffs))
+
+    assert texts[:7] == [
+        "— Лайт —",
+        "Лайт (7 дней) - 23₽",
+        "Лайт (1 месяц) - 95₽",
+        "— Базовый —",
+        "Базовый (14 дней) - 125₽",
+        "Базовый (90 дней) - 659₽",
+        "◀️ Назад",
+    ]

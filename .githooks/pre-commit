@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+files=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$files" ] && exit 0
+
+blocked='(^|/)(\.env($|\.)|.*\.db(-wal|-shm|-journal)?$|.*\.tar\.gz$|.*\.pem$)'
+blocked_files=$(echo "$files" | grep -E "$blocked" | grep -vE '\.example$' || true)
+if [ -n "$blocked_files" ]; then
+  echo "ERROR: staged secrets/runtime artifacts are blocked:" >&2
+  echo "$blocked_files" >&2
+  exit 1
+fi
+
+secret_pattern='(BOT_TOKEN=[0-9]+:[A-Za-z0-9_-]{20,}|PASSWORD[[:space:]]*=[[:space:]]*["'"'"'`][^$<"'"'"'`][^"'"'"'`]+["'"'"'`]|SECRET_KEY[[:space:]]*=[[:space:]]*["'"'"'`][^$<"'"'"'`][^"'"'"'`]+["'"'"'`]|API_KEY[[:space:]]*=[[:space:]]*["'"'"'`][^$<"'"'"'`][^"'"'"'`]+["'"'"'`]|sshpass -p ["'"'"'][^$<][^"'"'"']+["'"'"'])'
+while IFS= read -r file; do
+  [ -f "$file" ] || continue
+  case "$file" in
+    *.example) continue ;;
+  esac
+  if git show ":$file" | grep -E "$secret_pattern" >/dev/null; then
+    echo "ERROR: possible secret staged in $file" >&2
+    echo "Move real secrets to .env.deploy / server env; keep only placeholders in git." >&2
+    exit 1
+  fi
+done <<< "$files"

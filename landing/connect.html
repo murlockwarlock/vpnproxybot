@@ -1,0 +1,808 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ускоритель интернета</title>
+  <meta name="description" content="Быстрое подключение ускорителя интернета: выберите устройство, установите приложение и вставьте свою ссылку.">
+  <style>
+    :root {
+      --bg: #f6efe5;
+      --bg-soft: #fffaf3;
+      --panel: rgba(255, 250, 243, 0.86);
+      --panel-strong: #fffdf9;
+      --text: #12212b;
+      --muted: #5c6c75;
+      --line: rgba(18, 33, 43, 0.12);
+      --brand: #0c8c8c;
+      --brand-deep: #0f5e63;
+      --accent: #f08a24;
+      --shadow: 0 18px 44px rgba(20, 44, 54, 0.14);
+      --radius-xl: 28px;
+      --radius-lg: 20px;
+      --radius-md: 16px;
+      --max: 1120px;
+      --font: "Manrope", "Avenir Next", "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--font);
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(240, 138, 36, 0.20), transparent 34%),
+        radial-gradient(circle at top right, rgba(12, 140, 140, 0.16), transparent 28%),
+        linear-gradient(180deg, #fff8ef 0%, #f7f0e7 50%, #f2eadf 100%);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(18, 33, 43, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(18, 33, 43, 0.03) 1px, transparent 1px);
+      background-size: 26px 26px;
+      mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.35), transparent 80%);
+    }
+
+    .page {
+      position: relative;
+      width: min(var(--max), calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 48px;
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 28px;
+      border: 1px solid rgba(255, 255, 255, 0.5);
+      border-radius: 32px;
+      background:
+        linear-gradient(135deg, rgba(255, 255, 255, 0.9), rgba(255, 249, 241, 0.82)),
+        linear-gradient(180deg, rgba(12, 140, 140, 0.06), transparent 50%);
+      box-shadow: var(--shadow);
+      animation: reveal-up 560ms ease-out both;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 220px;
+      height: 220px;
+      right: -72px;
+      top: -72px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(12, 140, 140, 0.2), transparent 66%);
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 14px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: rgba(18, 33, 43, 0.06);
+      color: var(--brand-deep);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      content: "";
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent), #ffd16f);
+      box-shadow: 0 0 0 6px rgba(240, 138, 36, 0.12);
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 10ch;
+      font-size: clamp(2.6rem, 6vw, 4.9rem);
+      line-height: 0.95;
+      letter-spacing: -0.05em;
+    }
+
+    .hero-copy {
+      max-width: 640px;
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: clamp(1rem, 2vw, 1.16rem);
+      line-height: 1.6;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+      gap: 18px;
+      align-items: end;
+      margin-top: 26px;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .chip {
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.62);
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text);
+      backdrop-filter: blur(12px);
+    }
+
+    .status-card {
+      padding: 18px;
+      border-radius: 22px;
+      background: linear-gradient(180deg, rgba(12, 140, 140, 0.12), rgba(255, 255, 255, 0.88));
+      border: 1px solid rgba(12, 140, 140, 0.18);
+    }
+
+    .status-label {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .status-value {
+      margin: 0;
+      font-size: 1.08rem;
+      font-weight: 800;
+      line-height: 1.45;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: minmax(0, 320px) minmax(0, 1fr);
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .panel {
+      padding: 22px;
+      border: 1px solid rgba(255, 255, 255, 0.64);
+      border-radius: var(--radius-xl);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+      animation: reveal-up 620ms ease-out both;
+    }
+
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 1.35rem;
+      letter-spacing: -0.03em;
+    }
+
+    .panel-copy {
+      margin: 0 0 16px;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .platform-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .platform-card {
+      width: 100%;
+      text-align: left;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 16px;
+      background: rgba(255, 255, 255, 0.75);
+      color: var(--text);
+      cursor: pointer;
+      transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease, background 180ms ease;
+    }
+
+    .platform-card:hover,
+    .platform-card:focus-visible {
+      outline: none;
+      transform: translateY(-2px);
+      border-color: rgba(12, 140, 140, 0.34);
+      box-shadow: 0 16px 30px rgba(14, 44, 60, 0.10);
+      background: rgba(255, 255, 255, 0.96);
+    }
+
+    .platform-card.active {
+      border-color: rgba(12, 140, 140, 0.56);
+      background: linear-gradient(180deg, rgba(12, 140, 140, 0.10), rgba(255, 255, 255, 0.95));
+      box-shadow: 0 18px 34px rgba(12, 94, 99, 0.12);
+    }
+
+    .platform-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: flex-start;
+      margin-bottom: 8px;
+    }
+
+    .platform-name {
+      font-size: 1rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+
+    .platform-badge {
+      flex-shrink: 0;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(18, 33, 43, 0.06);
+      color: var(--brand-deep);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .platform-note {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .guide-panel {
+      position: relative;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at top right, rgba(240, 138, 36, 0.16), transparent 28%),
+        linear-gradient(180deg, rgba(255, 253, 249, 0.92), rgba(255, 249, 241, 0.92));
+    }
+
+    .guide-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: flex-start;
+      margin-bottom: 18px;
+    }
+
+    .guide-kicker {
+      display: inline-block;
+      margin-bottom: 10px;
+      color: var(--brand-deep);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .guide-title {
+      margin: 0;
+      font-size: clamp(1.7rem, 3vw, 2.4rem);
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+    }
+
+    .guide-subtitle {
+      margin: 10px 0 0;
+      max-width: 600px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .guide-prompt {
+      padding: 10px 14px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.82);
+      border: 1px solid rgba(18, 33, 43, 0.08);
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .guide-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .button,
+    .button-ghost {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 52px;
+      padding: 0 18px;
+      border-radius: 16px;
+      text-decoration: none;
+      font-weight: 800;
+      transition: transform 180ms ease, box-shadow 180ms ease, background 180ms ease, border-color 180ms ease;
+      cursor: pointer;
+    }
+
+    .button {
+      border: none;
+      color: #fff;
+      background: linear-gradient(135deg, var(--brand), var(--brand-deep));
+      box-shadow: 0 14px 28px rgba(12, 94, 99, 0.22);
+    }
+
+    .button:hover,
+    .button:focus-visible,
+    .button-ghost:hover,
+    .button-ghost:focus-visible {
+      outline: none;
+      transform: translateY(-1px);
+    }
+
+    .button-ghost {
+      border: 1px solid var(--line);
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    .button[disabled],
+    .button-ghost[disabled] {
+      cursor: not-allowed;
+      opacity: 0.54;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .link-card {
+      padding: 18px;
+      border: 1px solid rgba(18, 33, 43, 0.08);
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.84);
+    }
+
+    .field-label {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .link-box {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .link-input {
+      width: 100%;
+      min-height: 54px;
+      padding: 0 16px;
+      border: 1px solid rgba(18, 33, 43, 0.12);
+      border-radius: 16px;
+      background: #fff;
+      color: var(--text);
+      font-size: 14px;
+      font-family: "SF Mono", "JetBrains Mono", "Menlo", monospace;
+    }
+
+    .helper-text,
+    .copy-state {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .copy-state {
+      min-height: 1.4em;
+      color: var(--brand-deep);
+      font-weight: 700;
+    }
+
+    .steps {
+      margin: 18px 0 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: 12px;
+      counter-reset: step;
+    }
+
+    .steps li {
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+      padding: 14px;
+      border: 1px solid rgba(18, 33, 43, 0.08);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    .steps li::before {
+      counter-increment: step;
+      content: counter(step);
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, rgba(240, 138, 36, 0.18), rgba(12, 140, 140, 0.18));
+      color: var(--text);
+      font-weight: 900;
+      font-size: 1rem;
+    }
+
+    .step-text {
+      color: var(--text);
+      line-height: 1.55;
+    }
+
+    .footnote {
+      margin: 18px 0 0;
+      padding: 16px 18px;
+      border-radius: 18px;
+      background: rgba(18, 33, 43, 0.05);
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    @keyframes reveal-up {
+      from {
+        opacity: 0;
+        transform: translateY(20px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (max-width: 960px) {
+      .hero-grid,
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .guide-head {
+        flex-direction: column;
+      }
+
+      h1 {
+        max-width: none;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .page {
+        width: min(var(--max), calc(100% - 20px));
+        padding-top: 18px;
+      }
+
+      .hero,
+      .panel {
+        padding: 18px;
+        border-radius: 24px;
+      }
+
+      .link-box {
+        grid-template-columns: 1fr;
+      }
+
+      .button,
+      .button-ghost {
+        width: 100%;
+      }
+
+      .guide-prompt {
+        white-space: normal;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <p class="eyebrow">Ускоритель интернета</p>
+      <h1>Подключение за минуту</h1>
+      <p class="hero-copy">
+        Выберите устройство, установите приложение и вставьте свою ссылку. Всё уже готово: нужно только добавить подписку и нажать кнопку подключения.
+      </p>
+      <div class="hero-grid">
+        <div class="chips">
+          <div class="chip">Подходит для Android, iPhone, Mac, Windows и TV</div>
+          <div class="chip">Одна ссылка для всех серверов</div>
+          <div class="chip">Понятная настройка без лишних шагов</div>
+        </div>
+        <div class="status-card">
+          <p class="status-label">Статус ссылки</p>
+          <p class="status-value" id="statusValue">Откройте персональную ссылку из бота, и страница подготовит всё автоматически.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="shell">
+      <aside class="panel">
+        <h2>Выберите устройство</h2>
+        <p class="panel-copy">
+          Нажмите на вашу платформу. Справа сразу откроется нужный гайд и ссылка на подходящее приложение.
+        </p>
+        <div class="platform-list" id="platformList"></div>
+      </aside>
+
+      <section class="panel guide-panel">
+        <div class="guide-head">
+          <div>
+            <span class="guide-kicker">Быстрый старт</span>
+            <h2 class="guide-title" id="guideTitle">Выберите платформу</h2>
+            <p class="guide-subtitle" id="guideSubtitle">
+              После выбора вы увидите короткую инструкцию и нужную кнопку для установки приложения.
+            </p>
+          </div>
+          <div class="guide-prompt" id="guidePrompt">Платформа не выбрана</div>
+        </div>
+
+        <div class="guide-actions">
+          <a class="button" id="downloadBtn" href="#" target="_blank" rel="noopener noreferrer" aria-disabled="true">Скачать приложение</a>
+          <button class="button-ghost" id="copyBtn" type="button" disabled>Скопировать ссылку</button>
+        </div>
+
+        <div class="link-card">
+          <p class="field-label">Ссылка для приложения</p>
+          <div class="link-box">
+            <input class="link-input" id="subscriptionInput" type="text" readonly value="Откройте страницу по персональной ссылке">
+            <button class="button-ghost" id="copyInlineBtn" type="button" disabled>Скопировать</button>
+          </div>
+          <p class="helper-text" id="helperText">
+            Если приложение попросит ссылку вручную, просто вставьте строку из поля выше.
+          </p>
+          <p class="copy-state" id="copyState"></p>
+        </div>
+
+        <ul class="steps" id="stepsList"></ul>
+
+        <div class="footnote">
+          Если вы уже пользовались приложением раньше, обычно достаточно обновить или заново импортировать ту же ссылку. Если что-то не подключается, откройте поддержку из бота и отправьте скриншот экрана.
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const platformMeta = {
+      android: {
+        cardTitle: "Android",
+        badge: "Быстрый старт",
+        note: "Оптимально для телефонов и планшетов на Android.",
+        title: "Android",
+        subtitle: "Самый простой сценарий: установить Happ из Google Play, вставить свою ссылку и включить подключение.",
+        prompt: "Google Play",
+        appLabel: "Открыть в Google Play",
+        appUrl: "https://play.google.com/store/apps/details?id=com.happproxy&hl=ru",
+        steps: [
+          "Установите приложение Happ из Google Play.",
+          "Нажмите на этой странице «Скопировать ссылку».",
+          "Откройте Happ и нажмите на кнопку добавления профиля.",
+          "Выберите импорт по ссылке или вставьте ссылку вручную.",
+          "Сохраните профиль, выберите сервер и включите подключение."
+        ]
+      },
+      ios: {
+        cardTitle: "iPhone / iPad",
+        badge: "App Store",
+        note: "Подходит для iPhone и iPad. Всё делается в одном приложении.",
+        title: "iPhone и iPad",
+        subtitle: "На iOS удобнее всего использовать Happ из App Store. После установки останется только импортировать ссылку.",
+        prompt: "App Store",
+        appLabel: "Открыть App Store",
+        appUrl: "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973",
+        steps: [
+          "Установите Happ из App Store.",
+          "Скопируйте ссылку с этой страницы.",
+          "Откройте Happ и нажмите на плюс для добавления новой подписки.",
+          "Выберите импорт по ссылке, вставьте строку и сохраните.",
+          "Откройте список серверов и включите подключение."
+        ]
+      },
+      mac: {
+        cardTitle: "Mac",
+        badge: "macOS",
+        note: "Подходит для MacBook и iMac. Схема настройки такая же, как на iPhone.",
+        title: "Mac",
+        subtitle: "Для macOS используйте Happ. Если удобнее, можно открыть страницу на телефоне, скопировать ссылку и переслать её на Mac.",
+        prompt: "App Store / сайт",
+        appLabel: "Открыть Happ",
+        appUrl: "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973?platform=mac",
+        steps: [
+          "Установите Happ на Mac через App Store.",
+          "Скопируйте ссылку с этой страницы.",
+          "Откройте Happ и добавьте новую подписку по ссылке.",
+          "Сохраните профиль и дождитесь загрузки серверов.",
+          "Выберите сервер и включите подключение."
+        ]
+      },
+      windows: {
+        cardTitle: "Windows",
+        badge: "Desktop",
+        note: "Для ПК и ноутбуков на Windows. Нужна только одна ссылка.",
+        title: "Windows",
+        subtitle: "На Windows откройте официальный сайт Happ, установите клиент и импортируйте вашу ссылку в пару кликов.",
+        prompt: "Скачать установщик",
+        appLabel: "Скачать Happ",
+        appUrl: "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe",
+        steps: [
+          "Откройте сайт Happ и скачайте версию для Windows.",
+          "Установите приложение и запустите его.",
+          "Нажмите «Скопировать ссылку» на этой странице.",
+          "В приложении добавьте подписку по ссылке и сохраните её.",
+          "После загрузки списка серверов выберите нужный и подключитесь."
+        ]
+      },
+      android_tv: {
+        cardTitle: "Android TV",
+        badge: "TV",
+        note: "Для телевизоров и приставок на Android TV.",
+        title: "Android TV",
+        subtitle: "На телевизоре настройка такая же, но удобнее сначала открыть эту страницу на телефоне или компьютере и сохранить ссылку.",
+        prompt: "Google Play",
+        appLabel: "Открыть в Google Play",
+        appUrl: "https://play.google.com/store/apps/details?id=com.happproxy",
+        steps: [
+          "Установите Happ на телевизор или приставку через Google Play.",
+          "Скопируйте ссылку с этой страницы на телефоне или компьютере.",
+          "Передайте её на телевизор любым удобным способом.",
+          "Откройте Happ на TV и импортируйте подписку по ссылке.",
+          "Сохраните профиль, выберите сервер и включите подключение."
+        ]
+      }
+    };
+
+    const order = ["android", "ios", "mac", "windows", "android_tv"];
+
+    const platformList = document.getElementById("platformList");
+    const statusValue = document.getElementById("statusValue");
+    const guideTitle = document.getElementById("guideTitle");
+    const guideSubtitle = document.getElementById("guideSubtitle");
+    const guidePrompt = document.getElementById("guidePrompt");
+    const downloadBtn = document.getElementById("downloadBtn");
+    const copyBtn = document.getElementById("copyBtn");
+    const copyInlineBtn = document.getElementById("copyInlineBtn");
+    const subscriptionInput = document.getElementById("subscriptionInput");
+    const stepsList = document.getElementById("stepsList");
+    const helperText = document.getElementById("helperText");
+    const copyState = document.getElementById("copyState");
+
+    let activePlatform = null;
+
+    function detectPlatform() {
+      const ua = navigator.userAgent.toLowerCase();
+      if (ua.includes("android") && ua.includes("tv")) return "android_tv";
+      if (ua.includes("iphone") || ua.includes("ipad") || ua.includes("ipod")) return "ios";
+      if (ua.includes("macintosh") || ua.includes("mac os x")) return "mac";
+      if (ua.includes("windows")) return "windows";
+      if (ua.includes("android")) return "android";
+      return "android";
+    }
+
+    function getToken() {
+      const parts = window.location.pathname.split("/").filter(Boolean);
+      if ((parts[0] === "connect" || parts[0] === "sub") && parts[1]) return parts[1];
+      return "";
+    }
+
+    function getSubscriptionUrl() {
+      const token = getToken();
+      if (!token) return "";
+      return `${window.location.origin}/sub/${token}`;
+    }
+
+    function setCopyState(text) {
+      copyState.textContent = text;
+    }
+
+    async function copySubscription() {
+      const value = getSubscriptionUrl();
+      if (!value) return;
+      try {
+        await navigator.clipboard.writeText(value);
+        setCopyState("Ссылка скопирована. Теперь откройте приложение и вставьте её.");
+      } catch (error) {
+        subscriptionInput.focus();
+        subscriptionInput.select();
+        document.execCommand("copy");
+        setCopyState("Ссылка выделена. Если автоматическое копирование не сработало, нажмите Ctrl+C или ⌘C.");
+      }
+    }
+
+    function renderSteps(steps) {
+      stepsList.innerHTML = "";
+      steps.forEach((step) => {
+        const li = document.createElement("li");
+        const text = document.createElement("div");
+        text.className = "step-text";
+        text.textContent = step;
+        li.appendChild(text);
+        stepsList.appendChild(li);
+      });
+    }
+
+    function setActivePlatform(name) {
+      activePlatform = name;
+      const meta = platformMeta[name];
+      document.querySelectorAll(".platform-card").forEach((node) => {
+        node.classList.toggle("active", node.dataset.platform === name);
+      });
+
+      guideTitle.textContent = meta.title;
+      guideSubtitle.textContent = meta.subtitle;
+      guidePrompt.textContent = meta.prompt;
+      downloadBtn.href = meta.appUrl;
+      downloadBtn.removeAttribute("aria-disabled");
+      copyBtn.disabled = false;
+      copyInlineBtn.disabled = false;
+      renderSteps(meta.steps);
+    }
+
+    function buildCards() {
+      order.forEach((name, index) => {
+        const meta = platformMeta[name];
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "platform-card";
+        button.dataset.platform = name;
+        button.style.animation = `reveal-up 460ms ease-out ${90 + index * 50}ms both`;
+        button.innerHTML = `
+          <div class="platform-top">
+            <div class="platform-name">${meta.cardTitle}</div>
+            <div class="platform-badge">${meta.badge}</div>
+          </div>
+          <p class="platform-note">${meta.note}</p>
+        `;
+        button.addEventListener("click", () => setActivePlatform(name));
+        platformList.appendChild(button);
+      });
+    }
+
+    function init() {
+      buildCards();
+
+      const subscriptionUrl = getSubscriptionUrl();
+      if (subscriptionUrl) {
+        statusValue.textContent = "Персональная ссылка найдена. Выберите устройство, скачайте приложение и вставьте ссылку ниже.";
+        subscriptionInput.value = subscriptionUrl;
+        helperText.textContent = "Это ваша персональная ссылка. Её нужно вставить в приложение через импорт по ссылке.";
+      } else {
+        statusValue.textContent = "Страница открыта без персональной ссылки. Откройте её из вашего сообщения в боте.";
+        subscriptionInput.value = "Сначала откройте эту страницу по персональной ссылке";
+        copyBtn.disabled = true;
+        copyInlineBtn.disabled = true;
+      }
+
+      const initialPlatform = detectPlatform();
+      setActivePlatform(initialPlatform);
+
+      copyBtn.addEventListener("click", copySubscription);
+      copyInlineBtn.addEventListener("click", copySubscription);
+    }
+
+    init();
+  </script>
+</body>
+</html>

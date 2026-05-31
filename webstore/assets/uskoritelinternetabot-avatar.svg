@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Uskoritel Interneta Telegram Avatar</title>
+  <desc id="desc">Round Telegram-friendly avatar with teal gradient background, signal ring, and yellow speed bolt.</desc>
+  <defs>
+    <radialGradient id="bg" cx="32%" cy="24%" r="86%">
+      <stop offset="0" stop-color="#17a4ab"/>
+      <stop offset="0.58" stop-color="#0d6f92"/>
+      <stop offset="1" stop-color="#0a466b"/>
+    </radialGradient>
+    <linearGradient id="bolt" x1="290" y1="250" x2="664" y2="688" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffd36a"/>
+      <stop offset="1" stop-color="#ffb43d"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="224" y1="180" x2="806" y2="844" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#c8fbff" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#7ce8ff" stop-opacity="0.25"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="28" flood-color="#07253e" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <circle cx="512" cy="512" r="430" fill="url(#bg)"/>
+  <circle cx="512" cy="512" r="396" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="8"/>
+  <path
+    d="M297 640c43 67 120 111 207 111 96 0 180-53 220-131"
+    fill="none"
+    stroke="url(#ring)"
+    stroke-linecap="round"
+    stroke-width="38"
+    opacity="0.9"
+  />
+  <path
+    d="M345 331c45-49 110-79 182-79 103 0 193 61 234 149"
+    fill="none"
+    stroke="url(#ring)"
+    stroke-linecap="round"
+    stroke-width="28"
+    opacity="0.75"
+  />
+
+  <g filter="url(#softShadow)">
+    <path
+      d="M567 252c23 0 35 27 20 45l-87 106h95c23 0 34 28 18 45L475 628c-18 23-54 6-46-22l29-97h-86c-24 0-35-28-18-46l171-191c11-12 25-20 42-20Z"
+      fill="url(#bolt)"
+    />
+    <path
+      d="M567 252c23 0 35 27 20 45l-87 106h95c23 0 34 28 18 45L475 628c-18 23-54 6-46-22l29-97h-86c-24 0-35-28-18-46l171-191c11-12 25-20 42-20Z"
+      fill="none"
+      stroke="#fff2b8"
+      stroke-opacity="0.3"
+      stroke-width="10"
+    />
+  </g>
+
+  <g transform="translate(0 8)">
+    <rect x="300" y="680" width="424" height="64" rx="32" fill="rgba(255,255,255,0.12)"/>
+    <circle cx="360" cy="712" r="22" fill="#ffd15f"/>
+    <circle cx="512" cy="712" r="22" fill="#7fe9ff"/>
+    <circle cx="664" cy="712" r="22" fill="#ffd15f"/>
+  </g>
+</svg>

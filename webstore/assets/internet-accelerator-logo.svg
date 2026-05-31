@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Internet Accelerator Logo</title>
+  <desc id="desc">Rounded square with fast connection lines and linked nodes.</desc>
+  <defs>
+    <linearGradient id="bg" x1="32" y1="24" x2="224" y2="232" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0d7d7f"/>
+      <stop offset="1" stop-color="#0f4f7d"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="70" y1="60" x2="186" y2="178" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffb347"/>
+      <stop offset="1" stop-color="#ffd25f"/>
+    </linearGradient>
+  </defs>
+  <rect x="18" y="18" width="220" height="220" rx="56" fill="url(#bg)"/>
+  <path d="M74 85c10-12 24-19 40-19 28 0 51 21 54 48h20c8 0 14 6 14 14s-6 14-14 14h-47c-8 0-14-6-14-14 0-6 4-12 10-13-3-14-16-24-31-24-9 0-18 4-24 11-5 6-14 7-20 2-6-5-7-14-2-19Z" fill="url(#accent)"/>
+  <path d="M70 151h54c8 0 14 6 14 14s-6 14-14 14H70c-8 0-14-6-14-14s6-14 14-14Zm92 0h24c8 0 14 6 14 14s-6 14-14 14h-24c-8 0-14-6-14-14s6-14 14-14Z" fill="#ffffff"/>
+  <circle cx="78" cy="171" r="10" fill="#ffd25f"/>
+  <circle cx="128" cy="171" r="10" fill="#69e4ff"/>
+  <circle cx="178" cy="171" r="10" fill="#ffd25f"/>
+</svg>

@@ -1,0 +1,1464 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AdaptGroup VPN API",
+    "version": "1.0.0",
+    "description": "API for managing VPN subscriptions in your projects.\n\n**Base URL:** `https://network-api.adaptgroup.app`\n\n**Authentication:** pass your API key in the `X-Api-Key` header and integration ID in the request body.\n\n**Rate limit:** 100 requests per 60 seconds per `api_key_id`. Returns `429 Too Many Requests` when exceeded.\n\n[📥 Download OpenAPI spec](/openapi/vpn.json)",
+    "contact": {
+      "name": "AdaptGroup Support",
+      "url": "https://t.me/adapt_support",
+      "email": "support@adaptgroup.org"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://network-api.adaptgroup.app",
+      "description": "Production"
+    }
+  ],
+  "security": [
+    { "ApiKeyAuth": [] }
+  ],
+  "tags": [
+    {
+      "name": "Plans",
+      "description": "Subscription plans available for your integration"
+    },
+    {
+      "name": "Subscriptions",
+      "description": "Create and manage VPN subscriptions"
+    }
+  ],
+  "paths": {
+    "/plans/list": {
+      "post": {
+        "tags": ["Plans"],
+        "summary": "List plans",
+        "description": "Returns all subscription plans available for your integration, ordered by price.",
+        "operationId": "listPlans",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BaseRequest"
+              },
+              "example": {
+                "api_key_id": 1
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "List of plans",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlansListResponse"
+                },
+                "example": {
+                  "success": true,
+                  "plans": [
+                    {
+                      "uuid": "550e8400-e29b-41d4-a716-446655440000",
+                      "name": "Standard",
+                      "devices": 3,
+                      "days": 30,
+                      "price_usd": "3.50",
+                      "retail_price_usd": "5.00",
+                      "traffic_limit_bytes": null,
+                      "is_trial": false,
+                      "is_active": true,
+                      "created_at": "2026-01-01T00:00:00"
+                    },
+                    {
+                      "uuid": "661f9511-f3ac-52e5-b827-557766551111",
+                      "name": "Pro",
+                      "devices": 5,
+                      "days": 30,
+                      "price_usd": "5.00",
+                      "retail_price_usd": "8.00",
+                      "traffic_limit_bytes": 107374182400,
+                      "is_trial": false,
+                      "is_active": true,
+                      "created_at": "2026-01-01T00:00:00"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+  "invalid_key": {
+    "summary": "Invalid api_key or api_key_id",
+    "value": { "detail": "Invalid api_key or api_key_id" }
+  },
+  "missing_header": {
+    "summary": "Missing X-Api-Key header",
+    "value": { "detail": "Missing X-Api-Key header" }
+  }
+}
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subs/create": {
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Create subscription",
+        "description": "Creates a new VPN subscription for a user. Deducts the plan price from your integration balance.\n\n**Note:** Trial plans cannot be created via API.",
+        "operationId": "createSubscription",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSubscriptionRequest"
+              },
+              "example": {
+                "api_key_id": 1,
+                "plan_uuid": "550e8400-e29b-41d4-a716-446655440000",
+                "external_user_id": "user_123"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreateSubscriptionResponse" },
+                "example": {
+                  "success": true,
+                  "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                  "subscription_url": "https://network-api.adaptgroup.app/sub/770fa622-a4bd-63f6-c938-668877662222",
+                  "plan_uuid": "550e8400-e29b-41d4-a716-446655440000",
+                  "external_user_id": "user_123",
+                  "end_date": "2026-06-01T12:00:00",
+                  "devices": 3,
+                  "days": 30,
+                  "traffic_limit_bytes": null,
+                  "balance": "96.50"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+                  "plan_inactive": {
+                    "summary": "Plan is not active",
+                    "value": { "detail": "Plan is not active" }
+                  },
+                  "trial_not_allowed": {
+                    "summary": "Trial plans not allowed",
+                    "value": { "detail": "Trial plans are not allowed" }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+  "invalid_key": {
+    "summary": "Invalid api_key or api_key_id",
+    "value": { "detail": "Invalid api_key or api_key_id" }
+  },
+  "missing_header": {
+    "summary": "Missing X-Api-Key header",
+    "value": { "detail": "Missing X-Api-Key header" }
+  }
+}
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient balance",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Insufficient balance" }
+              }
+            }
+          },
+          "403": {
+            "description": "Plan does not belong to this integration",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Plan does not belong to this integration" }
+              }
+            }
+          },
+          "404": {
+            "description": "Plan not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Plan not found" }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          },
+          "503": {
+            "description": "Service temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Service temporarily unavailable" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subs/renew": {
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Renew subscription",
+        "description": "Renews an existing subscription using the same plan. Extends the end date by the plan's duration and adds traffic if the plan includes a traffic limit.\n\nIf the subscription has already expired, the new period starts from now. If it's still active, the new period is added to the current end date.",
+        "operationId": "renewSubscription",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SubscriptionUuidRequest" },
+              "example": {
+                "api_key_id": 1,
+                "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription renewed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RenewSubscriptionResponse" },
+                "example": {
+                  "success": true,
+                  "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                  "subscription_url": "https://network-api.adaptgroup.app/sub/770fa622-a4bd-63f6-c938-668877662222",
+                  "end_date": "2026-07-01T12:00:00",
+                  "days": 30,
+                  "traffic_limit_bytes": null,
+                  "balance": "93.00"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Subscription is frozen",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Subscription is frozen" }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+  "invalid_key": {
+    "summary": "Invalid api_key or api_key_id",
+    "value": { "detail": "Invalid api_key or api_key_id" }
+  },
+  "missing_header": {
+    "summary": "Missing X-Api-Key header",
+    "value": { "detail": "Missing X-Api-Key header" }
+  }
+}
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient balance",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Insufficient balance" }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Subscription not found" }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          },
+          "503": {
+            "description": "Service temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Service temporarily unavailable" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subs/freeze": {
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Freeze subscription",
+        "description": "Freezes an active subscription. The user loses access to VPN servers. The remaining days are preserved — when unfrozen, the end date is extended by the frozen duration.",
+        "operationId": "freezeSubscription",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SubscriptionUuidRequest" },
+              "example": {
+                "api_key_id": 1,
+                "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription frozen",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FreezeSubscriptionResponse" },
+                "example": {
+                  "success": true,
+                  "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                  "subscription_url": "https://network-api.adaptgroup.app/sub/770fa622-a4bd-63f6-c938-668877662222",
+                  "frozen_at": "2026-05-04T10:00:00"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+                  "not_active": {
+                    "summary": "Subscription is not active",
+                    "value": { "detail": "Subscription is not active" }
+                  },
+                  "already_frozen": {
+                    "summary": "Already frozen",
+                    "value": { "detail": "Subscription is already frozen" }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+  "invalid_key": {
+    "summary": "Invalid api_key or api_key_id",
+    "value": { "detail": "Invalid api_key or api_key_id" }
+  },
+  "missing_header": {
+    "summary": "Missing X-Api-Key header",
+    "value": { "detail": "Missing X-Api-Key header" }
+  }
+}
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Subscription not found" }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          },
+          "503": {
+            "description": "Service temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Service temporarily unavailable" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subs/unfreeze": {
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Unfreeze subscription",
+        "description": "Unfreezes a frozen subscription. Restores VPN access and extends the end date by the time the subscription was frozen.",
+        "operationId": "unfreezeSubscription",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SubscriptionUuidRequest" },
+              "example": {
+                "api_key_id": 1,
+                "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription unfrozen",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UnfreezeSubscriptionResponse" },
+                "example": {
+                  "success": true,
+                  "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                  "subscription_url": "https://network-api.adaptgroup.app/sub/770fa622-a4bd-63f6-c938-668877662222",
+                  "end_date": "2026-06-08T10:00:00"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Subscription is not frozen",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Subscription is not frozen" }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+  "invalid_key": {
+    "summary": "Invalid api_key or api_key_id",
+    "value": { "detail": "Invalid api_key or api_key_id" }
+  },
+  "missing_header": {
+    "summary": "Missing X-Api-Key header",
+    "value": { "detail": "Missing X-Api-Key header" }
+  }
+}
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Subscription not found" }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          },
+          "503": {
+            "description": "Service temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Service temporarily unavailable" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subs/upgrade": {
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Upgrade subscription",
+        "description": "Upgrades an active subscription to a more expensive plan. The cost is calculated proportionally based on the remaining days.\n\n**Upgrade price formula:**\n```\nupgrade_price = (new_price_per_day - old_price_per_day) × remaining_days\n```\n\nIf both plans include a traffic limit, additional traffic is also added proportionally.",
+        "operationId": "upgradeSubscription",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpgradeSubscriptionRequest" },
+              "example": {
+                "api_key_id": 1,
+                "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                "new_plan_uuid": "661f9511-f3ac-52e5-b827-557766551111"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription upgraded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UpgradeSubscriptionResponse" },
+                "example": {
+                  "success": true,
+                  "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                  "subscription_url": "https://network-api.adaptgroup.app/sub/770fa622-a4bd-63f6-c938-668877662222",
+                  "new_plan_uuid": "661f9511-f3ac-52e5-b827-557766551111",
+                  "devices": 5,
+                  "additional_bytes": 53687091200,
+                  "upgrade_price": "1.2500",
+                  "balance": "95.25"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+                  "not_active": {
+                    "summary": "Subscription is not active",
+                    "value": { "detail": "Subscription is not active" }
+                  },
+                  "frozen": {
+                    "summary": "Subscription is frozen",
+                    "value": { "detail": "Subscription is frozen" }
+                  },
+                  "expired": {
+                    "summary": "Subscription is expired",
+                    "value": { "detail": "Subscription is expired" }
+                  },
+                  "cheaper_plan": {
+                    "summary": "New plan must be more expensive",
+                    "value": { "detail": "New plan must be more expensive than current plan" }
+                  },
+                  "no_days": {
+                    "summary": "Not enough days remaining",
+                    "value": { "detail": "Not enough days remaining to upgrade" }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+  "invalid_key": {
+    "summary": "Invalid api_key or api_key_id",
+    "value": { "detail": "Invalid api_key or api_key_id" }
+  },
+  "missing_header": {
+    "summary": "Missing X-Api-Key header",
+    "value": { "detail": "Missing X-Api-Key header" }
+  }
+}
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient balance",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Insufficient balance" }
+              }
+            }
+          },
+          "403": {
+            "description": "Plan does not belong to this integration",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Plan does not belong to this integration" }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+                  "subscription_not_found": {
+                    "summary": "Subscription not found",
+                    "value": { "detail": "Subscription not found" }
+                  },
+                  "plan_not_found": {
+                    "summary": "Plan not found",
+                    "value": { "detail": "New plan not found" }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          },
+          "503": {
+            "description": "Service temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Service temporarily unavailable" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subs/traffic": {
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Purchase traffic",
+        "description": "Purchases additional traffic (GB) for a subscription that has a traffic limit (⚡️ servers).\n\nOnly available for subscriptions that support traffic limits. The price per GB is set in the dashboard.",
+        "operationId": "purchaseTraffic",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PurchaseTrafficRequest" },
+              "example": {
+                "api_key_id": 1,
+                "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                "gb_amount": 10
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Traffic purchased",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PurchaseTrafficResponse" },
+                "example": {
+                  "success": true,
+                  "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                  "subscription_url": "https://network-api.adaptgroup.app/sub/770fa622-a4bd-63f6-c938-668877662222",
+                  "gb_amount": 10,
+                  "additional_bytes": 10737418240,
+                  "total_price": "0.5000",
+                  "balance": "94.75"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+                  "not_active": {
+                    "summary": "Subscription is not active",
+                    "value": { "detail": "Subscription is not active" }
+                  },
+                  "frozen": {
+                    "summary": "Subscription is frozen",
+                    "value": { "detail": "Subscription is frozen" }
+                  },
+                  "no_traffic": {
+                    "summary": "Subscription does not support traffic",
+                    "value": { "detail": "Subscription does not support traffic" }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+  "invalid_key": {
+    "summary": "Invalid api_key or api_key_id",
+    "value": { "detail": "Invalid api_key or api_key_id" }
+  },
+  "missing_header": {
+    "summary": "Missing X-Api-Key header",
+    "value": { "detail": "Missing X-Api-Key header" }
+  }
+}
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient balance",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Insufficient balance" }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Subscription not found" }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          },
+          "503": {
+            "description": "Service temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Service temporarily unavailable" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subs/status": {
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Get subscription status",
+        "description": "Returns the current status and details of a subscription.",
+        "operationId": "getSubscriptionStatus",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SubscriptionUuidRequest" },
+              "example": {
+                "api_key_id": 1,
+                "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SubscriptionStatusResponse" },
+                "example": {
+                  "success": true,
+                  "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                  "subscription_url": "https://network-api.adaptgroup.app/sub/770fa622-a4bd-63f6-c938-668877662222",
+                  "plan_uuid": "550e8400-e29b-41d4-a716-446655440000",
+                  "external_user_id": "user_123",
+                  "devices": 3,
+                  "days": 30,
+                  "traffic_limit_bytes": null,
+                  "used_traffic_bytes": 1073741824,
+                  "price_paid": "3.50",
+                  "start_date": "2026-05-01T12:00:00",
+                  "end_date": "2026-06-01T12:00:00",
+                  "is_active": true,
+                  "is_frozen": false,
+                  "frozen_at": null,
+                  "created_at": "2026-05-01T12:00:00"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+  "invalid_key": {
+    "summary": "Invalid api_key or api_key_id",
+    "value": { "detail": "Invalid api_key or api_key_id" }
+  },
+  "missing_header": {
+    "summary": "Missing X-Api-Key header",
+    "value": { "detail": "Missing X-Api-Key header" }
+  }
+}
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Subscription not found" }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subs/devices": {
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Get devices",
+        "description": "Returns a list of devices that have connected to the subscription.",
+        "operationId": "getDevices",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SubscriptionUuidRequest" },
+              "example": {
+                "api_key_id": 1,
+                "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "List of devices",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SubscriptionDevicesResponse" },
+                "example": {
+                  "success": true,
+                  "devices": [
+                    {
+                      "id": 1,
+                      "name": "iPhone 15 Pro",
+                      "hwid": "abc123def456",
+                      "device_os": "ios",
+                      "device_model": "iPhone 15 Pro",
+                      "os_version": "17.0",
+                      "ip_address": "1.2.3.4",
+                      "first_seen": "2026-05-01T12:00:00",
+                      "last_seen": "2026-05-04T09:00:00"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+  "invalid_key": {
+    "summary": "Invalid api_key or api_key_id",
+    "value": { "detail": "Invalid api_key or api_key_id" }
+  },
+  "missing_header": {
+    "summary": "Missing X-Api-Key header",
+    "value": { "detail": "Missing X-Api-Key header" }
+  }
+}
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Subscription not found" }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subs/requests": {
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Get connection requests",
+        "description": "Returns paginated history of connection requests for a subscription.",
+        "operationId": "getRequests",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SubscriptionRequestsRequest" },
+              "example": {
+                "api_key_id": 1,
+                "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                "offset": 0,
+                "limit": 20
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Connection requests history",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SubscriptionRequestsResponse" },
+                "example": {
+                  "success": true,
+                  "items": [
+                    {
+                      "id": 1,
+                      "device_id": 1,
+                      "hwid": "abc123def456",
+                      "device_os": "ios",
+                      "device_model": "iPhone 15 Pro",
+                      "os_version": "17.0",
+                      "ip_address": "1.2.3.4",
+                      "status": "success",
+                      "created_at": "2026-05-04T09:00:00"
+                    }
+                  ],
+                  "total": 42,
+                  "offset": 0,
+                  "limit": 20
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+  "invalid_key": {
+    "summary": "Invalid api_key or api_key_id",
+    "value": { "detail": "Invalid api_key or api_key_id" }
+  },
+  "missing_header": {
+    "summary": "Missing X-Api-Key header",
+    "value": { "detail": "Missing X-Api-Key header" }
+  }
+}
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Subscription not found" }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/subs/devices/delete": {
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Delete device",
+        "description": "Removes a device from the subscription. After deletion the device slot is freed and can be used by a new device.",
+        "operationId": "deleteDevice",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/DeleteDeviceRequest" },
+              "example": {
+                "api_key_id": 1,
+                "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                "device_id": 1
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Device deleted",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SuccessResponse" },
+                "example": { "success": true }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+  "invalid_key": {
+    "summary": "Invalid api_key or api_key_id",
+    "value": { "detail": "Invalid api_key or api_key_id" }
+  },
+  "missing_header": {
+    "summary": "Missing X-Api-Key header",
+    "value": { "detail": "Missing X-Api-Key header" }
+  }
+}
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+                  "subscription_not_found": {
+                    "summary": "Subscription not found",
+                    "value": { "detail": "Subscription not found" }
+                  },
+                  "device_not_found": {
+                    "summary": "Device not found",
+                    "value": { "detail": "Device not found" }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Api-Key",
+        "description": "Your integration API key. Obtained from the dashboard."
+      }
+    },
+    "schemas": {
+      "BaseRequest": {
+        "type": "object",
+        "required": ["api_key_id"],
+        "properties": {
+          "api_key_id": {
+            "type": "integer",
+            "description": "Integration ID",
+            "example": 1
+          }
+        }
+      },
+      "SubscriptionUuidRequest": {
+        "type": "object",
+        "required": ["api_key_id", "subscription_uuid"],
+        "properties": {
+          "api_key_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "subscription_uuid": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Subscription UUID",
+            "example": "770fa622-a4bd-63f6-c938-668877662222"
+          }
+        }
+      },
+      "CreateSubscriptionRequest": {
+        "type": "object",
+        "required": ["api_key_id", "plan_uuid"],
+        "properties": {
+          "api_key_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "plan_uuid": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the plan to subscribe to",
+            "example": "550e8400-e29b-41d4-a716-446655440000"
+          },
+          "external_user_id": {
+            "type": "string",
+            "description": "Your system's user ID. Optional, used for analytics and webhooks",
+            "example": "user_123",
+            "nullable": true
+          }
+        }
+      },
+      "UpgradeSubscriptionRequest": {
+        "type": "object",
+        "required": ["api_key_id", "subscription_uuid", "new_plan_uuid"],
+        "properties": {
+          "api_key_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "subscription_uuid": {
+            "type": "string",
+            "format": "uuid",
+            "example": "770fa622-a4bd-63f6-c938-668877662222"
+          },
+          "new_plan_uuid": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the new plan. Must be more expensive than the current plan",
+            "example": "661f9511-f3ac-52e5-b827-557766551111"
+          }
+        }
+      },
+      "PurchaseTrafficRequest": {
+        "type": "object",
+        "required": ["api_key_id", "subscription_uuid", "gb_amount"],
+        "properties": {
+          "api_key_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "subscription_uuid": {
+            "type": "string",
+            "format": "uuid",
+            "example": "770fa622-a4bd-63f6-c938-668877662222"
+          },
+          "gb_amount": {
+            "type": "integer",
+            "description": "Amount of GB to purchase. Min: 1, max: 1000",
+            "minimum": 1,
+            "maximum": 1000,
+            "example": 10
+          }
+        }
+      },
+      "SubscriptionRequestsRequest": {
+        "type": "object",
+        "required": ["api_key_id", "subscription_uuid"],
+        "properties": {
+          "api_key_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "subscription_uuid": {
+            "type": "string",
+            "format": "uuid",
+            "example": "770fa622-a4bd-63f6-c938-668877662222"
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Pagination offset",
+            "default": 0,
+            "minimum": 0,
+            "example": 0
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Results per page. Min: 1, max: 100",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 100,
+            "example": 20
+          }
+        }
+      },
+      "DeleteDeviceRequest": {
+        "type": "object",
+        "required": ["api_key_id", "subscription_uuid", "device_id"],
+        "properties": {
+          "api_key_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "subscription_uuid": {
+            "type": "string",
+            "format": "uuid",
+            "example": "770fa622-a4bd-63f6-c938-668877662222"
+          },
+          "device_id": {
+            "type": "integer",
+            "description": "Device ID from the devices list",
+            "example": 1
+          }
+        }
+      },
+      "PlanItem": {
+        "type": "object",
+        "properties": {
+          "uuid": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "example": "Standard" },
+          "devices": { "type": "integer", "example": 3 },
+          "days": { "type": "integer", "example": 30 },
+          "price_usd": { "type": "string", "example": "3.50" },
+          "retail_price_usd": { "type": "string", "nullable": true, "example": "5.00" },
+          "traffic_limit_bytes": { "type": "integer", "nullable": true, "example": 107374182400 },
+          "is_trial": { "type": "boolean", "example": false },
+          "is_active": { "type": "boolean", "example": true },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "DeviceItem": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "example": 1 },
+          "name": { "type": "string", "example": "iPhone 15 Pro" },
+          "hwid": { "type": "string", "nullable": true, "example": "abc123def456" },
+          "device_os": { "type": "string", "nullable": true, "example": "ios" },
+          "device_model": { "type": "string", "nullable": true, "example": "iPhone 15 Pro" },
+          "os_version": { "type": "string", "nullable": true, "example": "17.0" },
+          "ip_address": { "type": "string", "nullable": true, "example": "1.2.3.4" },
+          "first_seen": { "type": "string", "format": "date-time" },
+          "last_seen": { "type": "string", "format": "date-time" }
+        }
+      },
+      "RequestItem": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "example": 1 },
+          "device_id": { "type": "integer", "nullable": true, "example": 1 },
+          "hwid": { "type": "string", "nullable": true, "example": "abc123def456" },
+          "device_os": { "type": "string", "nullable": true, "example": "ios" },
+          "device_model": { "type": "string", "nullable": true, "example": "iPhone 15 Pro" },
+          "os_version": { "type": "string", "nullable": true, "example": "17.0" },
+          "ip_address": { "type": "string", "nullable": true, "example": "1.2.3.4" },
+          "status": { "type": "string", "enum": ["success", "failed"], "example": "success" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "PlansListResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true },
+          "plans": { "type": "array", "items": { "$ref": "#/components/schemas/PlanItem" } }
+        }
+      },
+      "CreateSubscriptionResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true },
+          "subscription_uuid": { "type": "string", "format": "uuid" },
+          "subscription_url": { "type": "string" },
+          "plan_uuid": { "type": "string", "format": "uuid" },
+          "external_user_id": { "type": "string", "nullable": true },
+          "end_date": { "type": "string", "format": "date-time" },
+          "devices": { "type": "integer" },
+          "days": { "type": "integer" },
+          "traffic_limit_bytes": { "type": "integer", "nullable": true },
+          "balance": { "type": "string" }
+        }
+      },
+      "RenewSubscriptionResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true },
+          "subscription_uuid": { "type": "string", "format": "uuid" },
+          "subscription_url": { "type": "string" },
+          "end_date": { "type": "string", "format": "date-time" },
+          "days": { "type": "integer" },
+          "traffic_limit_bytes": { "type": "integer", "nullable": true },
+          "balance": { "type": "string" }
+        }
+      },
+      "FreezeSubscriptionResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true },
+          "subscription_uuid": { "type": "string", "format": "uuid" },
+          "subscription_url": { "type": "string" },
+          "frozen_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "UnfreezeSubscriptionResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true },
+          "subscription_uuid": { "type": "string", "format": "uuid" },
+          "subscription_url": { "type": "string" },
+          "end_date": { "type": "string", "format": "date-time" }
+        }
+      },
+      "UpgradeSubscriptionResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true },
+          "subscription_uuid": { "type": "string", "format": "uuid" },
+          "subscription_url": { "type": "string" },
+          "new_plan_uuid": { "type": "string", "format": "uuid" },
+          "devices": { "type": "integer" },
+          "additional_bytes": { "type": "integer", "nullable": true },
+          "upgrade_price": { "type": "string" },
+          "balance": { "type": "string" }
+        }
+      },
+      "PurchaseTrafficResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true },
+          "subscription_uuid": { "type": "string", "format": "uuid" },
+          "subscription_url": { "type": "string" },
+          "gb_amount": { "type": "integer" },
+          "additional_bytes": { "type": "integer" },
+          "total_price": { "type": "string" },
+          "balance": { "type": "string" }
+        }
+      },
+      "SubscriptionStatusResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true },
+          "subscription_uuid": { "type": "string", "format": "uuid" },
+          "subscription_url": { "type": "string" },
+          "plan_uuid": { "type": "string", "format": "uuid", "nullable": true },
+          "external_user_id": { "type": "string", "nullable": true },
+          "devices": { "type": "integer" },
+          "days": { "type": "integer" },
+          "traffic_limit_bytes": { "type": "integer", "nullable": true },
+          "used_traffic_bytes": { "type": "integer" },
+          "price_paid": { "type": "string" },
+          "start_date": { "type": "string", "format": "date-time", "nullable": true },
+          "end_date": { "type": "string", "format": "date-time", "nullable": true },
+          "is_active": { "type": "boolean" },
+          "is_frozen": { "type": "boolean" },
+          "frozen_at": { "type": "string", "format": "date-time", "nullable": true },
+          "created_at": { "type": "string", "format": "date-time", "nullable": true }
+        }
+      },
+      "SubscriptionDevicesResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true },
+          "devices": { "type": "array", "items": { "$ref": "#/components/schemas/DeviceItem" } }
+        }
+      },
+      "SubscriptionRequestsResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true },
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/RequestItem" } },
+          "total": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "limit": { "type": "integer" }
+        }
+      },
+      "SuccessResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "detail": { "type": "string", "example": "Invalid api_key or api_key_id" }
+        }
+      }
+    }
+  }
+}

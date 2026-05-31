@@ -1,0 +1,2654 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{SITE_NAME}} — получить доступ</title>
+  <meta name="description" content="Получите доступ за пару минут: выберите тариф, оплатите картой и подключите интернет по условиям выбранного тарифа.">
+  <link rel="icon" type="image/svg+xml" href="/api/store/favicon">
+  <link rel="apple-touch-icon" href="/api/store/logo">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f7efe3;
+      --panel: rgba(255, 249, 241, 0.82);
+      --panel-solid: #fffaf4;
+      --text: #14222c;
+      --muted: #60707a;
+      --line: rgba(20, 34, 44, 0.12);
+      --brand: #0c8c8c;
+      --brand-deep: #0d5d62;
+      --accent: #ef8a25;
+      --accent-soft: rgba(239, 138, 37, 0.12);
+      --brand-soft: rgba(12, 140, 140, 0.12);
+      --shadow: 0 20px 44px rgba(26, 42, 49, 0.14);
+      --radius-xl: 30px;
+      --radius-lg: 22px;
+      --radius-md: 16px;
+      --max: 1080px;
+      --font: "Manrope", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      min-height: 100vh;
+      font-family: var(--font);
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(239, 138, 37, 0.22), transparent 28%),
+        radial-gradient(circle at top right, rgba(12, 140, 140, 0.18), transparent 30%),
+        linear-gradient(180deg, #fff8ef 0%, #f7f0e7 54%, #f2eadf 100%);
+    }
+    a { color: inherit; }
+    .page {
+      width: min(var(--max), calc(100% - 32px));
+      margin: 0 auto;
+      padding: 24px 0 72px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 26px;
+      animation: fadeUp 450ms ease-out both;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 16px;
+      border-radius: 999px;
+      background: rgba(20, 34, 44, 0.06);
+      text-decoration: none;
+      transition: transform 180ms ease, background 180ms ease;
+    }
+    .brand:hover {
+      transform: translateY(-1px);
+      background: rgba(20, 34, 44, 0.1);
+    }
+    .brand img {
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+    }
+    .brand-text {
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--brand-deep);
+    }
+    .topbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .ghost-link, .telegram-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      text-decoration: none;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.66);
+      box-shadow: var(--shadow);
+    }
+    .telegram-auth-link {
+      min-height: 44px;
+      padding: 0 16px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 800;
+      gap: 8px;
+      color: #fff;
+      border: none;
+      background: linear-gradient(135deg, var(--brand), var(--brand-deep));
+      cursor: pointer;
+      font-family: var(--font);
+    }
+    .telegram-auth-link.hidden {
+      display: none;
+    }
+    .ghost-link {
+      min-height: 44px;
+      padding: 0 16px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 800;
+      gap: 8px;
+      color: var(--text);
+    }
+    .ghost-link svg {
+      width: 16px;
+      height: 16px;
+      fill: currentColor;
+    }
+    .telegram-link {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      color: var(--brand-deep);
+      transition: transform 180ms ease, background 180ms ease;
+    }
+    .telegram-link:hover {
+      transform: translateY(-2px);
+      background: rgba(12, 140, 140, 0.08);
+    }
+    .telegram-link svg {
+      width: 20px;
+      height: 20px;
+      fill: currentColor;
+    }
+
+    .hero {
+      display: block;
+      margin-bottom: 24px;
+      animation: fadeUp 520ms ease-out both;
+    }
+    .hero-main {
+      border: 1px solid rgba(255, 255, 255, 0.55);
+      border-radius: var(--radius-xl);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(16px);
+    }
+    .hero-main {
+      position: relative;
+      overflow: hidden;
+      padding: 34px;
+      background:
+        radial-gradient(circle at top right, rgba(12, 140, 140, 0.12), transparent 30%),
+        radial-gradient(circle at bottom left, rgba(239, 138, 37, 0.18), transparent 30%),
+        linear-gradient(160deg, rgba(255, 250, 245, 0.92), rgba(255, 244, 233, 0.84));
+    }
+    h1 {
+      position: relative;
+      z-index: 1;
+      font-size: clamp(2.3rem, 6vw, 4.2rem);
+      line-height: 0.97;
+      letter-spacing: -0.05em;
+      max-width: none;
+      margin-bottom: 16px;
+    }
+    .hero-subtitle {
+      position: relative;
+      z-index: 1;
+      max-width: none;
+      color: var(--muted);
+      font-size: 17px;
+      line-height: 1.7;
+      margin-bottom: 24px;
+    }
+    .hero-points {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 26px;
+    }
+    .hero-point {
+      padding: 10px 14px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.58);
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .hero-actions {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 22px;
+    }
+    .hero-benefits {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .hero-benefit {
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.7);
+      border: 1px solid var(--line);
+    }
+    .hero-benefit strong {
+      display: block;
+      font-size: 15px;
+      margin-bottom: 4px;
+    }
+    .hero-benefit span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .primary-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      padding: 0 20px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--brand), var(--brand-deep));
+      color: #fff;
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 800;
+      box-shadow: 0 16px 30px rgba(12, 140, 140, 0.22);
+    }
+    .telegram-auth-cta {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      padding: 0 20px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.74);
+      color: var(--text);
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 800;
+      cursor: pointer;
+      font-family: var(--font);
+    }
+    .secondary-link {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--brand-deep);
+      text-decoration: none;
+    }
+    .accent-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      padding: 0 20px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--accent), #d97413);
+      color: #fff;
+      font-size: 14px;
+      font-weight: 800;
+      border: none;
+      cursor: pointer;
+      font-family: var(--font);
+      box-shadow: 0 16px 30px rgba(239, 138, 37, 0.22);
+    }
+    /* Demo modal */
+    .demo-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(20, 34, 44, 0.5);
+      backdrop-filter: blur(6px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 16px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 200ms ease;
+    }
+    .demo-overlay.active { opacity: 1; pointer-events: all; }
+    .demo-modal {
+      background: var(--panel-solid);
+      border-radius: var(--radius-xl);
+      padding: 32px 28px;
+      max-width: 420px;
+      width: 100%;
+      position: relative;
+      box-shadow: var(--shadow);
+      animation: fadeUp 250ms ease-out both;
+    }
+    .demo-modal-close {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      background: none;
+      border: none;
+      font-size: 18px;
+      cursor: pointer;
+      color: var(--muted);
+      width: 32px;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+    }
+    .demo-modal-close:hover { background: var(--brand-soft); }
+    .demo-modal h3 { font-size: 20px; font-weight: 800; margin-bottom: 10px; }
+    .demo-modal > div > p { color: var(--muted); font-size: 14px; line-height: 1.6; margin-bottom: 18px; }
+    .demo-input {
+      width: 100%;
+      height: 48px;
+      padding: 0 16px;
+      border-radius: var(--radius-md);
+      border: 1.5px solid var(--line);
+      background: #fff;
+      font-size: 15px;
+      font-family: var(--font);
+      color: var(--text);
+      outline: none;
+      margin-bottom: 12px;
+      transition: border-color 150ms ease;
+    }
+    .demo-input:focus { border-color: var(--brand); }
+    .demo-submit-btn {
+      width: 100%;
+      height: 48px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--accent), #d97413);
+      color: #fff;
+      font-size: 15px;
+      font-weight: 800;
+      border: none;
+      cursor: pointer;
+      font-family: var(--font);
+      margin-bottom: 14px;
+    }
+    .demo-note { text-align: center; font-size: 13px; color: var(--muted); }
+    .demo-note a { color: var(--brand); text-decoration: none; }
+    .demo-success-icon { font-size: 36px; margin-bottom: 12px; }
+    .demo-url-box {
+      background: rgba(12, 140, 140, 0.07);
+      border: 1px solid rgba(12, 140, 140, 0.2);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
+      font-size: 11px;
+      word-break: break-all;
+      color: var(--brand-deep);
+      margin-bottom: 12px;
+      font-family: monospace;
+    }
+    .demo-copy-btn {
+      width: 100%;
+      height: 48px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--brand), var(--brand-deep));
+      color: #fff;
+      font-size: 15px;
+      font-weight: 800;
+      border: none;
+      cursor: pointer;
+      font-family: var(--font);
+      margin-bottom: 10px;
+    }
+    .demo-platform-link {
+      display: block;
+      text-align: center;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--brand-deep);
+      text-decoration: none;
+    }
+    .proof-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 22px;
+      animation: fadeUp 620ms ease-out 160ms both;
+    }
+    .proof-card {
+      padding: 18px;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.54);
+      box-shadow: var(--shadow);
+    }
+    .proof-card strong {
+      display: block;
+      font-size: 1.45rem;
+      letter-spacing: -0.04em;
+      margin-bottom: 6px;
+    }
+    .proof-card span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .guides-wrap {
+      display: grid;
+      gap: 18px;
+    }
+    .guide-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .guide-tab {
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.72);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .guide-tab.active {
+      background: linear-gradient(135deg, var(--brand), var(--brand-deep));
+      color: #fff;
+      border-color: transparent;
+    }
+    .guide-panels {
+      position: relative;
+    }
+    .guide-panel {
+      display: none;
+      padding: 24px;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.74);
+    }
+    .guide-panel.active {
+      display: block;
+      animation: fadeUp 220ms ease-out both;
+    }
+    .guide-panel-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .guide-panel-head h3 {
+      font-size: 1.1rem;
+      margin-bottom: 6px;
+    }
+    .guide-panel-head p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+      max-width: 56ch;
+    }
+    .guide-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      padding: 0 14px;
+      border-radius: 999px;
+      background: rgba(12, 140, 140, 0.1);
+      color: var(--brand-deep);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .guide-steps {
+      list-style: none;
+      display: grid;
+      gap: 10px;
+      padding: 0;
+      counter-reset: guide-step;
+    }
+    .guide-steps li {
+      position: relative;
+      padding: 12px 14px 12px 46px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.82);
+      border: 1px solid rgba(20, 34, 44, 0.08);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.55;
+      counter-increment: guide-step;
+    }
+    .guide-steps li::before {
+      content: counter(guide-step);
+      position: absolute;
+      left: 12px;
+      top: 10px;
+      width: 24px;
+      height: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      background: var(--brand-soft);
+      color: var(--brand-deep);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .section {
+      margin-top: 22px;
+      animation: fadeUp 620ms ease-out 200ms both;
+    }
+    .section-card {
+      padding: 28px;
+      border-radius: var(--radius-xl);
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.55);
+      box-shadow: var(--shadow);
+    }
+    .section-head {
+      margin-bottom: 20px;
+    }
+    .section-head h2 {
+      font-size: clamp(1.45rem, 3vw, 2rem);
+      letter-spacing: -0.04em;
+      margin-bottom: 8px;
+    }
+    .section-head p {
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.65;
+      max-width: 64ch;
+    }
+
+    .contact-box {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 16px;
+      margin-bottom: 22px;
+      padding: 20px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, rgba(12, 140, 140, 0.09), rgba(239, 138, 37, 0.08));
+      border: 1px solid rgba(12, 140, 140, 0.14);
+    }
+    .contact-copy strong {
+      display: block;
+      font-size: 1rem;
+      margin-bottom: 4px;
+    }
+    .contact-copy span {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .contact-field-wrap {
+      display: grid;
+      gap: 10px;
+    }
+    .contact-type-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .contact-type-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 0 14px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.78);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 140ms ease, border-color 180ms ease, background 180ms ease;
+    }
+    .contact-type-chip:hover {
+      transform: translateY(-1px);
+      border-color: rgba(12, 140, 140, 0.3);
+    }
+    .contact-type-chip.active {
+      border-color: rgba(12, 140, 140, 0.35);
+      background: rgba(12, 140, 140, 0.12);
+      color: var(--brand-deep);
+    }
+    .contact-input-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+    }
+    .contact-input {
+      width: 100%;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.76);
+      font-family: var(--font);
+      font-size: 14px;
+      color: var(--text);
+      outline: none;
+      transition: border-color 180ms ease, box-shadow 180ms ease;
+    }
+    .contact-input:focus {
+      border-color: var(--brand);
+      box-shadow: 0 0 0 4px rgba(12, 140, 140, 0.08);
+    }
+    .contact-hint {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .contact-hint strong {
+      color: var(--text);
+      font-weight: 800;
+    }
+    .bonus-box {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+      padding: 16px 18px;
+      border-radius: 18px;
+      background: rgba(12, 140, 140, 0.08);
+      border: 1px solid rgba(12, 140, 140, 0.16);
+    }
+    .bonus-copy strong {
+      display: block;
+      font-size: 1rem;
+      margin-bottom: 4px;
+    }
+    .bonus-copy span {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .bonus-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .tariffs {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .tariff-card {
+      position: relative;
+      padding: 24px;
+      border: 1px solid rgba(255, 255, 255, 0.5);
+      border-radius: var(--radius-xl);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(16px);
+      display: flex;
+      flex-direction: column;
+      transition: transform 180ms ease, box-shadow 180ms ease;
+    }
+    .tariff-card:hover {
+      transform: translateY(-4px);
+      box-shadow: 0 26px 52px rgba(20, 44, 54, 0.16);
+    }
+    .tariff-card.featured {
+      background:
+        radial-gradient(circle at top right, rgba(12, 140, 140, 0.14), transparent 32%),
+        linear-gradient(180deg, rgba(255, 250, 244, 0.95), rgba(248, 255, 252, 0.9));
+      border-color: rgba(12, 140, 140, 0.36);
+      box-shadow: 0 28px 56px rgba(12, 140, 140, 0.18);
+    }
+    .tariff-badge {
+      position: absolute;
+      top: -12px;
+      left: 20px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--brand), var(--brand-deep));
+      color: #fff;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .tariff-label {
+      font-size: 1.2rem;
+      font-weight: 800;
+      margin-bottom: 8px;
+      letter-spacing: -0.03em;
+    }
+    .tariff-desc {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+      margin-bottom: 18px;
+    }
+    .tariff-price {
+      font-size: 2.4rem;
+      font-weight: 800;
+      letter-spacing: -0.05em;
+      line-height: 1;
+      margin-bottom: 8px;
+    }
+    .tariff-price span {
+      font-size: 1rem;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .tariff-per-day,
+    .tariff-per-month {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 6px;
+    }
+    .tariff-features {
+      list-style: none;
+      display: grid;
+      gap: 8px;
+      margin: 16px 0 20px;
+      padding: 0;
+    }
+    .tariff-features li {
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .tariff-features li::before {
+      content: "• ";
+      color: var(--brand);
+      font-weight: 800;
+    }
+    .buy-btn {
+      display: block;
+      width: 100%;
+      padding: 15px 16px;
+      border: none;
+      border-radius: 16px;
+      background: linear-gradient(135deg, var(--brand), var(--brand-deep));
+      color: #fff;
+      font-family: var(--font);
+      font-size: 15px;
+      font-weight: 800;
+      cursor: pointer;
+      transition: opacity 180ms ease, transform 120ms ease;
+      margin-top: auto;
+    }
+    .buy-btn:hover { opacity: 0.92; }
+    .buy-btn:active { transform: scale(0.985); }
+
+    .balance-section {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(280px, 360px);
+      gap: 18px;
+      align-items: stretch;
+    }
+    .balance-copy {
+      padding: 24px;
+      border-radius: 24px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid var(--line);
+    }
+    .balance-copy h3 {
+      font-size: 1.1rem;
+      margin-bottom: 10px;
+    }
+    .balance-copy p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.65;
+      margin-bottom: 12px;
+    }
+    .balance-points {
+      display: grid;
+      gap: 8px;
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--text);
+    }
+    .balance-points div::before {
+      content: "• ";
+      color: var(--brand);
+      font-weight: 800;
+    }
+    .balance-form {
+      padding: 24px;
+      border-radius: 24px;
+      background: linear-gradient(135deg, rgba(12, 140, 140, 0.09), rgba(239, 138, 37, 0.08));
+      border: 1px solid rgba(12, 140, 140, 0.14);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 12px;
+    }
+    .balance-form strong {
+      font-size: 1rem;
+    }
+    .balance-form span {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+    .balance-input {
+      width: 100%;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.86);
+      font-family: var(--font);
+      font-size: 15px;
+      color: var(--text);
+      outline: none;
+    }
+    .balance-input:focus {
+      border-color: var(--brand);
+      box-shadow: 0 0 0 4px rgba(12, 140, 140, 0.08);
+    }
+    .balance-form .buy-btn {
+      margin-top: 0;
+    }
+
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .step-card {
+      padding: 22px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.68);
+      border: 1px solid var(--line);
+    }
+    .step-index {
+      width: 34px;
+      height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      background: var(--brand-soft);
+      color: var(--brand-deep);
+      font-size: 14px;
+      font-weight: 800;
+      margin-bottom: 12px;
+    }
+    .step-card h3 {
+      font-size: 1rem;
+      margin-bottom: 8px;
+    }
+    .step-card p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .explain-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .explain-card {
+      padding: 22px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.68);
+      border: 1px solid var(--line);
+    }
+    .explain-card strong {
+      display: block;
+      font-size: 1rem;
+      margin-bottom: 8px;
+    }
+    .explain-card p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .notice-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .notice-card {
+      padding: 22px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid var(--line);
+    }
+    .notice-card strong {
+      display: block;
+      font-size: 1rem;
+      margin-bottom: 8px;
+    }
+    .notice-card p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+      margin-bottom: 12px;
+    }
+    .notice-card ul {
+      display: grid;
+      gap: 8px;
+      padding-left: 18px;
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+    .tariff-note-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin-bottom: 18px;
+    }
+    .tariff-locations-note {
+      margin: 0 0 18px;
+      padding: 18px 20px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid var(--line);
+      font-size: 14px;
+      line-height: 1.65;
+      color: var(--text);
+    }
+    .tariff-locations-note span {
+      color: var(--muted);
+    }
+    .learn-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .learn-card {
+      padding: 22px;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.68);
+    }
+    .learn-card strong {
+      display: block;
+      font-size: 1rem;
+      margin-bottom: 8px;
+    }
+    .learn-card p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .referral-box {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) auto;
+      gap: 18px;
+      align-items: center;
+      padding: 28px;
+      border-radius: var(--radius-xl);
+      border: 1px solid rgba(12, 140, 140, 0.16);
+      background: linear-gradient(135deg, rgba(12, 140, 140, 0.08), rgba(239, 138, 37, 0.08));
+      box-shadow: var(--shadow);
+    }
+    .referral-copy h2 {
+      font-size: clamp(1.45rem, 3vw, 2rem);
+      letter-spacing: -0.04em;
+      margin-bottom: 10px;
+    }
+    .referral-copy p {
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.65;
+      max-width: 60ch;
+      margin-bottom: 14px;
+    }
+    .referral-points {
+      display: grid;
+      gap: 8px;
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+    .referral-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      align-items: stretch;
+    }
+    .referral-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      padding: 0 20px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--brand), var(--brand-deep));
+      color: #fff;
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 800;
+      white-space: nowrap;
+      box-shadow: 0 16px 30px rgba(12, 140, 140, 0.22);
+    }
+    .guide-safe-note {
+      margin-top: 16px;
+      padding: 16px 18px;
+      border-radius: 18px;
+      border: 1px solid rgba(12, 140, 140, 0.16);
+      background: linear-gradient(135deg, rgba(12, 140, 140, 0.08), rgba(239, 138, 37, 0.08));
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .platform-strip {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+    .platform-pill {
+      padding: 14px 12px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.7);
+      text-align: center;
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .platform-pill span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      margin-top: 5px;
+    }
+    .locations-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 16px;
+    }
+    .location-card {
+      padding: 20px;
+      border-radius: 20px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.7);
+    }
+    .location-flag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 44px;
+      height: 44px;
+      margin-bottom: 12px;
+      border-radius: 14px;
+      background: rgba(20, 34, 44, 0.05);
+      font-size: 24px;
+      line-height: 1;
+    }
+    .location-card strong {
+      display: block;
+      font-size: 1rem;
+      margin-bottom: 6px;
+    }
+    .location-card span {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .route-note {
+      padding: 18px 20px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, rgba(12, 140, 140, 0.09), rgba(239, 138, 37, 0.08));
+      border: 1px solid rgba(12, 140, 140, 0.14);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.7;
+    }
+    .route-note strong {
+      color: var(--brand-deep);
+    }
+
+    .bot-section {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: center;
+      padding: 28px;
+      border-radius: var(--radius-xl);
+      background:
+        radial-gradient(circle at top left, rgba(12, 140, 140, 0.2), transparent 28%),
+        linear-gradient(135deg, #15252f, #243740);
+      color: #fff;
+      box-shadow: 0 26px 60px rgba(20, 34, 44, 0.2);
+    }
+    .bot-copy h2 {
+      font-size: clamp(1.45rem, 3vw, 2rem);
+      letter-spacing: -0.04em;
+      margin-bottom: 10px;
+    }
+    .bot-copy p {
+      max-width: 58ch;
+      color: rgba(255, 255, 255, 0.78);
+      font-size: 15px;
+      line-height: 1.7;
+    }
+    .bot-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      padding: 0 20px;
+      border-radius: 999px;
+      background: #fff;
+      color: #14222c;
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .faq {
+      display: grid;
+      gap: 12px;
+    }
+    .faq-item {
+      padding: 18px 20px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.68);
+    }
+    .faq-item strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 15px;
+    }
+    .faq-item span {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .footer {
+      text-align: center;
+      margin-top: 32px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .footer a {
+      color: var(--brand);
+      text-decoration: none;
+      font-weight: 700;
+    }
+    .cookie-banner {
+      position: fixed;
+      left: 20px;
+      right: 20px;
+      bottom: 20px;
+      display: none;
+      justify-content: center;
+      z-index: 120;
+    }
+    .cookie-banner.active {
+      display: flex;
+    }
+    .cookie-banner-card {
+      width: min(720px, 100%);
+      padding: 18px 20px;
+      border-radius: 24px;
+      background: #fffaf4;
+      border: 1px solid rgba(20, 34, 44, 0.1);
+      box-shadow: 0 20px 44px rgba(20, 34, 44, 0.2);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .cookie-banner-copy h3 {
+      font-size: 1rem;
+      margin-bottom: 6px;
+      letter-spacing: -0.02em;
+    }
+    .cookie-banner-copy p {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .cookie-accept-btn {
+      min-height: 44px;
+      padding: 0 18px;
+      border: none;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--brand), var(--brand-deep));
+      color: #fff;
+      font-family: var(--font);
+      font-size: 14px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(100px);
+      max-width: min(560px, calc(100vw - 32px));
+      padding: 14px 24px;
+      border-radius: 14px;
+      background: #1a1a2e;
+      color: #fff;
+      font-family: var(--font);
+      font-size: 14px;
+      font-weight: 600;
+      box-shadow: 0 12px 36px rgba(0, 0, 0, 0.3);
+      transition: transform 300ms ease-out;
+      z-index: 10050;
+      pointer-events: none;
+      text-align: center;
+    }
+    .toast.show { transform: translateX(-50%) translateY(0); }
+    .loading-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: blur(6px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+    }
+    .loading-overlay.active { display: flex; }
+    .spinner {
+      width: 48px;
+      height: 48px;
+      border: 4px solid var(--line);
+      border-top-color: var(--brand);
+      border-radius: 50%;
+      animation: spin 800ms linear infinite;
+    }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(18px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+
+    @media (max-width: 920px) {
+      .bot-section {
+        grid-template-columns: 1fr;
+      }
+      .referral-box {
+        grid-template-columns: 1fr;
+      }
+      .balance-section {
+        grid-template-columns: 1fr;
+      }
+      .hero-benefits,
+      .proof-strip,
+      .locations-grid,
+      .platform-strip,
+      .steps {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      h1 { max-width: none; }
+    }
+
+    @media (max-width: 680px) {
+      .page {
+        width: min(var(--max), calc(100% - 20px));
+        padding-top: 18px;
+      }
+      .topbar {
+        align-items: center;
+        gap: 8px;
+      }
+      .brand-text {
+        display: none;
+      }
+      .brand {
+        padding: 8px;
+        gap: 0;
+      }
+      .topbar-actions {
+        flex-shrink: 0;
+        gap: 6px;
+      }
+      .topbar-actions .ghost-link span {
+        display: none;
+      }
+      .topbar-actions .ghost-link {
+        width: 40px;
+        height: 40px;
+        min-height: 40px;
+        padding: 0;
+        border-radius: 50%;
+      }
+      .topbar-actions .ghost-link svg {
+        width: 18px;
+        height: 18px;
+      }
+      .telegram-auth-link {
+        width: 40px !important;
+        height: 40px !important;
+        min-height: 40px !important;
+        padding: 0 !important;
+        border-radius: 50% !important;
+        font-size: 0 !important;
+      }
+      .telegram-auth-link span {
+        display: none;
+      }
+      .telegram-auth-link::before {
+        content: "";
+        display: block;
+        width: 18px;
+        height: 18px;
+        background: #fff;
+        mask: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M21.5 4.5 18.4 19c-.23 1.03-.84 1.28-1.7.8l-4.7-3.47-2.27 2.18c-.25.25-.46.46-.94.46l.34-4.83 8.8-7.95c.38-.34-.08-.54-.6-.2L6.4 13.2 1.76 11.75c-1-.31-1.03-1 .22-1.49L20.2 3.3c.84-.31 1.57.2 1.3 1.2Z'/%3E%3C/svg%3E") center/contain no-repeat;
+        -webkit-mask: url("data:image/svg+xml,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M21.5 4.5 18.4 19c-.23 1.03-.84 1.28-1.7.8l-4.7-3.47-2.27 2.18c-.25.25-.46.46-.94.46l.34-4.83 8.8-7.95c.38-.34-.08-.54-.6-.2L6.4 13.2 1.76 11.75c-1-.31-1.03-1 .22-1.49L20.2 3.3c.84-.31 1.57.2 1.3 1.2Z'/%3E%3C/svg%3E") center/contain no-repeat;
+      }
+      .telegram-link {
+        width: 40px;
+        height: 40px;
+      }
+      .hero-main,
+      .section-card,
+      .bot-section {
+        padding: 22px;
+      }
+      .guide-panel-head {
+        flex-direction: column;
+      }
+      .cookie-banner {
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+      }
+      .cookie-banner-card {
+        flex-direction: column;
+        align-items: stretch;
+        padding: 16px;
+        border-radius: 18px;
+        gap: 12px;
+        text-align: center;
+      }
+      .cookie-accept-btn {
+        width: 100%;
+      }
+      .contact-box {
+        grid-template-columns: 1fr;
+      }
+      .contact-input {
+        width: 100%;
+      }
+      .hero-benefits,
+      .proof-strip,
+      .locations-grid,
+      .platform-strip,
+      .steps,
+      .balance-section,
+      .explain-grid,
+      .notice-grid,
+      .tariff-note-grid,
+      .learn-grid {
+        grid-template-columns: 1fr;
+      }
+      h1 {
+        font-size: clamp(1.8rem, 7vw, 2.3rem);
+      }
+      .hero-subtitle {
+        font-size: 15px;
+      }
+      .hero-actions {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .hero-actions .primary-link,
+      .hero-actions .telegram-auth-cta,
+      .hero-actions .accent-btn {
+        text-align: center;
+        justify-content: center;
+      }
+      .hero-actions .secondary-link {
+        text-align: center;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="topbar">
+      <a href="/buy" class="brand">
+        <img src="/api/store/logo" alt="Лого">
+        <span class="brand-text">{{SITE_NAME}}</span>
+      </a>
+      <div class="topbar-actions">
+        <button type="button" class="ghost-link" id="loginTopbarBtn" aria-label="Войти">
+          <span>Войти</span>
+        </button>
+        <button type="button" class="ghost-link telegram-auth-link" id="registerTopbarBtn" aria-label="Зарегистрироваться">
+          <span>Регистрация</span>
+        </button>
+        <a href="{{CHANNEL_URL}}" class="telegram-link" target="_blank" aria-label="Telegram">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M21.5 4.5 18.4 19c-.23 1.03-.84 1.28-1.7.8l-4.7-3.47-2.27 2.18c-.25.25-.46.46-.94.46l.34-4.83 8.8-7.95c.38-.34-.08-.54-.6-.2L6.4 13.2 1.76 11.75c-1-.31-1.03-1 .22-1.49L20.2 3.3c.84-.31 1.57.2 1.3 1.2Z"/>
+          </svg>
+        </a>
+        {{VK_LINK_HTML}}
+      </div>
+    </div>
+
+    <section class="hero">
+      <div class="hero-main">
+        <h1>Получите доступ и подключите интернет за пару минут</h1>
+        <p class="hero-subtitle">
+          Подходит для iPhone, Android, Windows, Mac, Linux и TV. После оплаты вы получите вашу ссылку и сможете подключить устройства по условиям выбранного тарифа через Happ или другой аналогичный клиент.
+        </p>
+        <div class="hero-actions">
+          <button type="button" class="accent-btn" id="demoHeroBtn">Попробовать бесплатно — 3 дня</button>
+          <a href="#tariffs" class="primary-link">Выбрать тариф</a>
+          <button type="button" class="telegram-auth-cta" id="authHeroBtn">Войти / зарегистрироваться</button>
+        </div>
+        <div class="hero-benefits">
+          <div class="hero-benefit">
+            <strong>Без карты на старте</strong>
+            <span>3 дня доступа бесплатно — просто введите email или телефон.</span>
+          </div>
+          <div class="hero-benefit">
+            <strong>Если приложение уже стоит</strong>
+            <span>Скачивать заново не нужно. Просто добавьте новую ссылку в тот же Happ.</span>
+          </div>
+          <div class="hero-benefit">
+            <strong>Устройства по тарифу</strong>
+            <span>количество подключений зависит от выбранного тарифа</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="proof-strip">
+      <div class="proof-card">
+        <strong>Просто</strong>
+        <span>понятные шаги вместо технических слов и лишних настроек</span>
+      </div>
+      <div class="proof-card">
+        <strong>6 платформ</strong>
+        <span>iPhone, Android, Windows, Mac, Linux и TV</span>
+      </div>
+      <div class="proof-card">
+        <strong>Несколько локаций</strong>
+        <span>можно переключаться между разными вариантами подключения</span>
+      </div>
+      <div class="proof-card">
+        <strong>Устройства по тарифу</strong>
+        <span>Лайт и Премиум — 3 устройства, Базовый — 1 устройство</span>
+      </div>
+    </section>
+
+    <section class="section" id="first-steps">
+      <div class="section-card">
+        <div class="section-head">
+          <h2>Сначала самое главное</h2>
+          <p>Если вы раньше этим не пользовались, вот короткое объяснение без сложных слов.</p>
+        </div>
+        <div class="explain-grid">
+          <div class="explain-card">
+            <strong>Что такое Happ</strong>
+            <p>Happ — это один из удобных клиентов для подключения. Можно использовать и другой аналогичный клиент, если вам так привычнее. Само по себе приложение ничего не даёт, пока в него не добавлена ваша ссылка.</p>
+          </div>
+          <div class="explain-card">
+            <strong>Если Happ уже установлен</strong>
+            <p>Скачивать его заново обычно не нужно. Часто достаточно открыть то же приложение или другой похожий клиент и добавить новую ссылку, которую вы получите после оплаты.</p>
+          </div>
+          <div class="explain-card">
+            <strong>Чем отличается наш сервис</strong>
+            <p>Важно не только приложение, но и сама ссылка доступа, локации и варианты подключения. Именно это влияет на удобство и стабильность работы.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="how">
+      <div class="section-card">
+        <div class="section-head">
+          <h2>Как это работает</h2>
+          <p>Для большинства людей это выглядит так. Сначала личный кабинет, потом оплата и сразу ссылка.</p>
+        </div>
+        <div class="steps">
+          <div class="step-card">
+            <div class="step-index">1</div>
+            <h3>Войдите или зарегистрируйтесь</h3>
+            <p>Нужны email или телефон и пароль от 8 знаков. Так заказ и ключ сохранятся в личном кабинете.</p>
+          </div>
+          <div class="step-card">
+            <div class="step-index">2</div>
+            <h3>Оплатите и получите ссылку</h3>
+            <p>После оплаты ссылка появится прямо на сайте. По SMS и email ключ не отправляется: email нужен для чека.</p>
+          </div>
+          <div class="step-card">
+            <div class="step-index">3</div>
+            <h3>Откройте приложение и вставьте ссылку</h3>
+            <p>Можно использовать Happ или другой аналогичный клиент. Если приложение уже стоит, просто добавьте в него вашу новую ссылку.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-card">
+        <div class="section-head">
+          <h2>Что может появиться на экране телефона</h2>
+          <p>Некоторые системные окна выглядят тревожно. На самом деле это обычные шаги подключения.</p>
+        </div>
+        <div class="notice-grid">
+          <div class="notice-card">
+            <strong>iPhone / iPad</strong>
+            <p>На iPhone может появиться окно вроде «Разрешить вставку из буфера». Это нормально.</p>
+            <ul>
+              <li>Нажмите «Разрешить», если вы только что скопировали свою ссылку.</li>
+              <li>Приложение просто берёт эту ссылку, чтобы добавить ваш доступ.</li>
+              <li>Это не означает, что кто-то читает ваши личные данные.</li>
+            </ul>
+          </div>
+          <div class="notice-card">
+            <strong>Android</strong>
+            <p>На Android может появиться запрос вроде «Разрешить приложению изменить конфигурацию соединения» или похожее системное окно.</p>
+            <ul>
+              <li>Это стандартное разрешение Android для такого типа подключения.</li>
+              <li>Формулировка может отличаться на разных моделях телефонов.</li>
+              <li>Если вы сейчас подключаете сервис по нашей инструкции, это ожидаемый шаг.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="guides">
+      <div class="section-card">
+        <div class="section-head">
+          <h2>Платформы и подключение</h2>
+          <p>Одна ссылка подходит для разных устройств. Выберите своё устройство, и ниже откроется только нужная инструкция.</p>
+        </div>
+        <div class="guides-wrap">
+          <div class="platform-strip">
+            <div class="platform-pill">iPhone<span>App Store</span></div>
+            <div class="platform-pill">Android<span>Google Play</span></div>
+            <div class="platform-pill">Windows<span>Desktop</span></div>
+            <div class="platform-pill">Mac<span>App Store</span></div>
+            <div class="platform-pill">Linux<span>deb / rpm / pkg</span></div>
+            <div class="platform-pill">TV<span>Apple TV / Android TV</span></div>
+          </div>
+          <div class="guide-tabs" id="guideTabs"></div>
+          <div class="guide-panels" id="guidePanels"></div>
+          <div class="guide-safe-note">
+            В инструкциях ниже мы показываем Happ как самый простой пример. Но вы можете использовать и другой аналогичный клиент. Логика та же: открыть приложение, вставить ссылку и выбрать локацию.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="tariffs">
+      <div class="section-card">
+        <div class="section-head">
+          <h2>Теперь можно перейти к оплате</h2>
+          <p>Если всё понятно, выберите подходящий вариант ниже. После оплаты вы получите вашу ссылку для подключения.</p>
+        </div>
+
+        <div class="notice-grid tariff-note-grid">
+          <div class="notice-card">
+            <strong>Сразу после оплаты</strong>
+            <p>Появится ваша персональная ссылка. Её можно открыть в Happ или в другом аналогичном клиенте.</p>
+          </div>
+          <div class="notice-card">
+            <strong>Устройства зависят от тарифа</strong>
+            <p>Лайт и Премиум включают 3 устройства, Базовый — 1 устройство. Дополнительные устройства можно докупить, если они доступны для тарифа.</p>
+          </div>
+          <div class="notice-card">
+            <strong>Локации можно переключать</strong>
+            <p>Если в вашей сети один вариант работает хуже, в приложении можно быстро выбрать другой.</p>
+          </div>
+        </div>
+        {{TARIFF_EXPLANATION_HTML}}
+
+        <div class="bonus-box" id="bonusBox">
+          <div class="bonus-copy">
+            <strong id="bonusTitle">На сайте есть бонус</strong>
+            <span id="bonusText">Его можно сразу списать при оплате.</span>
+          </div>
+          <label class="bonus-toggle">
+            <input type="checkbox" id="useBalanceCheckbox" checked>
+            <span>Списать сейчас</span>
+          </label>
+        </div>
+
+        <div class="tariffs" id="tariffCards"></div>
+      </div>
+    </section>
+
+    <section class="section" id="balance-topup">
+      <div class="section-card">
+        <div class="section-head">
+          <h2>Или пополните баланс</h2>
+          <p>Можно положить на баланс любую сумму и держать деньги в профиле с запасом. Туда же приходят бонусы за друзей.</p>
+        </div>
+        <div class="balance-section">
+          <div class="balance-copy">
+            <h3>Как это работает</h3>
+            <p>Баланс подходит тем, кто не хочет каждый раз платить ровно за один срок. Пополнили один раз, а дальше деньги лежат в вашем профиле.</p>
+            <div class="balance-points">
+              <div>Пополняете на любую удобную сумму.</div>
+              <div>Если включить списания, сейчас будет списываться {{DAILY_CHARGE_RUB}} ₽ в день за базовый доступ.</div>
+              <div>В профиле видно остаток и все операции.</div>
+              <div>Бонусы за приглашения тоже падают туда.</div>
+              <div>Если захотите, в профиле можно включить ежедневные списания.</div>
+            </div>
+          </div>
+          <div class="balance-form">
+            <strong>Пополнить баланс</strong>
+            <span>Введите сумму в рублях. Если вы ещё не вошли, сначала откроется регистрация или вход.</span>
+            <input type="number" min="10" max="50000" step="1" class="balance-input" id="balanceAmountInput" placeholder="Например, 300">
+            <button type="button" class="buy-btn balance-topup-btn" id="balanceTopupBtn">Пополнить баланс</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-card">
+        <div class="section-head">
+          <h2>Коротко о сервисе</h2>
+          <p>Если вы сравниваете разные сервисы и не понимаете, в чём между ними разница, вот самое важное.</p>
+        </div>
+        <div class="learn-grid">
+          <div class="learn-card">
+            <strong>Бесплатный и платный доступ</strong>
+            <p>Бесплатные варианты часто работают нестабильно, перегружены и быстро перестают подходить для повседневного использования. Платный сервис обычно даёт более понятный и стабильный опыт.</p>
+          </div>
+          <div class="learn-card">
+            <strong>Почему приложение может быть одинаковым</strong>
+            <p>Одно и то же приложение может использоваться у разных сервисов. Разница не в иконке на телефоне, а в самой ссылке доступа, локациях и качестве настройки сервиса.</p>
+          </div>
+          <div class="learn-card">
+            <strong>Почему сервис может работать по-разному</strong>
+            <p>На качество влияют локации, запасные варианты подключения и то, насколько удобно пользователю объяснили каждый шаг. Мы стараемся делать всё это максимально понятным.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-card">
+        <div class="section-head">
+          <h2>Локации и разные варианты подключения</h2>
+          <p>Сервис не завязан на одной точке. Это помогает сохранить удобство работы в разных сетях, в разное время и на разных устройствах.</p>
+        </div>
+        <div class="locations-grid">
+          <div class="location-card">
+            <div class="location-flag">🇪🇪</div>
+            <strong>Эстония</strong>
+            <span>Сейчас это самый стабильный вариант для подключения.</span>
+          </div>
+          <div class="location-card">
+            <div class="location-flag">🇩🇪</div>
+            <strong>Германия</strong>
+            <span>Стабильная локация для ежедневного использования.</span>
+          </div>
+          <div class="location-card">
+            <div class="location-flag">🇳🇱</div>
+            <strong>Нидерланды</strong>
+            <span>Быстрая и стабильная локация для подключения.</span>
+          </div>
+        </div>
+        <div class="route-note">
+          <strong>Плюс:</strong> у сервиса есть несколько вариантов подключения и резервных маршрутов. Если один способ в вашей сети работает хуже, часто помогает переключение на другой.
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="bot-section">
+        <div class="bot-copy">
+          <h2>Если удобнее, можно пользоваться через Telegram</h2>
+          <p>В боте удобно открывать профиль, видеть свои ключи, возвращаться к заказам и читать подсказки прямо в Telegram. Там же можно пригласить друга, получить процент с его оплаты на баланс и потом использовать этот баланс для оплаты наших услуг.</p>
+        </div>
+        <a href="{{BOT_URL}}" class="bot-link" target="_blank">{{BOT_HANDLE}}</a>
+      </div>
+    </section>
+
+    <section class="section" id="inviteSection" style="display:none;">
+      <div class="referral-box">
+        <div class="referral-copy">
+          <h2>Пригласить друга</h2>
+          <p>Отправьте другу свою ссылку. После его оплаты деньги придут на ваш баланс на сайте.</p>
+          <div class="referral-points">
+            <div>Ссылка открывает сайт сразу.</div>
+            <div>Начисление приходит после оплаты друга.</div>
+            <div>Эти деньги можно списать при следующей оплате.</div>
+          </div>
+        </div>
+        <div class="referral-actions">
+          <button type="button" class="referral-link referral-copy-btn" id="inviteCopyBtn" style="display:none;">Копировать</button>
+          <a href="/profile" class="referral-link referral-open-btn" id="inviteProfileLink" target="_blank" rel="noopener" style="display:none;">Открыть</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-card">
+        <div class="section-head">
+          <h2>Частые вопросы</h2>
+          <p>Коротко о том, что обычно спрашивают перед покупкой.</p>
+        </div>
+        <div class="faq">
+          <div class="faq-item">
+            <strong>У меня Happ уже установлен. Что делать?</strong>
+            <span>Обычно ничего переустанавливать не нужно. Просто откройте Happ или другой похожий клиент и добавьте новую ссылку, которую получите после оплаты.</span>
+          </div>
+          <div class="faq-item">
+            <strong>Когда я получу доступ?</strong>
+            <span>Обычно сразу после подтверждения оплаты. На странице появится персональная ссылка для подключения.</span>
+          </div>
+          <div class="faq-item">
+            <strong>Зачем нужен контакт?</strong>
+            <span>Чтобы потом открыть профиль, увидеть свои заказы и при необходимости восстановить доступ без лишней переписки.</span>
+          </div>
+          <div class="faq-item">
+            <strong>Нужен ли Telegram для покупки?</strong>
+            <span>Нет. Вы можете купить доступ прямо на сайте. Telegram-бот нужен только как дополнительный удобный способ оформления и управления.</span>
+          </div>
+          <div class="faq-item">
+            <strong>Почему одно и то же приложение может работать по-разному?</strong>
+            <span>Потому что само приложение — это только инструмент. Важно, какая у вас ссылка доступа, какие локации доступны и как настроен сам сервис.</span>
+          </div>
+          <div class="faq-item">
+            <strong>Обязательно использовать именно Happ?</strong>
+            <span>Нет. Happ — это просто самый понятный пример для большинства пользователей. Можно использовать и другой аналогичный клиент, если он поддерживает вашу ссылку.</span>
+          </div>
+          <div class="faq-item">
+            <strong>Если возникнут вопросы?</strong>
+            <span>Напишите во встроенный чат поддержки. Кнопка чата есть на странице.</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="footer">
+      <p style="margin-bottom: 10px;"><a href="/profile">Мой профиль</a> — посмотреть заказы и ключи</p>
+      <p>Нужна помощь? <a href="{{SUPPORT_URL}}">Откройте чат поддержки</a></p>
+    </div>
+  </div>
+
+  <div class="cookie-banner" id="cookieBanner" aria-hidden="true">
+    <div class="cookie-banner-card">
+      <div class="cookie-banner-copy">
+        <h3>Мы используем cookies</h3>
+        <p>Они нужны, чтобы сайт запоминал ваш профиль и работал удобнее при повторных заходах.</p>
+      </div>
+      <button type="button" class="cookie-accept-btn" id="cookieAcceptBtn">Принять</button>
+    </div>
+  </div>
+
+  <!-- Demo modal -->
+  <div class="demo-overlay" id="demoOverlay">
+    <div class="demo-modal">
+      <button type="button" class="demo-modal-close" id="demoModalClose">✕</button>
+      <div id="demoFormContent">
+        <h3>Попробовать бесплатно</h3>
+        <p>Демо-доступ создаётся в личном кабинете. Если вы ещё не вошли, сначала откроется регистрация или вход.</p>
+        <button type="button" class="demo-submit-btn" id="demoSubmitBtn">Создать демо-доступ</button>
+        <p class="demo-note">Покупка тарифа на наших серверах потом продлит этот же ключ. VHQ-тариф выдаст отдельный ключ.</p>
+      </div>
+      <div id="demoSuccessContent" style="display:none;">
+        <div class="demo-success-icon">🎁</div>
+        <h3>Доступ готов</h3>
+        <p>Скопируйте ссылку и добавьте её в Happ или любой похожий клиент. Действует 3 дня.</p>
+        <div class="demo-url-box" id="demoUrlBox"></div>
+        <button type="button" class="demo-copy-btn" id="demoCopyBtn">Скопировать ссылку</button>
+        <a href="#first-steps" class="demo-platform-link" id="demoHowLink">Как подключить →</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="demo-overlay" id="authOverlay">
+    <div class="demo-modal">
+      <button type="button" class="demo-modal-close" id="authModalClose">✕</button>
+      <h3 id="authTitle">Войти в личный кабинет</h3>
+      <p id="authText">Введите email или телефон и пароль. После входа мы сразу вернём вас к оплате.</p>
+      <input type="text" class="demo-input" id="authContactInput" placeholder="Email или телефон" autocomplete="username" autocorrect="off">
+      <input type="password" class="demo-input" id="authPasswordInput" placeholder="Пароль от 8 знаков" autocomplete="current-password">
+      <input type="password" class="demo-input" id="authPassword2Input" placeholder="Повторите пароль" autocomplete="new-password" style="display:none;">
+      <button type="button" class="demo-submit-btn" id="authSubmitBtn">Войти</button>
+      <p class="demo-note" id="authSwitchText">Нет профиля? <a href="#" id="authSwitchLink">Зарегистрироваться</a></p>
+      <p class="demo-note" style="margin-top:8px;">Ключ после оплаты появится на сайте. На email приходит чек, не ключ.</p>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <div class="loading-overlay" id="loading">
+    <div class="spinner"></div>
+  </div>
+
+  <!-- Support Chat Widget -->
+  <style>
+    .support-fab {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      width: auto;
+      min-width: 56px;
+      height: 48px;
+      padding: 0 16px 0 12px;
+      border-radius: 999px;
+      background: #0c8c8c;
+      color: #fff;
+      border: none;
+      cursor: pointer;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+      font-size: 15px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      z-index: 9000;
+      transition: transform 0.2s, background 0.2s;
+      white-space: nowrap;
+    }
+    .support-fab .fab-icon { font-size: 20px; line-height: 1; }
+    .support-fab .fab-label { font-size: 13px; font-weight: 700; }
+    .support-fab:hover { background: #0a7070; transform: scale(1.03); }
+    .support-popup {
+      position: fixed;
+      bottom: 86px;
+      right: 24px;
+      width: 380px;
+      height: 560px;
+      max-width: calc(100vw - 48px);
+      max-height: calc(100vh - 120px);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.22);
+      z-index: 9001;
+      display: none;
+      flex-direction: column;
+      background: #fffaf4;
+    }
+    .support-popup.open { display: flex; }
+    .support-popup iframe {
+      width: 100%;
+      flex: 1;
+      border: none;
+      display: block;
+      min-height: 0;
+      background: #fffaf4;
+    }
+    @media (max-width: 640px) {
+      .support-fab {
+        right: max(16px, env(safe-area-inset-right));
+        bottom: max(16px, env(safe-area-inset-bottom));
+      }
+      .support-popup {
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: 100vw;
+        height: min(680px, 100dvh);
+        max-width: none;
+        max-height: 100dvh;
+        border-radius: 18px 18px 0 0;
+      }
+    }
+  </style>
+
+  <button class="support-fab" id="supportFab" onclick="toggleSupportChat()" title="Чат с поддержкой">
+    <span class="fab-icon" id="fabIcon">💬</span>
+    <span class="fab-label" id="fabLabel">Есть вопросы?</span>
+  </button>
+  <div class="support-popup" id="supportPopup">
+    <iframe id="supportFrame" title="Чат с поддержкой" allow="autoplay"></iframe>
+  </div>
+
+  <script>
+    const tariffs = {{TARIFFS_JSON}};
+    const refSource = new URLSearchParams(window.location.search).get("ref") || "";
+    const COOKIE_CONSENT_KEY = "webstore_cookie_consent";
+    const PROFILE_COOKIE = "webstore_profile_token";
+    const PROFILE_COOKIE_MAX_AGE = 60 * 60 * 24 * 30;
+    const CONTACT_DRAFT_KEY = "webstore_contact_draft";
+    let telegramAuthPoll = null;
+
+    // Capture entry referrer/URL once on page load, persist in sessionStorage
+    (function() {
+      const ENTRY_REF_KEY = "ws_entry_referrer";
+      const ENTRY_URL_KEY = "ws_entry_url";
+      if (!sessionStorage.getItem(ENTRY_URL_KEY)) {
+        sessionStorage.setItem(ENTRY_REF_KEY, document.referrer || "");
+        sessionStorage.setItem(ENTRY_URL_KEY, window.location.href || "");
+      }
+    })();
+    function getEntryReferrer() { return sessionStorage.getItem("ws_entry_referrer") || ""; }
+    function getEntryUrl() { return sessionStorage.getItem("ws_entry_url") || ""; }
+
+    function toggleSupportChat() {
+      const popup = document.getElementById('supportPopup');
+      const frame = document.getElementById('supportFrame');
+      const isOpen = popup.classList.toggle('open');
+      if (isOpen && frame.dataset.loaded !== '1') {
+        frame.src = '/support?widget=1';
+        frame.dataset.loaded = '1';
+      }
+      document.getElementById('fabIcon').textContent = isOpen ? '✕' : '💬';
+      document.getElementById('fabLabel').textContent = isOpen ? 'Закрыть' : 'Есть вопросы?';
+    }
+    let authMode = "login";
+    let pendingTariffKey = "";
+    let pendingBalanceTopup = false;
+    let pendingDemoAccess = false;
+    const contactModes = {
+      email: {
+        placeholder: "name@mail.ru",
+        hint: "name@mail.ru",
+        inputMode: "email",
+        autocomplete: "email",
+      },
+      telegram: {
+        placeholder: "@username",
+        hint: "@username",
+        inputMode: "text",
+        autocomplete: "username",
+      },
+      phone: {
+        placeholder: "+7 999 123-45-67",
+        hint: "+7 999 123-45-67",
+        inputMode: "tel",
+        autocomplete: "tel",
+      },
+    };
+    let currentContactMode = "email";
+    const guides = {
+      ios: {
+        tab: "iPhone / iPad",
+        title: "iPhone и iPad",
+        description: "Можно использовать Happ или другой аналогичный клиент. Ниже самый простой вариант на примере Happ.",
+        appLabel: "Открыть Happ в App Store",
+        appUrl: "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973",
+        steps: [
+          "Установите Happ из App Store.",
+          "Если Happ уже установлен, просто откройте его и ничего не скачивайте заново.",
+          "После оплаты скопируйте вашу ссылку.",
+          "Откройте Happ и нажмите +, чтобы добавить новую ссылку.",
+          "Если iPhone спросит про вставку из буфера, нажмите «Разрешить». Это нужно для добавления вашей ссылки.",
+          "Сохраните добавление, выберите нужную локацию и включите подключение."
+        ]
+      },
+      android: {
+        tab: "Android",
+        title: "Android",
+        description: "Можно использовать Happ или другой аналогичный клиент. Ниже самый простой вариант на примере Happ.",
+        appLabel: "Открыть Happ в Google Play",
+        appUrl: "https://play.google.com/store/apps/details?id=com.happproxy",
+        steps: [
+          "Установите Happ из Google Play.",
+          "Если Happ уже установлен, просто откройте его.",
+          "Скопируйте вашу ссылку после оплаты.",
+          "В приложении нажмите + и выберите добавление по ссылке.",
+          "Если Android покажет системное окно про настройку соединения, подтвердите его. Это обычный шаг.",
+          "Выберите подходящую локацию и включите подключение."
+        ]
+      },
+      windows: {
+        tab: "Windows",
+        title: "Windows",
+        description: "Можно использовать Happ или другой аналогичный клиент. Ниже самый простой вариант на примере Happ.",
+        appLabel: "Скачать Happ для Windows",
+        appUrl: "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe",
+        steps: [
+          "Скачайте и установите Happ для Windows.",
+          "Если Happ уже установлен, просто откройте его.",
+          "Скопируйте вашу ссылку доступа.",
+          "В приложении добавьте новую ссылку.",
+          "Дождитесь, пока появятся доступные локации.",
+          "Выберите нужный вариант и включите подключение."
+        ]
+      },
+      mac: {
+        tab: "Mac",
+        title: "Mac",
+        description: "Можно использовать Happ или другой аналогичный клиент. Ниже самый простой вариант на примере Happ.",
+        appLabel: "Открыть Happ для Mac",
+        appUrl: "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973?platform=mac",
+        steps: [
+          "Установите Happ на Mac через App Store.",
+          "Если Happ уже установлен, просто откройте его.",
+          "Скопируйте вашу ссылку после оплаты.",
+          "Добавьте эту ссылку в Happ.",
+          "Дождитесь, пока загрузятся локации.",
+          "Выберите сервер и включите подключение."
+        ]
+      },
+      linux: {
+        tab: "Linux",
+        title: "Linux",
+        description: "Для Linux можно использовать Happ или другой аналогичный клиент. Ниже показан самый простой ориентир.",
+        appLabel: "Открыть страницу загрузок Happ",
+        appUrl: "https://www.happ.su/main/ru",
+        steps: [
+          "Откройте официальную страницу Happ и выберите сборку для Linux.",
+          "Установите подходящий пакет для вашей системы.",
+          "После оплаты скопируйте вашу ссылку.",
+          "Добавьте эту ссылку в Happ.",
+          "Дождитесь загрузки локаций и включите подключение."
+        ]
+      },
+      tv: {
+        tab: "TV",
+        title: "TV",
+        description: "Для TV можно использовать Happ или другой аналогичный клиент. Ниже показан вариант на примере Happ.",
+        appLabel: "Открыть страницу Happ",
+        appUrl: "https://www.happ.su/main/ru",
+        steps: [
+          "Откройте страницу Happ и выберите версию для вашей TV-платформы.",
+          "Установите приложение на телевизор или приставку.",
+          "Скопируйте вашу ссылку на другом устройстве.",
+          "Добавьте её в Happ на телевизоре или приставке.",
+          "Выберите нужную локацию и включите подключение."
+        ]
+      }
+    };
+
+    function renderTariffs() {
+      const container = document.getElementById("tariffCards");
+      tariffs.forEach((t, i) => {
+        const perDay = (t.price_rub / t.days).toFixed(1);
+        const featured = i === tariffs.length - 1;
+        const card = document.createElement("div");
+        card.className = "tariff-card" + (featured ? " featured" : "");
+        card.innerHTML = `
+          ${t.badge ? `<div class="tariff-badge">${t.badge}</div>` : ""}
+          <div class="tariff-label">${t.label}</div>
+          <div class="tariff-desc">${t.description}</div>
+          <div class="tariff-price">${t.price_rub} <span>₽</span></div>
+          <div class="tariff-per-month">${t.days >= 365 ? Math.round(t.price_rub / 12) + " ₽/мес" : "Оплата одним платежом"}</div>
+          <div class="tariff-per-day">${perDay} ₽ в день</div>
+          <ul class="tariff-features">
+            ${(t.features || []).map(f => `<li>${f}</li>`).join("")}
+          </ul>
+          <button class="buy-btn" data-key="${t.key}">Перейти к оплате</button>
+        `;
+        container.appendChild(card);
+      });
+    }
+
+    function showToast(msg) {
+      const el = document.getElementById("toast");
+      el.textContent = msg;
+      el.classList.add("show");
+      setTimeout(() => el.classList.remove("show"), 4000);
+    }
+
+    function saveProfileToken(token) {
+      document.cookie = `${PROFILE_COOKIE}=${encodeURIComponent(token)}; Max-Age=${PROFILE_COOKIE_MAX_AGE}; Path=/; SameSite=Lax; Secure`;
+    }
+
+    function getSavedProfileToken() {
+      const cookies = document.cookie ? document.cookie.split("; ") : [];
+      for (const row of cookies) {
+        if (row.startsWith(`${PROFILE_COOKIE}=`)) {
+          return decodeURIComponent(row.slice(PROFILE_COOKIE.length + 1));
+        }
+      }
+      return "";
+    }
+
+    function saveContactDraft(value) {
+      const normalized = value.trim();
+      if (!normalized) {
+        localStorage.removeItem(CONTACT_DRAFT_KEY);
+        return;
+      }
+      localStorage.setItem(CONTACT_DRAFT_KEY, normalized);
+    }
+
+    function getSavedContactDraft() {
+      return localStorage.getItem(CONTACT_DRAFT_KEY) || "";
+    }
+
+    function detectContactMode(value) {
+      const normalized = value.trim();
+      if (!normalized) return currentContactMode || "email";
+      if (normalized.startsWith("@")) return "telegram";
+      if (/^[+\d][\d\s\-()]{5,}$/.test(normalized)) return "phone";
+      if (normalized.includes("@")) return "email";
+      return currentContactMode || "email";
+    }
+
+    function setContactMode(mode, { focus = false } = {}) {
+      if (!contactModes[mode]) return;
+      currentContactMode = mode;
+      const input = document.getElementById("contactInput");
+      const hint = document.getElementById("contactHint");
+      if (!input || !hint) return;
+
+      document.querySelectorAll(".contact-type-chip").forEach((chip) => {
+        chip.classList.toggle("active", chip.dataset.contactMode === mode);
+      });
+
+      const config = contactModes[mode];
+      input.placeholder = config.placeholder;
+      input.setAttribute("inputmode", config.inputMode);
+      input.setAttribute("autocomplete", config.autocomplete);
+      hint.innerHTML = `<strong>Например:</strong> ${config.hint}`;
+
+      if (focus) {
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+      }
+    }
+
+    function initContactForm() {
+      const input = document.getElementById("contactInput");
+      if (!input) return;
+
+      const savedDraft = getSavedContactDraft();
+      if (savedDraft) {
+        input.value = savedDraft;
+        currentContactMode = detectContactMode(savedDraft);
+      }
+      setContactMode(currentContactMode);
+
+      document.querySelectorAll(".contact-type-chip").forEach((chip) => {
+        chip.addEventListener("click", () => {
+          const mode = chip.dataset.contactMode;
+          if (!mode) return;
+          if (mode === "phone" && !input.value.trim()) {
+            input.value = "+7 ";
+          }
+          setContactMode(mode, { focus: true });
+          saveContactDraft(input.value);
+        });
+      });
+
+      input.addEventListener("input", () => {
+        const value = input.value;
+        saveContactDraft(value);
+        const detectedMode = detectContactMode(value);
+        if (detectedMode !== currentContactMode) {
+          setContactMode(detectedMode);
+        }
+      });
+    }
+
+    function syncAuthButtons() {
+      const token = getSavedProfileToken();
+      const loginBtn = document.getElementById("loginTopbarBtn");
+      const registerBtn = document.getElementById("registerTopbarBtn");
+      const heroBtn = document.getElementById("authHeroBtn");
+      if (!loginBtn || !registerBtn || !heroBtn) return;
+
+      if (token) {
+        loginBtn.textContent = "Профиль";
+        registerBtn.classList.add("hidden");
+        heroBtn.textContent = "Мой профиль";
+      } else {
+        loginBtn.textContent = "Войти";
+        registerBtn.classList.remove("hidden");
+        heroBtn.textContent = "Войти / зарегистрироваться";
+      }
+    }
+
+    async function loadInviteSection() {
+      const token = getSavedProfileToken();
+      const section = document.getElementById("inviteSection");
+      const link = document.getElementById("inviteProfileLink");
+      const copyBtn = document.getElementById("inviteCopyBtn");
+      if (!section || !link || !copyBtn || !token) {
+        return;
+      }
+
+      try {
+        const resp = await fetch(`/api/store/profile-orders?token=${encodeURIComponent(token)}`);
+        const data = await resp.json();
+        if (!resp.ok || !data.referral || !data.referral.site_url) {
+          return;
+        }
+        const url = data.referral.site_url;
+        link.href = url;
+        link.style.display = "";
+        copyBtn.style.display = "";
+        copyBtn.addEventListener("click", () => {
+          navigator.clipboard.writeText(url).then(() => {
+            const orig = copyBtn.textContent;
+            copyBtn.textContent = "Скопировано!";
+            setTimeout(() => { copyBtn.textContent = orig; }, 2000);
+          });
+        });
+        section.style.display = "block";
+      } catch {
+        // ignore temporary network errors
+      }
+    }
+
+    async function loadWebBalanceHint() {
+      const token = getSavedProfileToken();
+      const box = document.getElementById("bonusBox");
+      const title = document.getElementById("bonusTitle");
+      const text = document.getElementById("bonusText");
+      if (!token || !box || !title || !text) {
+        return;
+      }
+      try {
+        const resp = await fetch(`/api/store/profile-orders?token=${encodeURIComponent(token)}`);
+        const data = await resp.json();
+        if (!resp.ok || !data.referral || !Number(data.referral.balance_rub || 0)) {
+          return;
+        }
+        const balance = Number(data.referral.balance_rub);
+        title.textContent = `На сайте доступно ${balance.toFixed(2)} ₽`;
+        text.textContent = "Эту сумму можно сразу списать при оплате или оставить на следующую покупку.";
+        box.style.display = "flex";
+      } catch {
+        // ignore temporary network errors
+      }
+    }
+
+    function setLoading(on) {
+      document.getElementById("loading").classList.toggle("active", on);
+    }
+
+    function initCookieConsent() {
+      if (localStorage.getItem(COOKIE_CONSENT_KEY) === "accepted") {
+        return;
+      }
+      const modal = document.getElementById("cookieBanner");
+      const btn = document.getElementById("cookieAcceptBtn");
+      modal.classList.add("active");
+      modal.setAttribute("aria-hidden", "false");
+      btn.addEventListener("click", () => {
+        localStorage.setItem(COOKIE_CONSENT_KEY, "accepted");
+        modal.classList.remove("active");
+        modal.setAttribute("aria-hidden", "true");
+      }, { once: true });
+    }
+
+    function renderGuides() {
+      const tabsEl = document.getElementById("guideTabs");
+      const panelsEl = document.getElementById("guidePanels");
+      const order = ["ios", "android", "windows", "mac", "linux", "tv"];
+      const detected = detectPlatform();
+
+      order.forEach((key) => {
+        const guide = guides[key];
+        const active = key === detected;
+
+        const tab = document.createElement("button");
+        tab.type = "button";
+        tab.className = "guide-tab" + (active ? " active" : "");
+        tab.textContent = guide.tab;
+        tab.dataset.guide = key;
+        tab.addEventListener("click", () => setActiveGuide(key));
+        tabsEl.appendChild(tab);
+
+        const panel = document.createElement("div");
+        panel.className = "guide-panel" + (active ? " active" : "");
+        panel.id = `guide-panel-${key}`;
+        panel.innerHTML = `
+          <div class="guide-panel-head">
+            <div>
+              <h3>${guide.title}</h3>
+              <p>${guide.description}</p>
+            </div>
+            <a class="guide-link" href="${guide.appUrl}" target="_blank">${guide.appLabel}</a>
+          </div>
+          <ol class="guide-steps">${guide.steps.map(step => `<li>${step}</li>`).join("")}</ol>
+        `;
+        panelsEl.appendChild(panel);
+      });
+    }
+
+    function setActiveGuide(key) {
+      document.querySelectorAll(".guide-tab").forEach((tab) => {
+        tab.classList.toggle("active", tab.dataset.guide === key);
+      });
+      document.querySelectorAll(".guide-panel").forEach((panel) => {
+        panel.classList.toggle("active", panel.id === `guide-panel-${key}`);
+      });
+    }
+
+    function detectPlatform() {
+      const ua = navigator.userAgent.toLowerCase();
+      if (ua.includes("iphone") || ua.includes("ipad")) return "ios";
+      if (ua.includes("android") && ua.includes("tv")) return "tv";
+      if (ua.includes("tvos") || ua.includes("appletv")) return "tv";
+      if (ua.includes("linux")) return "linux";
+      if (ua.includes("macintosh")) return "mac";
+      if (ua.includes("windows")) return "windows";
+      if (ua.includes("android")) return "android";
+      return "ios";
+    }
+
+    function setAuthMode(mode) {
+      authMode = mode === "register" ? "register" : "login";
+      const isRegister = authMode === "register";
+      document.getElementById("authTitle").textContent = isRegister ? "Регистрация" : "Войти в личный кабинет";
+      document.getElementById("authText").textContent = isRegister
+        ? "Введите email или телефон и придумайте пароль от 8 знаков."
+        : "Введите email или телефон и пароль. После входа мы сразу вернём вас к оплате.";
+      document.getElementById("authPassword2Input").style.display = isRegister ? "block" : "none";
+      document.getElementById("authPasswordInput").autocomplete = isRegister ? "new-password" : "current-password";
+      document.getElementById("authSubmitBtn").textContent = isRegister ? "Зарегистрироваться" : "Войти";
+      document.getElementById("authSwitchText").innerHTML = isRegister
+        ? 'Уже есть профиль? <a href="#" id="authSwitchLink">Войти</a>'
+        : 'Нет профиля? <a href="#" id="authSwitchLink">Зарегистрироваться</a>';
+      document.getElementById("authSwitchLink").addEventListener("click", (e) => {
+        e.preventDefault();
+        setAuthMode(isRegister ? "login" : "register");
+      });
+    }
+
+    function openAuthModal(mode = "login", tariffKey = "") {
+      pendingTariffKey = tariffKey || "";
+      setAuthMode(mode);
+      const contact = document.getElementById("contactInput")?.value.trim() || getSavedContactDraft();
+      if (contact) document.getElementById("authContactInput").value = contact;
+      document.getElementById("authOverlay").classList.add("active");
+      setTimeout(() => document.getElementById("authContactInput").focus(), 50);
+    }
+
+    function closeAuthModal() {
+      document.getElementById("authOverlay").classList.remove("active");
+    }
+
+    async function submitAuth() {
+      const contact = document.getElementById("authContactInput").value.trim();
+      const password = document.getElementById("authPasswordInput").value;
+      const password2 = document.getElementById("authPassword2Input").value;
+      if (!contact) { showToast("Введите email или телефон"); return; }
+      if (password.length < 8) { showToast("Пароль должен быть не короче 8 знаков"); return; }
+      if (authMode === "register" && password !== password2) { showToast("Пароли не совпадают"); return; }
+      const btn = document.getElementById("authSubmitBtn");
+      btn.disabled = true;
+      btn.textContent = authMode === "register" ? "Регистрируем…" : "Входим…";
+      try {
+        const resp = await fetch(`/api/store/auth/${authMode}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contact, password, password2 }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          showToast(data.error || "Не удалось войти");
+          return;
+        }
+        if (data.token) saveProfileToken(data.token);
+        saveContactDraft(contact);
+        closeAuthModal();
+        syncAuthButtons();
+        showToast(authMode === "register" ? "Профиль создан" : "Вы вошли");
+        const tariff = pendingTariffKey;
+        const resumeBalanceTopup = pendingBalanceTopup;
+        const resumeDemoAccess = pendingDemoAccess;
+        pendingTariffKey = "";
+        pendingBalanceTopup = false;
+        pendingDemoAccess = false;
+        if (tariff) buyTariff(tariff);
+        if (!tariff && resumeBalanceTopup) createBalanceTopup();
+        if (!tariff && !resumeBalanceTopup && resumeDemoAccess) requestDemoAccess();
+      } catch {
+        showToast("Ошибка сети. Попробуйте ещё раз.");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = authMode === "register" ? "Зарегистрироваться" : "Войти";
+      }
+    }
+
+    async function buyTariff(key) {
+      const contact = document.getElementById("contactInput")?.value.trim() || getSavedContactDraft();
+      const savedToken = getSavedProfileToken();
+      const useBalance = !!document.getElementById("useBalanceCheckbox")?.checked;
+      if (!savedToken) {
+        openAuthModal("register", key);
+        showToast("Сначала создайте личный кабинет. После входа откроется оплата.");
+        return;
+      }
+      saveContactDraft(contact);
+      setLoading(true);
+
+      try {
+        const resp = await fetch("/api/store/create-order", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tariff_key: key,
+            contact: contact || undefined,
+            ref: refSource || undefined,
+            use_balance: useBalance,
+            entry_referrer: getEntryReferrer() || undefined,
+            entry_url: getEntryUrl() || undefined,
+          }),
+        });
+
+        const data = await resp.json();
+
+        if (data.redirect_url) {
+          window.location.href = data.redirect_url;
+          return;
+        }
+
+        if (resp.status === 401 && data.auth_required) {
+          openAuthModal("login", key);
+          showToast(data.error || "Сначала войдите");
+          return;
+        }
+        showToast(data.error || "Произошла ошибка");
+      } catch (e) {
+        showToast("Ошибка сети. Попробуйте ещё раз.");
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    async function createBalanceTopup() {
+      const input = document.getElementById("balanceAmountInput");
+      const amount = Number((input?.value || "").trim());
+      const token = getSavedProfileToken();
+      if (!amount || amount < 10 || amount > 50000) {
+        showToast("Введите сумму от 10 до 50 000 ₽");
+        return;
+      }
+      if (!token) {
+        pendingBalanceTopup = true;
+        openAuthModal("register");
+        showToast("Сначала создайте личный кабинет. После входа откроется пополнение.");
+        return;
+      }
+
+      setLoading(true);
+      try {
+        const resp = await fetch("/api/store/create-balance-topup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token, amount_rub: amount }),
+        });
+        const data = await resp.json();
+        if (data.redirect_url) {
+          window.location.href = data.redirect_url;
+          return;
+        }
+        if (resp.status === 401 && data.auth_required) {
+          pendingBalanceTopup = true;
+          openAuthModal("login");
+          showToast(data.error || "Сначала войдите");
+          return;
+        }
+        showToast(data.error || "Не удалось открыть оплату");
+      } catch (e) {
+        showToast("Ошибка сети. Попробуйте ещё раз.");
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    async function startTelegramLogin(triggerBtn) {
+      const original = triggerBtn.textContent;
+      triggerBtn.disabled = true;
+      triggerBtn.textContent = "Открываем...";
+      try {
+        const resp = await fetch("/api/store/telegram-auth-init", { method: "POST" });
+        const data = await resp.json();
+        if (!resp.ok || !data.code || !data.link_url) {
+          showToast(data.error || "Не удалось начать вход");
+          return;
+        }
+        window.open(data.link_url, "_blank", "noopener");
+        showToast("Подтвердите вход в {{BOT_HANDLE}}");
+        startTelegramAuthPolling(data.code);
+      } catch {
+        showToast("Ошибка сети. Попробуйте ещё раз.");
+      } finally {
+        triggerBtn.disabled = false;
+        triggerBtn.textContent = original;
+      }
+    }
+
+    function startTelegramAuthPolling(code) {
+      if (telegramAuthPoll) clearInterval(telegramAuthPoll);
+      const check = async () => {
+        try {
+          const resp = await fetch(`/api/store/telegram-auth-status?code=${encodeURIComponent(code)}`);
+          const data = await resp.json();
+          if (data.status === "completed" && data.token) {
+            clearInterval(telegramAuthPoll);
+            telegramAuthPoll = null;
+            saveProfileToken(data.token);
+            syncAuthButtons();
+            window.location.href = "/profile";
+            return;
+          }
+          if (data.status === "expired") {
+            clearInterval(telegramAuthPoll);
+            telegramAuthPoll = null;
+            showToast("Ссылка истекла. Попробуйте ещё раз.");
+          }
+        } catch {
+          // temporary network errors
+        }
+      };
+      check();
+      telegramAuthPoll = setInterval(check, 2000);
+      setTimeout(() => {
+        if (telegramAuthPoll) {
+          clearInterval(telegramAuthPoll);
+          telegramAuthPoll = null;
+        }
+      }, 1000 * 60 * 2);
+    }
+
+    document.addEventListener("click", (e) => {
+      if (e.target.classList.contains("buy-btn") && e.target.dataset.key) {
+        buyTariff(e.target.dataset.key);
+      }
+    });
+
+    document.getElementById("loginTopbarBtn").addEventListener("click", function () {
+      if (getSavedProfileToken()) {
+        window.location.href = "/profile";
+        return;
+      }
+      openAuthModal("login");
+    });
+    document.getElementById("registerTopbarBtn").addEventListener("click", function () {
+      openAuthModal("register");
+    });
+    document.getElementById("authHeroBtn").addEventListener("click", function () {
+      if (getSavedProfileToken()) {
+        window.location.href = "/profile";
+        return;
+      }
+      openAuthModal("register");
+    });
+    document.getElementById("balanceTopupBtn").addEventListener("click", createBalanceTopup);
+    document.getElementById("authSubmitBtn").addEventListener("click", submitAuth);
+    document.getElementById("authModalClose").addEventListener("click", closeAuthModal);
+    document.getElementById("authOverlay").addEventListener("click", (e) => {
+      if (e.target === e.currentTarget) closeAuthModal();
+    });
+    ["authContactInput", "authPasswordInput", "authPassword2Input"].forEach((id) => {
+      document.getElementById(id).addEventListener("keydown", (e) => {
+        if (e.key === "Enter") submitAuth();
+      });
+    });
+
+    // Demo modal
+    function openDemoModal() {
+      if (!getSavedProfileToken()) {
+        pendingDemoAccess = true;
+        openAuthModal("register");
+        showToast("Сначала создайте личный кабинет. После входа демо откроется автоматически.");
+        return;
+      }
+      document.getElementById("demoOverlay").classList.add("active");
+      document.getElementById("demoFormContent").style.display = "block";
+      document.getElementById("demoSuccessContent").style.display = "none";
+      requestDemoAccess();
+    }
+    function closeDemoModal() {
+      document.getElementById("demoOverlay").classList.remove("active");
+    }
+    async function requestDemoAccess() {
+      const token = getSavedProfileToken();
+      if (!token) {
+        pendingDemoAccess = true;
+        openAuthModal("register");
+        showToast("Сначала создайте личный кабинет. После входа демо откроется автоматически.");
+        return;
+      }
+      document.getElementById("demoOverlay").classList.add("active");
+      const btn = document.getElementById("demoSubmitBtn");
+      btn.disabled = true;
+      btn.textContent = "Создаём доступ…";
+      try {
+        const resp = await fetch("/api/store/create-profile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          if (resp.status === 401 && data.auth_required) {
+            closeDemoModal();
+            pendingDemoAccess = true;
+            openAuthModal("login");
+            showToast(data.error || "Сначала войдите");
+            return;
+          }
+          showToast(data.error || "Ошибка. Попробуйте ещё раз.");
+          btn.disabled = false;
+          btn.textContent = "Создать демо-доступ";
+          return;
+        }
+        if (data.token) saveProfileToken(data.token);
+        if (data.demo_subscription_url) {
+          document.getElementById("demoUrlBox").textContent = data.demo_subscription_url;
+          document.getElementById("demoFormContent").style.display = "none";
+          document.getElementById("demoSuccessContent").style.display = "block";
+          syncAuthButtons();
+        } else {
+          showToast("Демо-доступ недоступен. Выберите тариф.");
+          closeDemoModal();
+        }
+      } catch {
+        showToast("Ошибка сети. Попробуйте ещё раз.");
+        btn.disabled = false;
+        btn.textContent = "Создать демо-доступ";
+      }
+    }
+
+    document.getElementById("demoHeroBtn").addEventListener("click", openDemoModal);
+    document.getElementById("demoModalClose").addEventListener("click", closeDemoModal);
+    document.getElementById("demoOverlay").addEventListener("click", (e) => {
+      if (e.target === e.currentTarget) closeDemoModal();
+    });
+    document.getElementById("demoSubmitBtn").addEventListener("click", requestDemoAccess);
+    document.getElementById("demoCopyBtn").addEventListener("click", function () {
+      const url = document.getElementById("demoUrlBox").textContent;
+      navigator.clipboard.writeText(url).then(() => {
+        this.textContent = "Скопировано ✓";
+        setTimeout(() => { this.textContent = "Скопировать ссылку"; }, 2500);
+      });
+    });
+    document.getElementById("demoHowLink").addEventListener("click", closeDemoModal);
+
+    renderTariffs();
+    renderGuides();
+    initContactForm();
+    initCookieConsent();
+    syncAuthButtons();
+    loadInviteSection();
+    loadWebBalanceHint();
+  </script>
+</body>
+</html>

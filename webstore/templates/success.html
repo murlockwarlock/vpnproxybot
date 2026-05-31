@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Оплата прошла — ваш доступ готов</title>
+  <link rel="icon" type="image/svg+xml" href="/api/store/favicon">
+  <link rel="apple-touch-icon" href="/api/store/logo">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f6efe5;
+      --panel: rgba(255, 250, 243, 0.86);
+      --text: #12212b;
+      --muted: #5c6c75;
+      --line: rgba(18, 33, 43, 0.12);
+      --brand: #0c8c8c;
+      --brand-deep: #0f5e63;
+      --accent: #f08a24;
+      --green: #1a9956;
+      --shadow: 0 18px 44px rgba(20, 44, 54, 0.14);
+      --radius-xl: 28px;
+      --radius-lg: 20px;
+      --radius-md: 16px;
+      --max: 720px;
+      --font: "Manrope", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; }
+    body {
+      min-height: 100vh;
+      font-family: var(--font);
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(240, 138, 36, 0.20), transparent 34%),
+        radial-gradient(circle at top right, rgba(12, 140, 140, 0.16), transparent 28%),
+        linear-gradient(180deg, #fff8ef 0%, #f7f0e7 50%, #f2eadf 100%);
+    }
+    .page {
+      width: min(var(--max), calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 64px;
+    }
+
+    /* States */
+    .state { display: none; }
+    .state.active { display: block; }
+
+    /* Pending */
+    .pending-box {
+      text-align: center;
+      padding: 48px 24px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-xl);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .pending-spinner {
+      width: 56px; height: 56px;
+      border: 4px solid var(--line);
+      border-top-color: var(--brand);
+      border-radius: 50%;
+      animation: spin 800ms linear infinite;
+      margin: 0 auto 20px;
+    }
+    .pending-box h2 { font-size: 1.3rem; margin-bottom: 8px; }
+    .pending-box p { color: var(--muted); font-size: 15px; }
+    .pending-actions {
+      display: none;
+      margin-top: 18px;
+      justify-content: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .pending-actions.visible { display: flex; }
+    .secondary-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px 20px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.7);
+      color: var(--text);
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 14px;
+    }
+
+    /* Success */
+    .success-header {
+      text-align: center;
+      margin-bottom: 28px;
+      animation: fadeUp 500ms ease-out both;
+    }
+    .success-icon {
+      width: 64px; height: 64px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--green), #22c55e);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 16px;
+      font-size: 28px;
+      color: #fff;
+    }
+    .success-header h1 {
+      font-size: 1.6rem;
+      letter-spacing: -0.03em;
+    }
+    .success-header p {
+      color: var(--muted);
+      margin-top: 6px;
+      font-size: 15px;
+    }
+
+    /* Key card */
+    .key-card {
+      padding: 24px;
+      border: 2px solid var(--brand);
+      border-radius: var(--radius-xl);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      margin-bottom: 24px;
+      animation: fadeUp 500ms ease-out 100ms both;
+    }
+    .key-card h3 {
+      font-size: 1rem;
+      margin-bottom: 12px;
+    }
+    .key-url {
+      position: relative;
+      padding: 14px 16px;
+      padding-right: 80px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.8);
+      font-family: monospace;
+      font-size: 13px;
+      word-break: break-all;
+      line-height: 1.5;
+      color: var(--text);
+      cursor: pointer;
+    }
+    .copy-btn {
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      padding: 8px 14px;
+      border: none;
+      border-radius: 8px;
+      background: var(--brand);
+      color: #fff;
+      font-family: var(--font);
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .copy-btn:active { opacity: 0.8; }
+    .copy-status {
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--green);
+      min-height: 20px;
+    }
+
+    /* QR */
+    .qr-section {
+      text-align: center;
+      margin: 20px 0;
+    }
+    #qrcode {
+      display: inline-block;
+      padding: 12px;
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+    }
+    .qr-hint {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 8px;
+    }
+
+    /* Guide section */
+    .guide-section {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-xl);
+      background: rgba(255, 255, 255, 0.5);
+      animation: fadeUp 500ms ease-out 200ms both;
+    }
+    .invite-box {
+      display: none;
+      margin-top: 20px;
+      padding: 22px;
+      border-radius: var(--radius-xl);
+      border: 1px solid rgba(12, 140, 140, 0.16);
+      background: linear-gradient(135deg, rgba(12, 140, 140, 0.08), rgba(240, 138, 36, 0.08));
+      box-shadow: var(--shadow);
+      animation: fadeUp 500ms ease-out 260ms both;
+    }
+    .invite-box h3 {
+      font-size: 1.05rem;
+      margin-bottom: 8px;
+    }
+    .invite-box p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+      margin-bottom: 12px;
+    }
+    .invite-link-row {
+      display: flex;
+      gap: 10px;
+      align-items: stretch;
+      flex-wrap: wrap;
+    }
+    .invite-link-text {
+      flex: 1 1 320px;
+      min-height: 46px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255,255,255,0.82);
+      font-family: monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      word-break: break-all;
+    }
+    .guide-section h3 {
+      font-size: 1.1rem;
+      margin-bottom: 16px;
+      text-align: center;
+    }
+    .platform-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+      margin-bottom: 20px;
+    }
+    .platform-tab {
+      padding: 8px 16px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.6);
+      font-family: var(--font);
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 200ms;
+    }
+    .platform-tab:hover { background: rgba(255, 255, 255, 0.9); }
+    .platform-tab.active {
+      background: var(--brand);
+      color: #fff;
+      border-color: var(--brand);
+    }
+    .guide-content {
+      display: none;
+    }
+    .guide-content.active { display: block; }
+    .guide-content h4 {
+      font-size: 1rem;
+      margin-bottom: 8px;
+    }
+    .guide-content .app-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 18px;
+      border-radius: 12px;
+      background: var(--brand);
+      color: #fff;
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 700;
+      margin-bottom: 16px;
+    }
+    .guide-steps {
+      list-style: none;
+      padding: 0;
+      counter-reset: step;
+    }
+    .guide-steps li {
+      padding: 8px 0;
+      padding-left: 32px;
+      position: relative;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+      counter-increment: step;
+    }
+    .guide-steps li::before {
+      content: counter(step);
+      position: absolute;
+      left: 0;
+      width: 22px; height: 22px;
+      border-radius: 50%;
+      background: rgba(12, 140, 140, 0.12);
+      color: var(--brand);
+      font-size: 12px;
+      font-weight: 800;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* Error */
+    .error-box {
+      text-align: center;
+      padding: 48px 24px;
+      border: 1px solid #e8384f33;
+      border-radius: var(--radius-xl);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .error-box h2 { color: #e8384f; margin-bottom: 8px; }
+    .error-box p { color: var(--muted); font-size: 15px; margin-bottom: 20px; }
+    .error-box a {
+      padding: 12px 24px;
+      border-radius: 12px;
+      background: var(--brand);
+      color: #fff;
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 14px;
+    }
+
+    .footer {
+      text-align: center;
+      margin-top: 36px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .footer a { color: var(--brand); text-decoration: none; }
+    .footer-note {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(18px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <!-- Pending state -->
+    <div class="state active" id="statePending">
+      <div class="pending-box">
+        <div class="pending-spinner"></div>
+        <h2>Подтверждаем оплату...</h2>
+        <p id="pendingText">Обычно это занимает несколько секунд. Не закрывайте страницу.</p>
+        <div class="pending-actions" id="pendingActions">
+          <a class="secondary-link" href="/buy#tariffs">Вернуться к оплате</a>
+          <a class="secondary-link" href="/buy">Главное меню</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Success state -->
+    <div class="state" id="stateSuccess">
+      <div class="success-header">
+        <div class="success-icon">&#10003;</div>
+        <h1>Оплата прошла!</h1>
+        <p id="tariffInfo"></p>
+        <p><strong>Это и есть ваш ключ.</strong> Скопируйте ссылку ниже и вставьте её в приложение. По SMS и email ключ не отправляется: email нужен только для чека.</p>
+      </div>
+
+      <div class="key-card">
+        <h3>Ваша персональная ссылка для приложения</h3>
+        <div class="copy-status" style="margin-bottom: 10px;">Номер заказа: <strong id="orderIdText"></strong></div>
+        <div class="key-url" id="keyUrl" onclick="copyLink()">
+          <span id="keyUrlText"></span>
+          <button class="copy-btn" type="button">Копировать</button>
+        </div>
+        <div class="copy-status" id="copyStatus"></div>
+      </div>
+
+      <div class="qr-section">
+        <div id="qrcode"></div>
+        <div class="qr-hint">Отсканируйте QR-код камерой или приложением</div>
+      </div>
+
+      <div class="guide-section">
+        <h3>Как подключиться</h3>
+        <div class="platform-tabs" id="platformTabs"></div>
+        <div id="guideContents"></div>
+      </div>
+
+      <div class="invite-box" id="inviteBox">
+        <h3>Пригласить друга</h3>
+        <p>Отправьте другу свою ссылку. После его оплаты деньги придут на ваш баланс на сайте.</p>
+        <div class="invite-link-row">
+          <div class="invite-link-text" id="inviteLinkText"></div>
+          <button class="copy-btn" type="button" id="inviteCopyBtn">Копировать</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Error state -->
+    <div class="state" id="stateError">
+      <div class="error-box">
+        <h2>Что-то пошло не так</h2>
+        <p id="errorText">Заказ не найден или произошла ошибка.</p>
+        <a href="/buy#tariffs">Перейти к оплате</a>
+      </div>
+    </div>
+
+    <div class="footer">
+      <p id="profileLink" style="display:none; margin-bottom: 12px;">
+        <a id="profileUrl" href="#" style="color: var(--brand); text-decoration: none; font-weight: 700; font-size: 15px;">Мой профиль — все заказы и ключи</a>
+      </p>
+      <p id="referralHint" class="footer-note" style="display:none;">В профиле можно взять ссылку и пригласить друга.</p>
+      <p>Нужна помощь? <a href="{{SUPPORT_URL}}">Откройте чат поддержки</a></p>
+    </div>
+  </div>
+
+  <script>
+    const ORDER_ID = "{{ORDER_ID}}";
+    const PROFILE_COOKIE = "webstore_profile_token";
+    const PROFILE_COOKIE_MAX_AGE = 60 * 60 * 24 * 30;
+
+    const platforms = {
+      android: {
+        tab: "Android",
+        title: "Android",
+        appLabel: "Скачать Happ",
+        appUrl: "https://play.google.com/store/apps/details?id=com.happproxy",
+        steps: [
+          "Установите Happ из Google Play.",
+          "Нажмите «Копировать» выше, чтобы скопировать ссылку.",
+          "Откройте Happ, нажмите + и выберите импорт по ссылке.",
+          "Вставьте ссылку и сохраните.",
+          "Выберите сервер и включите подключение."
+        ]
+      },
+      ios: {
+        tab: "iPhone",
+        title: "iPhone и iPad",
+        appLabel: "Открыть App Store",
+        appUrl: "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973",
+        steps: [
+          "Установите Happ из App Store.",
+          "Скопируйте ссылку с этой страницы.",
+          "Откройте Happ и нажмите + для добавления подписки.",
+          "Выберите импорт по ссылке, вставьте и сохраните.",
+          "Откройте список серверов и включите подключение."
+        ]
+      },
+      mac: {
+        tab: "Mac",
+        title: "Mac",
+        appLabel: "Открыть Happ",
+        appUrl: "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973?platform=mac",
+        steps: [
+          "Установите Happ на Mac через App Store.",
+          "Скопируйте ссылку с этой страницы.",
+          "Откройте Happ и добавьте подписку по ссылке.",
+          "Сохраните профиль и дождитесь загрузки серверов.",
+          "Выберите сервер и включите подключение."
+        ]
+      },
+      windows: {
+        tab: "Windows",
+        title: "Windows",
+        appLabel: "Скачать Happ",
+        appUrl: "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe",
+        steps: [
+          "Скачайте и установите Happ для Windows.",
+          "Скопируйте ссылку с этой страницы.",
+          "В приложении добавьте подписку по ссылке.",
+          "После загрузки серверов выберите нужный.",
+          "Включите подключение."
+        ]
+      }
+    };
+
+    let pollTimer = null;
+    let subUrl = "";
+    let pendingHintTimer = null;
+
+    function showPendingFallback() {
+      const pending = document.getElementById("statePending");
+      if (!pending.classList.contains("active")) return;
+      const pendingText = document.getElementById("pendingText");
+      const pendingActions = document.getElementById("pendingActions");
+      if (pendingText) {
+        pendingText.textContent =
+          "Если вы закрыли окно оплаты или передумали, можно вернуться к тарифам или в главное меню.";
+      }
+      if (pendingActions) {
+        pendingActions.classList.add("visible");
+      }
+    }
+
+    function saveProfileToken(token) {
+      document.cookie = `${PROFILE_COOKIE}=${encodeURIComponent(token)}; Max-Age=${PROFILE_COOKIE_MAX_AGE}; Path=/; SameSite=Lax; Secure`;
+    }
+
+    function setState(name) {
+      document.querySelectorAll(".state").forEach(el => el.classList.remove("active"));
+      const el = document.getElementById("state" + name.charAt(0).toUpperCase() + name.slice(1));
+      if (el) el.classList.add("active");
+      if (name !== "pending" && pendingHintTimer) {
+        clearTimeout(pendingHintTimer);
+        pendingHintTimer = null;
+      }
+    }
+
+    async function checkOrder() {
+      try {
+        const resp = await fetch(`/api/store/order-status?order_id=${ORDER_ID}`);
+        if (!resp.ok) {
+          setState("error");
+          return;
+        }
+        const data = await resp.json();
+
+        if (data.status === "delivered" && data.subscription_url) {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          showSuccess(data);
+        } else if (data.status === "canceled") {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          document.getElementById("errorText").textContent =
+            "Оплата была отменена. Если захотите попробовать ещё раз, вернитесь к тарифам.";
+          setState("error");
+        } else if (data.status === "failed") {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          document.getElementById("errorText").textContent =
+            data.failure_message || "Произошла ошибка при создании доступа. Обратитесь в поддержку.";
+          setState("error");
+        }
+        else {
+          showPendingFallback();
+        }
+      } catch (e) {
+        showPendingFallback();
+      }
+    }
+
+    async function loadReferralLink(profileToken) {
+      if (!profileToken) return;
+      try {
+        const resp = await fetch(`/api/store/profile-orders?token=${encodeURIComponent(profileToken)}`);
+        const data = await resp.json();
+        if (!resp.ok || !data.referral || !data.referral.site_url) {
+          return;
+        }
+        const box = document.getElementById("inviteBox");
+        const text = document.getElementById("inviteLinkText");
+        const btn = document.getElementById("inviteCopyBtn");
+        if (!box || !text || !btn) return;
+        text.textContent = data.referral.site_url;
+        btn.onclick = async () => {
+          try {
+            await navigator.clipboard.writeText(data.referral.site_url);
+            btn.textContent = "Скопировано";
+          } catch {
+            btn.textContent = "Готово";
+          }
+          setTimeout(() => {
+            btn.textContent = "Копировать";
+          }, 2000);
+        };
+        box.style.display = "block";
+      } catch {
+        // ignore temporary network errors
+      }
+    }
+
+    function showSuccess(data) {
+      subUrl = data.subscription_url;
+      document.getElementById("orderIdText").textContent = ORDER_ID;
+      document.getElementById("keyUrlText").textContent = subUrl;
+      document.getElementById("tariffInfo").textContent =
+        `Тариф: ${data.tariff_label} (${data.days} дн.)`;
+
+      // QR code
+      if (typeof QRCode !== "undefined") {
+        new QRCode(document.getElementById("qrcode"), {
+          text: subUrl,
+          width: 180,
+          height: 180,
+          colorDark: "#12212b",
+          correctLevel: QRCode.CorrectLevel.M,
+        });
+      }
+
+      // Profile link
+      if (data.profile_token) {
+        const linkEl = document.getElementById("profileLink");
+        saveProfileToken(data.profile_token);
+        document.getElementById("profileUrl").href = `/profile?token=${data.profile_token}`;
+        linkEl.style.display = "block";
+        document.getElementById("referralHint").style.display = "block";
+        loadReferralLink(data.profile_token);
+      }
+
+      // Platform guides
+      buildGuides();
+      setState("success");
+    }
+
+    function buildGuides() {
+      const tabsEl = document.getElementById("platformTabs");
+      const contentsEl = document.getElementById("guideContents");
+      const order = ["android", "ios", "mac", "windows"];
+      const detected = detectPlatform();
+
+      order.forEach((key, i) => {
+        const p = platforms[key];
+
+        const tab = document.createElement("button");
+        tab.type = "button";
+        tab.className = "platform-tab" + (key === detected ? " active" : "");
+        tab.textContent = p.tab;
+        tab.dataset.platform = key;
+        tab.addEventListener("click", () => setActiveGuide(key));
+        tabsEl.appendChild(tab);
+
+        const content = document.createElement("div");
+        content.className = "guide-content" + (key === detected ? " active" : "");
+        content.id = `guide-${key}`;
+        content.innerHTML = `
+          <h4>${p.title}</h4>
+          <a class="app-link" href="${p.appUrl}" target="_blank">${p.appLabel}</a>
+          <ol class="guide-steps">${p.steps.map(s => `<li>${s}</li>`).join("")}</ol>
+        `;
+        contentsEl.appendChild(content);
+      });
+    }
+
+    function setActiveGuide(key) {
+      document.querySelectorAll(".platform-tab").forEach(t =>
+        t.classList.toggle("active", t.dataset.platform === key));
+      document.querySelectorAll(".guide-content").forEach(c =>
+        c.classList.toggle("active", c.id === `guide-${key}`));
+    }
+
+    function detectPlatform() {
+      const ua = navigator.userAgent.toLowerCase();
+      if (ua.includes("iphone") || ua.includes("ipad")) return "ios";
+      if (ua.includes("macintosh")) return "mac";
+      if (ua.includes("windows")) return "windows";
+      return "android";
+    }
+
+    async function copyLink() {
+      if (!subUrl) return;
+      try {
+        await navigator.clipboard.writeText(subUrl);
+        document.getElementById("copyStatus").textContent = "Ссылка скопирована!";
+      } catch {
+        const input = document.createElement("textarea");
+        input.value = subUrl;
+        document.body.appendChild(input);
+        input.select();
+        document.execCommand("copy");
+        document.body.removeChild(input);
+        document.getElementById("copyStatus").textContent = "Ссылка скопирована!";
+      }
+      setTimeout(() => {
+        document.getElementById("copyStatus").textContent = "";
+      }, 3000);
+    }
+
+    // Start polling
+    if (ORDER_ID) {
+      checkOrder();
+      pollTimer = setInterval(checkOrder, 2000);
+      pendingHintTimer = setTimeout(showPendingFallback, 8000);
+      // Stop after 5 minutes
+      setTimeout(() => {
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          const pending = document.getElementById("statePending");
+          if (pending.classList.contains("active")) {
+            document.getElementById("errorText").textContent =
+              "Оплата не подтверждена. Если вы оплатили, подождите несколько минут и обновите страницу.";
+            setState("error");
+          }
+        }
+      }, 300000);
+    } else {
+      setState("error");
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+</body>
+</html>

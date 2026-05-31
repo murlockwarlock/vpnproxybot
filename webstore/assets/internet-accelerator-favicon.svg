@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">Internet Accelerator Favicon</title>
+  <defs>
+    <linearGradient id="bg" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0d7d7f"/>
+      <stop offset="1" stop-color="#0f4f7d"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#bg)"/>
+  <path d="M18 25c3-5 8-8 14-8 9 0 17 7 18 16h5a4 4 0 1 1 0 8H40a4 4 0 0 1-1-8c-1-4-5-7-10-7-3 0-6 1-8 4-2 2-5 2-7 0-2-2-2-5 0-7Z" fill="#ffc44d"/>
+  <path d="M18 44h28a4 4 0 1 1 0 8H18a4 4 0 1 1 0-8Z" fill="#fff"/>
+</svg>

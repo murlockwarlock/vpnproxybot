@@ -1,0 +1,68 @@
+services:
+  marzban:
+    image: gozargah/marzban:latest
+    restart: always
+    network_mode: host
+    env_file:
+      - ./data/env/marzban.env
+    environment:
+      UVICORN_HOST: 0.0.0.0
+      UVICORN_PORT: "7000"
+      SQLALCHEMY_DATABASE_URL: sqlite:////var/lib/marzban/db.sqlite3
+      XRAY_EXECUTABLE_PATH: /usr/local/bin/xray
+      XRAY_JSON: /var/lib/marzban/xray_config.json
+    volumes:
+      - ./data/marzban:/var/lib/marzban
+      - ./data/bin/xray:/usr/local/bin/xray:ro
+      - ./data/marzban/subscription.py:/code/app/routers/subscription.py
+      - ./data/marzban/share.py:/code/app/subscription/share.py
+
+  bot:
+    build:
+      context: ../..
+      dockerfile: ops/nl-stack/Dockerfile.app
+    restart: always
+    network_mode: host
+    env_file:
+      - ./data/env/anewkabot.env
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////data/anewkabot/vpn_bot.db
+      BACKUP_EXTRA_SQLITE_DBS: /data/webstore/webstore_loonapie.db
+    volumes:
+      - ./data/anewkabot:/data/anewkabot
+      - ./data/webstore:/data/webstore:ro
+      - ./data/backups:/app/backups
+    command: ["python", "-m", "bot"]
+
+  webstore:
+    build:
+      context: ../..
+      dockerfile: ops/nl-stack/Dockerfile.app
+    restart: always
+    network_mode: host
+    env_file:
+      - ./data/env/webstore.env
+    environment:
+      WEBSTORE_HOST: 127.0.0.1
+      WEBSTORE_PORT: "8901"
+      WEBSTORE_DB: /data/webstore/webstore_loonapie.db
+      MARZBAN_API_URL: http://127.0.0.1:7000
+      WEBSTORE_ENV_FILE: /app/.env.webstore.container
+    volumes:
+      - ./data/webstore:/data/webstore
+      - ./data/env/webstore.env:/app/.env.webstore.container:ro
+    command: ["python", "-m", "webstore"]
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: always
+    network_mode: host
+    depends_on:
+      - bot
+      - webstore
+      - marzban
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/stream.d:/etc/nginx/stream.d:ro
+      - ./data/letsencrypt:/etc/letsencrypt:ro
