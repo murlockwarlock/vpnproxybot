@@ -12,6 +12,14 @@ A complete, production-ready open-source infrastructure for deploying a Telegram
 - **Referral & Partner Systems**: Built-in affiliate programs with commission payouts to drive growth.
 - **Multi-tier Tariffs**: Support for various subscription tiers (Lite, Pro, Maximum) and custom bandwidth limits.
 
+## 💳 Advanced Payment Integrations
+A core feature of this architecture is its highly reliable and flexible billing engine:
+- **YooKassa:** Full support for processing CIS bank cards and alternative payment methods via the robust YooKassa API.
+- **Robokassa:** Integrated gateway for global payments.
+- **Cryptomus (Crypto):** Support for cryptocurrency payments to ensure global accessibility.
+- **Telegram Native Payments:** Direct in-app purchases using Telegram's native payment provider.
+- **Subscriptions & Referrals:** Fully automated recurring billing and affiliate payout tracking.
+
 ## 🚀 Quick Start
 
 ### 1. Prerequisites
