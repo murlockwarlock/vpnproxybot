@@ -226,9 +226,13 @@ class Payment(Base):
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     discount_applied: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    
+    tariff_id: Mapped[int | None] = mapped_column(ForeignKey("tariffs.id"), nullable=True)
+    platform: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="payments")
     subscription: Mapped["Subscription"] = relationship(back_populates="payment")
+    tariff: Mapped["Tariff | None"] = relationship(foreign_keys=[tariff_id])
 
 
 class Mailing(Base):
@@ -236,7 +240,7 @@ class Mailing(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    media_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    media_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     media_file_type: Mapped[str | None] = mapped_column(String(16), nullable=True)  # photo/video
     media_position: Mapped[str] = mapped_column(String(16), default="media_top")
     buttons_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list of button configs
@@ -403,6 +407,10 @@ class Tariff(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # Adapt Group integration: if set, this tariff is fulfilled via Adapt API
     adapt_plan_uuid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Adapt plan cost in USD for profit / upgrade math
+    adapt_cost_price_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Number of devices this tariff includes (None = use default included_devices_per_sub)
+    device_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # VHQ integration: explicit tier (lite/basic). Keeps provider stable when label changes.
     vhq_tier: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
@@ -431,12 +439,14 @@ class BotSettings(Base):
 
 
 class PlatformGuide(Base):
-    """Media (photo/video) attached to a platform-specific setup guide."""
+    """Media and text setup guide per platform."""
     __tablename__ = "platform_guides"
 
     platform: Mapped[str] = mapped_column(String(32), primary_key=True)  # android/ios/mac/windows/android_tv
+    guide_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     media_file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
-    media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)  # photo / video
+    media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)  # photo/video/album
+    buttons_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

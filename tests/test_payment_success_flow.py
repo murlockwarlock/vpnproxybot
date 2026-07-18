@@ -408,3 +408,94 @@ async def test_device_payment_reuses_existing_subscription_key(monkeypatch, db_s
     text = message.answer.await_args.args[0]
     assert "https://loonapie.xyz/s/existing-token" in text
     assert "тот же ключ" in text
+
+
+async def test_auto_retry_failed_provisionings(monkeypatch, db_session_factory):
+    async with db_session_factory() as session:
+        user = User(telegram_id=10005, username="retrybuyer", full_name="Retry Buyer")
+        server = Server(name="NL", host="72.56.71.124", location="Netherlands")
+        tariff = Tariff(
+            days=30,
+            label="Retry Tariff",
+            price_rub=99,
+            price_stars=990,
+            tariff_type=TariffType.VPN,
+            is_active=True,
+        )
+        session.add_all([user, server, tariff])
+        await session.commit()
+        await session.refresh(user)
+        await session.refresh(server)
+        await session.refresh(tariff)
+
+        payment = Payment(
+            user_id=user.id,
+            subscription_id=None,
+            amount=9900,
+            currency="RUB",
+            method=PaymentMethod.YOOKASSA,
+            status=PaymentStatus.COMPLETED,
+            provider_payment_id="yookassa_retry_test_1",
+            tariff_id=tariff.id,
+            platform="android",
+        )
+        session.add(payment)
+        await session.commit()
+        await session.refresh(payment)
+
+    from bot.services import scheduler
+    monkeypatch.setattr(scheduler, "async_session", db_session_factory)
+    monkeypatch.setattr(payment_handler, "async_session", db_session_factory)
+    
+    bot = SimpleNamespace(send_message=AsyncMock())
+    
+    from bot.services import guide_service
+    send_guide = AsyncMock()
+    monkeypatch.setattr(guide_service, "send_guide", send_guide)
+    
+    from bot.services import payment_service
+    credit_referral = AsyncMock()
+    log_referral_payment = AsyncMock()
+    credit_partner = AsyncMock()
+    monkeypatch.setattr(payment_service, "credit_referral", credit_referral)
+    monkeypatch.setattr(payment_service, "log_referral_payment", log_referral_payment)
+    monkeypatch.setattr(payment_service, "credit_partner", credit_partner)
+
+    from bot.services.cluster import LeaseManager
+    monkeypatch.setattr(LeaseManager, "acquire_or_renew", AsyncMock(return_value=True))
+    monkeypatch.setattr(LeaseManager, "release", AsyncMock())
+
+    async def _create_access(session, user, tariff, platform, bonus_days):
+        subscription = Subscription(
+            user_id=user.id,
+            server_id=server.id,
+            tariff_months=1,
+            tariff_days=tariff.days,
+            status=SubStatus.ACTIVE,
+            device_slots=3,
+            vpn_key="https://loonapie.xyz/s/retry-token",
+            client_name="tg10005_1",
+            platform=platform,
+            expires_at=__import__("datetime").datetime.utcnow() + __import__("datetime").timedelta(days=30),
+        )
+        session.add(subscription)
+        await session.flush()
+        return subscription, "https://loonapie.xyz/s/retry-token"
+
+    from bot.services import subscription_service
+    monkeypatch.setattr(subscription_service, "create_or_extend_paid_access", _create_access)
+
+    await scheduler.auto_retry_failed_provisionings(bot)
+
+    async with db_session_factory() as session:
+        refreshed_payment = await session.get(Payment, payment.id)
+        assert refreshed_payment.subscription_id is not None
+        
+        subscription = await session.get(Subscription, refreshed_payment.subscription_id)
+        assert subscription is not None
+        assert subscription.vpn_key == "https://loonapie.xyz/s/retry-token"
+        assert subscription.user_id == user.id
+
+    assert bot.send_message.called
+    assert send_guide.called
+    assert credit_referral.called

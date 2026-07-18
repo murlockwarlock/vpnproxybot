@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy @darimiru_bot to YOUR_SERVER_IP via paramiko (password auth)."""
+"""Deploy @darimiru_bot to 45.92.174.214 via paramiko (password auth)."""
 
 import os
 import sys
@@ -10,7 +10,7 @@ import paramiko
 
 from scripts.deploy_guard import ensure_clean_git, git_revision, load_local_env, require_env
 
-HOST = "YOUR_SERVER_IP"
+HOST = "45.92.174.214"
 USER = "root"
 load_local_env(os.path.dirname(os.path.abspath(__file__)))
 PASSWORD = require_env("DARIMIRU_SSH_PASSWORD")
@@ -37,7 +37,7 @@ EXCLUDE_FILES = {
 def ssh_connect():
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(HOST, username=USER, password=PASSWORD, timeout=15)
+    ssh.connect(HOST, username=USER, password=PASSWORD, timeout=15, look_for_keys=False, allow_agent=False)
     return ssh
 
 

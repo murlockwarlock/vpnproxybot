@@ -23,6 +23,12 @@ def _make_order(tariff_key="adapt_30", days=30, order_id="order-test-1"):
     return order
 
 
+def _make_session_without_primary():
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=None)))
+    return session
+
+
 # ── _fulfill_adapt_order ──────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -43,7 +49,7 @@ async def test_fulfill_adapt_order_success():
         })
         mock_cls.return_value = mock_api
 
-        await _fulfill_adapt_order(order, "plan-test-uuid")
+        await _fulfill_adapt_order(_make_session_without_primary(), order, "plan-test-uuid")
 
     assert order.status == "delivered"
     assert order.marzban_username == f"adapt_{adapt_uuid}"
@@ -71,7 +77,7 @@ async def test_fulfill_adapt_order_uses_api_end_date():
         })
         mock_cls.return_value = mock_api
 
-        await _fulfill_adapt_order(order, "plan-test-uuid")
+        await _fulfill_adapt_order(_make_session_without_primary(), order, "plan-test-uuid")
 
     assert order.status == "delivered"
     assert order.access_expires_at == datetime(2026, 6, 2, 12, 0, 0)
@@ -99,7 +105,7 @@ async def test_fulfill_adapt_order_uses_api_days_when_end_date_missing():
         })
         mock_cls.return_value = mock_api
 
-        await _fulfill_adapt_order(order, "plan-test-uuid")
+        await _fulfill_adapt_order(_make_session_without_primary(), order, "plan-test-uuid")
 
     assert order.status == "delivered"
     assert order.access_expires_at == datetime(2026, 6, 18, 10, 0, 0)
@@ -118,7 +124,7 @@ async def test_fulfill_adapt_order_api_error():
         mock_cls.return_value = mock_api
 
         with patch("webstore.routes._mark_order_failed", new=AsyncMock()):
-            await _fulfill_adapt_order(order, "plan-uuid")
+            await _fulfill_adapt_order(_make_session_without_primary(), order, "plan-uuid")
 
     # Status should not be changed to "delivered"
     assert order.status == "paid"
@@ -138,9 +144,72 @@ async def test_fulfill_adapt_order_missing_uuid():
         mock_api.create_subscription = AsyncMock(return_value={"plan_uuid": "ok"})  # no uuid
         mock_cls.return_value = mock_api
 
-        await _fulfill_adapt_order(order, "plan-uuid")
+        await _fulfill_adapt_order(_make_session_without_primary(), order, "plan-uuid")
 
     assert order.status == "paid"
+
+
+@pytest.mark.asyncio
+async def test_fulfill_adapt_order_renews_existing_same_tariff():
+    from webstore.routes import _fulfill_adapt_order
+
+    order = _make_order(tariff_key="adapt_30", order_id="renew-order")
+    primary = _make_order(tariff_key="adapt_30", order_id="primary-order")
+    primary.id = 10
+    order.id = 11
+    primary.marzban_username = "adapt_existing-uuid"
+    primary.subscription_url = "https://darimiru.ru/vpnbot/adapt-sub/existing-uuid"
+
+    session = AsyncMock()
+
+    with (
+        patch("webstore.routes._get_latest_web_access_order", new=AsyncMock(return_value=primary)),
+        patch("webstore.routes.AdaptAPI") as mock_cls,
+    ):
+        mock_api = AsyncMock()
+        mock_api.renew_subscription = AsyncMock(return_value={"end_date": "2026-07-01T00:00:00Z"})
+        mock_api.create_subscription = AsyncMock()
+        mock_cls.return_value = mock_api
+
+        await _fulfill_adapt_order(session, order, "plan-test-uuid")
+
+    mock_api.renew_subscription.assert_awaited_once_with("existing-uuid")
+    mock_api.create_subscription.assert_not_called()
+    assert order.status == "delivered"
+    assert order.marzban_username == primary.marzban_username
+    assert order.subscription_url == primary.subscription_url
+    assert order.access_expires_at == datetime(2026, 7, 1, 0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_fulfill_adapt_order_creates_new_for_different_tariff():
+    from webstore.routes import _fulfill_adapt_order
+
+    order = _make_order(tariff_key="adapt_30", order_id="new-plan-order")
+    primary = _make_order(tariff_key="adapt_2", order_id="primary-order")
+    primary.id = 10
+    order.id = 11
+    primary.marzban_username = "adapt_existing-uuid"
+    primary.subscription_url = "https://darimiru.ru/vpnbot/adapt-sub/existing-uuid"
+
+    session = AsyncMock()
+
+    with (
+        patch("webstore.routes._get_latest_web_access_order", new=AsyncMock(return_value=primary)),
+        patch("webstore.routes.AdaptAPI") as mock_cls,
+        patch("webstore.routes.build_adapt_mirror_url", return_value="https://darimiru.ru/vpnbot/adapt-sub/new-uuid"),
+    ):
+        mock_api = AsyncMock()
+        mock_api.renew_subscription = AsyncMock()
+        mock_api.create_subscription = AsyncMock(return_value={"subscription_uuid": "new-uuid"})
+        mock_cls.return_value = mock_api
+
+        await _fulfill_adapt_order(session, order, "plan-test-uuid")
+
+    mock_api.renew_subscription.assert_not_called()
+    mock_api.create_subscription.assert_awaited_once()
+    assert order.status == "delivered"
+    assert order.marzban_username == "adapt_new-uuid"
 
 
 # ── _fulfill_order routing ────────────────────────────────────────────────────
@@ -161,7 +230,7 @@ async def test_fulfill_order_dispatches_adapt():
     ):
         await _fulfill_order(session, order)
 
-    mock_adapt.assert_awaited_once_with(order, "plan-test-uuid")
+    mock_adapt.assert_awaited_once_with(session, order, "plan-test-uuid")
     mock_vhq.assert_not_awaited()
 
 

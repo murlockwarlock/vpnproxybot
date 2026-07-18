@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -67,7 +67,11 @@ async def _build_user_context(telegram_id: int) -> str | None:
                 lines.append(f"- Ежедневные списания: {status}")
                 if user.next_daily_charge_at:
                     label = "Следующее списание" if user.balance_autodebit_enabled else "Доступ до"
-                    dt_str = user.next_daily_charge_at.strftime("%d.%m.%Y %H:%M")
+                    dt = user.next_daily_charge_at
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    msk_tz = timezone(timedelta(hours=3))
+                    dt_str = dt.astimezone(msk_tz).strftime("%d.%m.%Y %H:%M")
                     lines.append(f"- {label}: {dt_str} МСК")
 
             subs_result = await session.execute(

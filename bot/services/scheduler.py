@@ -191,8 +191,287 @@ def setup_scheduler(bot):
     )
 
 
+async def auto_retry_failed_provisionings(bot) -> None:
+    """Attempt to provision subscriptions for completed payments without subscription."""
+    from bot.services.cluster import LeaseManager
+    from bot.models import Tariff, Platform, TariffType, RobokassaPayment, Subscription
+    from bot.services.subscription_service import create_or_extend_paid_access, create_mtproto_subscription, get_primary_active_server
+    from bot.services.device_slots import get_included_device_slots
+    from bot.services.payment_service import credit_referral, log_referral_payment, credit_partner
+    from bot.handlers.payment import _platform_from_str, _is_deferred_platform, _delivery_platform_kb, _send_subscription_key_for_platform
+    from bot.services.vhq_routing import is_vhq_tariff
+    
+    # We retry payments from the last 2 days
+    cutoff = datetime.utcnow() - timedelta(days=2)
+    lease_manager = LeaseManager(settings.instance_id)
+
+    async with async_session() as session:
+        completed_topup_exists = (
+            select(BalanceTopUp.id)
+            .where(BalanceTopUp.provider_payment_id == Payment.provider_payment_id)
+            .where(BalanceTopUp.status == "completed")
+            .exists()
+        )
+        result = await session.execute(
+            select(Payment)
+            .where(Payment.status == PaymentStatus.COMPLETED)
+            .where(Payment.subscription_id.is_(None))
+            .where(Payment.created_at >= cutoff)
+            .where(~completed_topup_exists)
+            .order_by(Payment.created_at.asc())
+        )
+        payments = result.scalars().all()
+        if not payments:
+            return
+
+        for payment in payments:
+            lock_name = f"payment_retry:{payment.id}"
+            acquired = await lease_manager.acquire_or_renew(lock_name, ttl_seconds=600)
+            if not acquired:
+                continue
+
+            try:
+                user = await session.get(User, payment.user_id)
+                if not user:
+                    logger.error("Auto-retry payment ID=%s: user not found", payment.id)
+                    continue
+
+                tariff = None
+                if payment.tariff_id:
+                    tariff = await session.get(Tariff, payment.tariff_id)
+                
+                if not tariff and payment.method.value == "robokassa" and payment.provider_payment_id and payment.provider_payment_id.isdigit():
+                    rp = await session.get(RobokassaPayment, int(payment.provider_payment_id))
+                    if rp:
+                        tariff = await session.get(Tariff, rp.tariff_id)
+
+                if not tariff:
+                    # Fallback matching by price
+                    amount_val = payment.amount
+                    if payment.currency == "XTR":
+                        stmt = select(Tariff).where(Tariff.price_stars == amount_val)
+                    else:
+                        stmt = select(Tariff).where(Tariff.price_rub == (amount_val / 100.0))
+                    
+                    tariffs = (await session.execute(stmt)).scalars().all()
+                    if len(tariffs) == 1:
+                        tariff = tariffs[0]
+                    elif len(tariffs) > 1:
+                        active_tariffs = [t for t in tariffs if t.is_active]
+                        tariff = active_tariffs[0] if len(active_tariffs) == 1 else tariffs[0]
+
+                if not tariff:
+                    logger.warning("Auto-retry payment ID=%s: could not determine tariff", payment.id)
+                    continue
+
+                platform_str = payment.platform
+                if not platform_str and payment.method.value == "robokassa" and payment.provider_payment_id and payment.provider_payment_id.isdigit():
+                    rp = await session.get(RobokassaPayment, int(payment.provider_payment_id))
+                    if rp:
+                        platform_str = rp.platform
+
+                platform = None
+                if platform_str:
+                    platform = _platform_from_str(platform_str)
+                else:
+                    platform = user.platform or Platform.ANDROID
+
+                logger.info(
+                    "Auto-retry provisioning for payment ID=%s, User=%s (%s), Tariff=%s, Platform=%s",
+                    payment.id, user.id, user.telegram_id, tariff.label, platform
+                )
+
+                is_tg_proxy_only = tariff.tariff_type == TariffType.TG_PROXY
+                is_both = tariff.tariff_type == TariffType.BOTH
+
+                saved_platform = user.platform if platform_str and _is_deferred_platform(platform_str) and user.platform and not is_tg_proxy_only else None
+                needs_platform_choice = platform_str and _is_deferred_platform(platform_str) and saved_platform is None and not is_tg_proxy_only
+                delivery_platform = saved_platform or platform
+
+                if user.platform is None and not is_tg_proxy_only and not (platform_str and _is_deferred_platform(platform_str)):
+                    user.platform = platform
+
+                subscription = None
+                vpn_key = None
+                proxy_link = None
+
+                if not is_tg_proxy_only:
+                    bonus = 0 if is_vhq_tariff(tariff) else (user.bonus_days or 0)
+                    if bonus > 0:
+                        user.bonus_days = 0
+                    
+                    try:
+                        subscription, vpn_key = await create_or_extend_paid_access(
+                            session,
+                            user=user,
+                            tariff=tariff,
+                            platform=delivery_platform,
+                            bonus_days=bonus,
+                        )
+                    except AccessProvisionError as e:
+                        logger.error(
+                            "AccessProvisionError in auto-retry for payment ID=%s: %s",
+                            payment.id, e.admin_message
+                        )
+                        continue
+                    except Exception as e:
+                        logger.error(
+                            "Unexpected error in auto-retry for payment ID=%s: %s",
+                            payment.id, e
+                        )
+                        continue
+
+                    if not subscription or not vpn_key:
+                        logger.error("Auto-retry for payment ID=%s failed to provision VPN", payment.id)
+                        continue
+
+                if is_tg_proxy_only or is_both:
+                    if is_tg_proxy_only:
+                        server = await get_primary_active_server(session)
+                        if not server:
+                            logger.error("Auto-retry payment ID=%s: no active proxy server found", payment.id)
+                            continue
+                        
+                        now = datetime.utcnow()
+                        expires_at = now + timedelta(days=tariff.days)
+                        client_name = f"mtproto_tg{user.telegram_id}"
+                        included_slots = await get_included_device_slots(session)
+                        subscription = Subscription(
+                            user_id=user.id,
+                            server_id=server.id,
+                            tariff_months=tariff.days // 30,
+                            tariff_days=tariff.days,
+                            vpn_key=None,
+                            client_name=client_name,
+                            platform=Platform.ANDROID,
+                            device_slots=included_slots,
+                            expires_at=expires_at,
+                        )
+                        session.add(subscription)
+                        await session.flush()
+
+                    mtproto_account, proxy_link = await create_mtproto_subscription(
+                        session, user=user, tariff=tariff, subscription=subscription
+                    )
+                    if not mtproto_account and is_tg_proxy_only:
+                        logger.error("Auto-retry payment ID=%s: failed to create MTProto account", payment.id)
+                        continue
+
+                payment.subscription_id = subscription.id if subscription else None
+                await session.flush()
+
+                amount_rub = (
+                    float(tariff.price_rub)
+                    if payment.currency == "XTR"
+                    else payment.amount / 100.0
+                )
+                try:
+                    await credit_referral(session, user.id, payment.id, amount_rub, bot=bot)
+                    await log_referral_payment(session, user.id, amount_rub, bot=bot)
+                except Exception as e:
+                    logger.error("Error crediting referral in auto-retry: %s", e)
+
+                if user.partner_id:
+                    try:
+                        await credit_partner(session, user.id, payment.id, amount_rub, bot=bot)
+                    except Exception as e:
+                        logger.error("Error crediting partner in auto-retry: %s", e)
+
+                plog(
+                    "ОПЛАТА_АВТО_РЕЗОЛВ",
+                    provider=payment.method.value,
+                    user_id=user.telegram_id,
+                    amount=f"{amount_rub:.2f}",
+                    tariff=tariff.label,
+                    payment_id=payment.id,
+                )
+                
+                await session.commit()
+                logger.info(
+                    "Auto-retry provisioning succeeded and committed for payment ID=%s, subscription ID=%s",
+                    payment.id, subscription.id if subscription else None
+                )
+
+                if vpn_key and needs_platform_choice and subscription:
+                    try:
+                        await bot.send_message(
+                            user.telegram_id,
+                            "✅ <b>Оплата прошла.</b>\n\n"
+                            "Выберите устройство, и я отправлю ключ вместе с подходящим гайдом.",
+                            parse_mode="HTML",
+                            reply_markup=_delivery_platform_kb(subscription.id),
+                        )
+                    except Exception as exc:
+                        logger.error("Failed to send platform selector keyboard in auto-retry: %s", exc)
+                elif vpn_key and subscription:
+                    try:
+                        delivered = await _send_subscription_key_for_platform(
+                            bot=bot,
+                            chat_id=user.telegram_id,
+                            telegram_id=user.telegram_id,
+                            subscription_id=subscription.id,
+                            platform=delivery_platform,
+                        )
+                        if not delivered:
+                            logger.error("Failed to deliver key in auto-retry for sub ID=%s", subscription.id)
+                    except Exception as exc:
+                        logger.error("Failed to deliver key via telegram in auto-retry: %s", exc)
+
+                if proxy_link and subscription:
+                    try:
+                        from bot.utils.texts import MTPROTO_KEY_DELIVERED
+                        expires_str = subscription.expires_at.strftime("%d.%m.%Y") if subscription.expires_at else "N/A"
+                        await bot.send_message(
+                            user.telegram_id,
+                            MTPROTO_KEY_DELIVERED.format(proxy_links=proxy_link, expires=expires_str),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as exc:
+                        logger.error("Failed to deliver proxy link in auto-retry: %s", exc)
+
+                try:
+                    async with async_session() as wa_session:
+                        wa_enabled_row = await wa_session.get(BotSettings, "whatsapp_proxy_enabled")
+                        wa_host_row = await wa_session.get(BotSettings, "whatsapp_proxy_host")
+                    if wa_enabled_row and wa_enabled_row.value == "1" and wa_host_row and wa_host_row.value:
+                        from bot.utils.texts import WHATSAPP_PROXY_BONUS
+                        await bot.send_message(
+                            user.telegram_id,
+                            WHATSAPP_PROXY_BONUS.format(proxy_host=wa_host_row.value),
+                            parse_mode="HTML",
+                        )
+                except Exception as exc:
+                    logger.warning("Failed to deliver WhatsApp proxy bonus in auto-retry: %s", exc)
+
+                admin_text = (
+                    "🤖 <b>Авто-выдача доступа после сбоя!</b>\n\n"
+                    f"Пользователь: {user.full_name or ''} (<code>{user.telegram_id}</code>)\n"
+                    f"Тариф: {tariff.label}\n"
+                    f"Платформа: {delivery_platform.value if hasattr(delivery_platform, 'value') else str(delivery_platform)}\n"
+                    f"Платеж ID: {payment.id}\n"
+                    f"Способ: {payment.method.value}\n"
+                    f"Доступ успешно выдан авто-попыткой!"
+                )
+                for admin_id in settings.admin_ids:
+                    try:
+                        await bot.send_message(admin_id, admin_text, parse_mode="HTML")
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                logger.error("Error in auto-retry loop for payment ID=%s: %s", payment.id, e)
+            finally:
+                await lease_manager.release(lock_name)
+
+
 async def check_payment_integrity(bot) -> None:
     """Alert admins if a completed non-topup payment is not linked to access."""
+    try:
+        await auto_retry_failed_provisionings(bot)
+    except Exception as e:
+        logger.error("Error running auto_retry_failed_provisionings: %s", e)
+
     cutoff = datetime.utcnow() - timedelta(days=30)
 
     async with async_session() as session:
@@ -813,6 +1092,9 @@ async def send_expiry_warnings(bot):
 
 async def send_recurring_charge_warnings(bot):
     """Warn users about upcoming recurring charges when consent is enabled."""
+    if not settings.recurring_payments_enabled:
+        return
+
     async with async_session() as session:
         now = datetime.utcnow()
         result = await session.execute(
@@ -883,7 +1165,7 @@ async def send_followup_mailings(bot):
             has_paid_sub = exists(
                 select(1)
                 .select_from(paid_sub)
-                .where(and_(paid_sub.user_id == User.id, paid_sub.client_name.notlike("%_demo")))
+                .where(and_(paid_sub.user_id == User.id, paid_sub.billing_mode != "demo"))
             )
             already_notified = exists(
                 select(1)
@@ -900,7 +1182,7 @@ async def send_followup_mailings(bot):
                     demo_sub,
                     and_(
                         demo_sub.user_id == User.id,
-                        demo_sub.client_name.like("%_demo"),
+                        demo_sub.billing_mode == "demo",
                         demo_sub.started_at <= cutoff,
                     ),
                 )
@@ -951,6 +1233,10 @@ async def send_followup_mailings(bot):
 
 async def process_recurring_charges(bot):
     """Attempt recurring YooKassa charges for profiles due for renewal."""
+    if not settings.recurring_payments_enabled:
+        logger.info("Recurring payments are disabled; skipping scheduler job.")
+        return
+
     import hashlib
 
     from bot.services.payment_service import create_recurring_yookassa_payment
@@ -988,6 +1274,20 @@ async def process_recurring_charges(bot):
             sub = profile.subscription
 
             if not user or not tariff:
+                continue
+
+            if not tariff.is_active or tariff.is_admin_only:
+                plog(
+                    "АВТОПРОДЛ_ПРОПУСК",
+                    user_id=user.telegram_id,
+                    reason="тариф_неактивен",
+                    tariff=tariff.label,
+                    is_active=tariff.is_active,
+                    is_admin_only=tariff.is_admin_only,
+                )
+                profile.is_active = False
+                profile.consent_granted = False
+                await session.commit()
                 continue
 
             # Only charge if subscription expired or about to expire

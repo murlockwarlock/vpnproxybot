@@ -35,11 +35,12 @@ _PASSTHROUGH_HEADERS = {
     "announce-url",
     "sub-info-text",
 }
-_FORWARDED_REQUEST_HEADERS = {
-    "user-agent",
-    "accept",
-    "if-none-match",
-    "if-modified-since",
+_BLOCKED_FORWARD_HEADERS = {
+    "host",
+    "connection",
+    "content-length",
+    "transfer-encoding",
+    "accept-encoding",
 }
 
 
@@ -71,6 +72,7 @@ async def fetch_adapt_mirror_payload(
     adapt_uuid: str,
     *,
     request_headers: Mapping[str, str] | None = None,
+    query_params: Mapping[str, str] | None = None,
 ) -> tuple[int, bytes, dict[str, str]]:
     """Fetch the upstream Adapt subscription response and return (status, body, headers).
 
@@ -79,13 +81,12 @@ async def fetch_adapt_mirror_payload(
     upstream_url = f"{_ADAPT_UPSTREAM_BASE}/{adapt_uuid}"
     forward_headers: dict[str, str] = {}
     if request_headers:
-        for h in _FORWARDED_REQUEST_HEADERS:
-            val = request_headers.get(h) or request_headers.get(h.title())
-            if val:
-                forward_headers[h] = val
+        for k, v in request_headers.items():
+            if k.lower() not in _BLOCKED_FORWARD_HEADERS:
+                forward_headers[k] = v
 
     async with aiohttp.ClientSession(timeout=_TIMEOUT) as http:
-        async with http.get(upstream_url, headers=forward_headers) as resp:
+        async with http.get(upstream_url, headers=forward_headers, params=query_params) as resp:
             body = await resp.read()
             out_headers: dict[str, str] = {}
             for h in _PASSTHROUGH_HEADERS:

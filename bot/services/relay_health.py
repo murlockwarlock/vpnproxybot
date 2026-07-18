@@ -24,26 +24,9 @@ class RelayHealthResult:
     skipped: bool = False
 
 
-RELAYS: tuple[RelayHost, ...] = (
-    RelayHost(name="relay-ru", host="84.54.28.169", user="root"),
-)
+RELAYS: tuple[RelayHost, ...] = ()
 
-EXPECTED_ROUTES: dict[str, dict[str, str]] = {
-    "relay-ru": {
-        "ads.x5.ru": "45.92.174.214:443",
-        "api-maps.yandex.ru": "45.92.174.214:443",
-        "eh1.vk.com": "72.56.71.124:443",
-        "smartcaptcha.yandexcloud.net": "72.56.71.124:443",
-        "io.ozone.ru": "81.200.156.43:443",
-        "www.ietf.org": "72.56.71.124:443",
-        "ietf.org": "72.56.71.124:443",
-        "www.microsoft.com": "45.92.174.214:443",
-        "microsoft.com": "45.92.174.214:443",
-        "humanprofi.ru": "127.0.0.1:8443",
-        "www.humanprofi.ru": "127.0.0.1:8443",
-        "default": "45.92.174.214:443",
-    },
-}
+EXPECTED_ROUTES: dict[str, dict[str, str]] = {}
 
 ROUTE_RE = re.compile(r"^\s*(?P<sni>[^\s#]+)\s+(?P<backend>\d+\.\d+\.\d+\.\d+:\d+);$")
 

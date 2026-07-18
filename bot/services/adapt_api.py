@@ -80,6 +80,16 @@ class AdaptAPI:
         """
         return await self._post("/subs/renew", {"subscription_uuid": subscription_uuid})
 
+    async def renew_subscription_custom(self, subscription_uuid: str, custom_days: int) -> dict[str, Any]:
+        """Renew subscription for a custom number of days.
+        
+        Returns RenewSubscriptionCustomResponse with new end_date and total_price.
+        """
+        return await self._post(
+            "/subs/renew/custom",
+            {"subscription_uuid": subscription_uuid, "custom_days": custom_days},
+        )
+
     async def freeze_subscription(self, subscription_uuid: str) -> dict[str, Any]:
         """Pause the subscription countdown.
 

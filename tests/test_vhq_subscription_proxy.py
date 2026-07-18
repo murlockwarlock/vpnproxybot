@@ -87,3 +87,27 @@ def test_display_key_wraps_only_vhq_subscriptions():
         "kind": "subscription",
         "subscription_id": vhq_sub.id,
     }
+
+
+def test_vhq_response_headers_userinfo_and_dynamic_title(monkeypatch):
+    monkeypatch.setattr("bot.config.settings.subscription_profile_title", "ДариМир Базовый")
+    
+    # 1. Test userinfo and refill-date passthrough
+    upstream_headers = {
+        "subscription-refill-date": "1782864600",
+        "cache-control": "no-store",
+    }
+    expires = datetime(2026, 4, 16, 18, 43, 11)
+    headers = build_vhq_response_headers(upstream_headers, expires_at=expires, tariff_label="Премиум • 30 дн")
+    
+    assert headers["subscription-refill-date"] == "1782864600"
+    assert "subscription-userinfo" in headers
+    assert "expire=1776364991" in headers["subscription-userinfo"]  # Unix timestamp for 2026-04-16 18:43:11
+    
+    # 2. Test dynamic title substitution
+    import base64
+    profile_title_encoded = headers["profile-title"]
+    assert profile_title_encoded.startswith("base64:")
+    title_bytes = base64.b64decode(profile_title_encoded[7:])
+    assert title_bytes.decode("utf-8") == "ДариМир Премиум"
+

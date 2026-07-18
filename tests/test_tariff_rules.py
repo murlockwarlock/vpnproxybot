@@ -21,14 +21,13 @@ def test_darimiru_tariff_text_contains_descriptions_and_locations():
         extra_device_tariffs=["Лайт (1 месяц)"],
     )
 
-    assert "Тариф Лайт" in text
     assert "Тариф Базовый" in text
-    assert "Тариф Премиум" in text
-    assert "100 серверов" in text
-    assert "белого списка" in text
+    assert "Тариф Максимум" in text
+    assert "50 серверов" in text
+    assert "80 серверов" in text
     assert "🇪🇪 Эстония" in text
     assert "и другие" in text
-    assert "3 устройства" in text
+    assert "1-5 устройств" in text
 
 
 def test_extra_devices_are_supported_only_for_non_vhq_vpn_tariffs():

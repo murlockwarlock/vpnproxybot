@@ -147,41 +147,27 @@ async def test_adapt_webhook_correct_signature_processes():
     assert response.status == 200
 
 
-# ── handle_adapt_subscription_proxy: unknown UUID ────────────────────────────
+# ── handle_adapt_subscription_proxy: invalid UUID format ─────────────────────
 
 @pytest.mark.asyncio
-async def test_adapt_sub_proxy_unknown_uuid_returns_404():
+async def test_adapt_sub_proxy_invalid_uuid_format_returns_404():
     from bot.webhooks import handle_adapt_subscription_proxy
 
     req = MagicMock()
-    req.match_info = {"uuid": "unknown-uuid"}
+    req.match_info = {"uuid": "not-a-valid-uuid"}
     req.headers = {}
     req.method = "GET"
 
-    with (
-        patch("bot.webhooks.async_session") as mock_session_cm,
-    ):
-        session_mock = AsyncMock()
-        session_mock.__aenter__ = AsyncMock(return_value=session_mock)
-        session_mock.__aexit__ = AsyncMock(return_value=False)
-        result_mock = MagicMock()
-        result_mock.scalar_one_or_none = MagicMock(return_value=None)
-        session_mock.execute = AsyncMock(return_value=result_mock)
-        mock_session_cm.return_value = session_mock
-
-        response = await handle_adapt_subscription_proxy(req)
+    response = await handle_adapt_subscription_proxy(req)
 
     assert response.status == 404
 
 
 @pytest.mark.asyncio
-async def test_adapt_sub_proxy_known_uuid_fetches_upstream():
+async def test_adapt_sub_proxy_valid_uuid_fetches_upstream():
     from bot.webhooks import handle_adapt_subscription_proxy
-    from bot.models import AdaptSubscription
 
-    uuid = "known-uuid"
-    adapt_record = MagicMock(spec=AdaptSubscription)
-    adapt_record.adapt_uuid = uuid
+    uuid = "8c3c5da9-d89a-4d05-90da-57108d6d56c6"
 
     req = MagicMock()
     req.match_info = {"uuid": uuid}
@@ -190,20 +176,9 @@ async def test_adapt_sub_proxy_known_uuid_fetches_upstream():
 
     upstream_body = base64.b64encode(b"vless://...").decode()
 
-    with (
-        patch("bot.webhooks.async_session") as mock_session_cm,
-        patch("bot.webhooks.fetch_adapt_mirror_payload", new=AsyncMock(
-            return_value=(200, upstream_body.encode(), {"content-type": "text/plain"})
-        )),
-    ):
-        session_mock = AsyncMock()
-        session_mock.__aenter__ = AsyncMock(return_value=session_mock)
-        session_mock.__aexit__ = AsyncMock(return_value=False)
-        result_mock = MagicMock()
-        result_mock.scalar_one_or_none = MagicMock(return_value=adapt_record)
-        session_mock.execute = AsyncMock(return_value=result_mock)
-        mock_session_cm.return_value = session_mock
-
+    with patch("bot.webhooks.fetch_adapt_mirror_payload", new=AsyncMock(
+        return_value=(200, upstream_body.encode(), {"content-type": "text/plain"})
+    )):
         response = await handle_adapt_subscription_proxy(req)
 
     assert response.status == 200

@@ -8,7 +8,9 @@ import math
 import re
 from datetime import timedelta, timezone
 
-from aiogram import Bot, F, Router
+import asyncio
+from typing import Any, Awaitable, Callable
+from aiogram import Bot, F, Router, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -17,6 +19,9 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    TelegramObject,
+    InputMediaPhoto,
+    InputMediaVideo,
 )
 from sqlalchemy import func, select
 
@@ -24,9 +29,62 @@ from bot.config import settings
 from bot.database import async_session
 from bot.models import BotSettings, FollowUpCampaign, Mailing
 from bot.services.device_slots import get_included_device_slots
+from bot.handlers.admin import AdminStates
 
 logger = logging.getLogger(__name__)
 router = Router(name="mailing")
+
+
+class MediaGroupMiddleware(BaseMiddleware):
+    def __init__(self, latency: float = 0.5):
+        super().__init__()
+        self.latency = latency
+        self.cache: dict[str, list[Message]] = {}
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if not isinstance(event, Message) or event.media_group_id is None:
+            return await handler(event, data)
+
+        media_group_id = event.media_group_id
+        
+        if media_group_id not in self.cache:
+            self.cache[media_group_id] = [event]
+            await asyncio.sleep(self.latency)
+            messages = self.cache.pop(media_group_id, [])
+            messages.sort(key=lambda m: m.message_id)
+            data["album"] = messages
+            return await handler(event, data)
+        else:
+            self.cache[media_group_id].append(event)
+            return None
+
+
+router.message.middleware(MediaGroupMiddleware())
+
+
+def _parse_album_media(media_str: str, caption: str | None = None) -> list[InputMediaPhoto | InputMediaVideo]:
+    items = []
+    parts = media_str.split(",")
+    for idx, part in enumerate(parts):
+        if ":" in part:
+            m_type, file_id = part.split(":", 1)
+        else:
+            m_type, file_id = "photo", part
+        
+        item_caption = caption if idx == 0 else None
+        
+        if m_type == "video":
+            items.append(InputMediaVideo(media=file_id, caption=item_caption, parse_mode="HTML"))
+        else:
+            items.append(InputMediaPhoto(media=file_id, caption=item_caption, parse_mode="HTML"))
+    return items
+
+
 ESCAPE_COMMANDS = {"/start", "/help", "/admin", "/policy", "/agree", "/oferta"}
 
 MSK = timezone(timedelta(hours=3))
@@ -306,12 +364,15 @@ def _history_kb(mailings: list[Mailing], page: int, total_pages: int) -> InlineK
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# ── Entry ─────────────────────────────────────────────
-
 @router.callback_query(F.data == "adm_mailing")
 async def mailing_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    if not _is_admin(callback.from_user.id):
-        return
+    data = await state.get_data()
+    preview_media_ids = data.get("preview_media_ids", [])
+    for p_id in preview_media_ids:
+        try:
+            await callback.message.bot.delete_message(callback.message.chat.id, p_id)
+        except Exception:
+            pass
     await state.clear()
 
     # If current message contains media we can't edit it to text - delete + re-send
@@ -387,7 +448,7 @@ async def mailing_select_audience(callback: CallbackQuery, state: FSMContext) ->
 # ── Step 2: content ───────────────────────────────────
 
 @router.message(MailingStates.content, F.text | F.photo | F.video)
-async def mailing_receive_content(message: Message, state: FSMContext, bot: Bot) -> None:
+async def mailing_receive_content(message: Message, state: FSMContext, bot: Bot, album: list[Message] | None = None) -> None:
     if not _is_admin(message.from_user.id):
         return
     data = await state.get_data()
@@ -399,23 +460,43 @@ async def mailing_receive_content(message: Message, state: FSMContext, bot: Bot)
     text       = data.get("text")
     position   = data.get("media_position")
 
-    if message.photo:
-        media_id   = message.photo[-1].file_id
-        media_type = "photo"
-        if message.caption:
+    if album:
+        media_list = []
+        for msg in album:
+            if msg.photo:
+                media_list.append(f"photo:{msg.photo[-1].file_id}")
+            elif msg.video:
+                media_list.append(f"video:{msg.video.file_id}")
+            if msg.caption:
+                text = msg.html_text
+        if media_list:
+            media_id = ",".join(media_list)
+            media_type = "album"
+    else:
+        if message.photo:
+            media_id   = message.photo[-1].file_id
+            media_type = "photo"
+            if message.caption:
+                text = message.html_text
+        elif message.video:
+            media_id   = message.video.file_id
+            media_type = "video"
+            if message.caption:
+                text = message.html_text
+        elif message.text:
             text = message.html_text
-    elif message.video:
-        media_id   = message.video.file_id
-        media_type = "video"
-        if message.caption:
-            text = message.html_text
-    elif message.text:
-        text = message.html_text
 
-    try:
-        await message.delete()
-    except Exception:
-        pass
+    if album:
+        for msg in album:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+    else:
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
     await state.update_data(
         text=text,
@@ -487,18 +568,38 @@ async def _show_preview(chat_id: int, msg_id: int, state: FSMContext, bot: Bot) 
     await state.set_state(MailingStates.confirmation)
     kb = _confirm_kb(len(buttons))
 
+    # Delete previous preview media group if any
+    preview_media_ids = data.get("preview_media_ids", [])
+    for p_id in preview_media_ids:
+        try:
+            await bot.delete_message(chat_id, p_id)
+        except Exception:
+            pass
+    await state.update_data(preview_media_ids=[])
+
     try:
         if media_id:
             try:
                 await bot.delete_message(chat_id, msg_id)
             except Exception:
                 pass
-            send_fn = bot.send_photo if media_type == "photo" else bot.send_video
-            sent = await send_fn(
-                chat_id, media_id,
-                caption=caption, parse_mode="HTML", reply_markup=kb,
-            )
-            await state.update_data(msg_id=sent.message_id)
+
+            if media_type == "album":
+                album_media = _parse_album_media(media_id)
+                sent_msgs = await bot.send_media_group(chat_id, media=album_media)
+                await state.update_data(preview_media_ids=[m.message_id for m in sent_msgs])
+                
+                sent = await bot.send_message(
+                    chat_id, caption, parse_mode="HTML", reply_markup=kb
+                )
+                await state.update_data(msg_id=sent.message_id)
+            else:
+                send_fn = bot.send_photo if media_type == "photo" else bot.send_video
+                sent = await send_fn(
+                    chat_id, media_id,
+                    caption=caption, parse_mode="HTML", reply_markup=kb,
+                )
+                await state.update_data(msg_id=sent.message_id)
         else:
             await bot.edit_message_text(
                 caption,
@@ -548,6 +649,15 @@ async def mailing_buttons_done(callback: CallbackQuery, state: FSMContext, bot: 
 async def mailing_edit(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         return
+    data = await state.get_data()
+    preview_media_ids = data.get("preview_media_ids", [])
+    for p_id in preview_media_ids:
+        try:
+            await callback.message.bot.delete_message(callback.message.chat.id, p_id)
+        except Exception:
+            pass
+    await state.update_data(preview_media_ids=[])
+
     await state.set_state(MailingStates.content)
     try:
         await callback.message.delete()
@@ -566,6 +676,12 @@ async def mailing_confirm_send(callback: CallbackQuery, state: FSMContext) -> No
     if not _is_admin(callback.from_user.id):
         return
     data = await state.get_data()
+    preview_media_ids = data.get("preview_media_ids", [])
+    for p_id in preview_media_ids:
+        try:
+            await callback.message.bot.delete_message(callback.message.chat.id, p_id)
+        except Exception:
+            pass
 
     async with async_session() as session:
         m = Mailing(
@@ -697,17 +813,24 @@ async def mailing_details(callback: CallbackQuery, bot: Bot) -> None:
 
     try:
         if m.media_file_id:
-            send_fn = bot.send_photo if m.media_file_type == "photo" else bot.send_video
-            if len(text) <= 1024:
-                await send_fn(
-                    callback.from_user.id, m.media_file_id,
-                    caption=text, reply_markup=back_kb, parse_mode="HTML",
-                )
-            else:
-                await send_fn(callback.from_user.id, m.media_file_id)
+            if m.media_file_type == "album":
+                album_media = _parse_album_media(m.media_file_id)
+                await bot.send_media_group(callback.from_user.id, media=album_media)
                 await bot.send_message(
                     callback.from_user.id, text, reply_markup=back_kb, parse_mode="HTML",
                 )
+            else:
+                send_fn = bot.send_photo if m.media_file_type == "photo" else bot.send_video
+                if len(text) <= 1024:
+                    await send_fn(
+                        callback.from_user.id, m.media_file_id,
+                        caption=text, reply_markup=back_kb, parse_mode="HTML",
+                    )
+                else:
+                    await send_fn(callback.from_user.id, m.media_file_id)
+                    await bot.send_message(
+                        callback.from_user.id, text, reply_markup=back_kb, parse_mode="HTML",
+                    )
         else:
             await bot.send_message(
                 callback.from_user.id, text, reply_markup=back_kb, parse_mode="HTML",
@@ -1155,6 +1278,7 @@ async def followup_buttons_save(callback: CallbackQuery, state: FSMContext) -> N
 
 @router.callback_query(F.data == "btn_add", FollowUpStates.buttons)
 @router.callback_query(F.data == "btn_add", MailingStates.buttons)
+@router.callback_query(F.data == "btn_add", AdminStates.guide_buttons)
 async def btn_add(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         return
@@ -1168,6 +1292,7 @@ async def btn_add(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("btn_del_"), FollowUpStates.buttons)
 @router.callback_query(F.data.startswith("btn_del_"), MailingStates.buttons)
+@router.callback_query(F.data.startswith("btn_del_"), AdminStates.guide_buttons)
 async def btn_delete(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         return
@@ -1177,8 +1302,17 @@ async def btn_delete(callback: CallbackQuery, state: FSMContext) -> None:
     if 0 <= idx < len(buttons):
         buttons.pop(idx)
         await state.update_data(buttons=buttons)
+    
     cid = data.get("campaign_id")
-    back_cb = f"adm_fubsave_{cid}" if data.get("btn_context") == "followup" else "adm_ml_btns_done"
+    btn_context = data.get("btn_context")
+    if btn_context == "followup":
+        back_cb = f"adm_fubsave_{cid}"
+    elif btn_context == "guide":
+        g_platform = data.get("guide_platform")
+        back_cb = f"adm_guide_bdone_{g_platform}"
+    else:
+        back_cb = "adm_ml_btns_done"
+
     await callback.message.edit_text(
         "🔘 <b>Редактор кнопок</b>\n\nДобавьте кнопки или нажмите «Готово».",
         reply_markup=_btn_editor_kb(buttons, back_cb),
@@ -1189,13 +1323,23 @@ async def btn_delete(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "btn_back_editor", FollowUpStates.buttons)
 @router.callback_query(F.data == "btn_back_editor", MailingStates.buttons)
+@router.callback_query(F.data == "btn_back_editor", AdminStates.guide_buttons)
 async def btn_back_to_editor(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         return
     data = await state.get_data()
     buttons = data.get("buttons", [])
+    
     cid = data.get("campaign_id")
-    back_cb = f"adm_fubsave_{cid}" if data.get("btn_context") == "followup" else "adm_ml_btns_done"
+    btn_context = data.get("btn_context")
+    if btn_context == "followup":
+        back_cb = f"adm_fubsave_{cid}"
+    elif btn_context == "guide":
+        g_platform = data.get("guide_platform")
+        back_cb = f"adm_guide_bdone_{g_platform}"
+    else:
+        back_cb = "adm_ml_btns_done"
+
     await callback.message.edit_text(
         "🔘 <b>Редактор кнопок</b>\n\nДобавьте кнопки или нажмите «Готово».",
         reply_markup=_btn_editor_kb(buttons, back_cb),
@@ -1206,6 +1350,7 @@ async def btn_back_to_editor(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.callback_query(F.data.startswith("btn_preset_"), FollowUpStates.buttons)
 @router.callback_query(F.data.startswith("btn_preset_"), MailingStates.buttons)
+@router.callback_query(F.data.startswith("btn_preset_"), AdminStates.guide_buttons)
 async def btn_preset_selected(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         return
@@ -1214,10 +1359,13 @@ async def btn_preset_selected(callback: CallbackQuery, state: FSMContext) -> Non
     buttons = data.get("buttons", [])
     max_row = max((b.get("row", 1) for b in buttons), default=0)
 
+    btn_context = data.get("btn_context")
     if preset == "url":
         # Need custom text + URL — go to FSM
-        if data.get("btn_context") == "followup":
+        if btn_context == "followup":
             await state.set_state(FollowUpStates.btn_text)
+        elif btn_context == "guide":
+            await state.set_state(AdminStates.guide_btn_text)
         else:
             await state.set_state(MailingStates.btn_text)
         await callback.message.edit_text(
@@ -1234,7 +1382,14 @@ async def btn_preset_selected(callback: CallbackQuery, state: FSMContext) -> Non
     await state.update_data(buttons=buttons)
 
     cid = data.get("campaign_id")
-    back_cb = f"adm_fubsave_{cid}" if data.get("btn_context") == "followup" else "adm_ml_btns_done"
+    if btn_context == "followup":
+        back_cb = f"adm_fubsave_{cid}"
+    elif btn_context == "guide":
+        g_platform = data.get("guide_platform")
+        back_cb = f"adm_guide_bdone_{g_platform}"
+    else:
+        back_cb = "adm_ml_btns_done"
+
     await callback.message.edit_text(
         "🔘 <b>Редактор кнопок</b>\n\nДобавьте кнопки или нажмите «Готово».",
         reply_markup=_btn_editor_kb(buttons, back_cb),
@@ -1245,13 +1400,17 @@ async def btn_preset_selected(callback: CallbackQuery, state: FSMContext) -> Non
 
 @router.message(FollowUpStates.btn_text, F.text)
 @router.message(MailingStates.btn_text, F.text)
+@router.message(AdminStates.guide_btn_text, F.text)
 async def btn_url_text_entered(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         return
     await state.update_data(btn_text_pending=message.text.strip()[:64])
     data = await state.get_data()
-    if data.get("btn_context") == "followup":
+    btn_context = data.get("btn_context")
+    if btn_context == "followup":
         await state.set_state(FollowUpStates.btn_url)
+    elif btn_context == "guide":
+        await state.set_state(AdminStates.guide_btn_url)
     else:
         await state.set_state(MailingStates.btn_url)
     await message.answer("🔗 Введите <b>URL</b> (например https://t.me/channel):", parse_mode="HTML")
@@ -1259,6 +1418,7 @@ async def btn_url_text_entered(message: Message, state: FSMContext) -> None:
 
 @router.message(FollowUpStates.btn_url, F.text)
 @router.message(MailingStates.btn_url, F.text)
+@router.message(AdminStates.guide_btn_url, F.text)
 async def btn_url_entered(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         return
@@ -1275,13 +1435,23 @@ async def btn_url_entered(message: Message, state: FSMContext) -> None:
     await state.update_data(buttons=buttons)
 
     # Return to button editor
-    if data.get("btn_context") == "followup":
+    btn_context = data.get("btn_context")
+    if btn_context == "followup":
         await state.set_state(FollowUpStates.buttons)
+    elif btn_context == "guide":
+        await state.set_state(AdminStates.guide_buttons)
     else:
         await state.set_state(MailingStates.buttons)
 
     cid = data.get("campaign_id")
-    back_cb = f"adm_fubsave_{cid}" if data.get("btn_context") == "followup" else "adm_ml_btns_done"
+    if btn_context == "followup":
+        back_cb = f"adm_fubsave_{cid}"
+    elif btn_context == "guide":
+        g_platform = data.get("guide_platform")
+        back_cb = f"adm_guide_bdone_{g_platform}"
+    else:
+        back_cb = "adm_ml_btns_done"
+
     await message.answer(
         "🔘 <b>Редактор кнопок</b>\n\nДобавьте кнопки или нажмите «Готово».",
         reply_markup=_btn_editor_kb(buttons, back_cb),
@@ -1508,7 +1678,7 @@ async def _count_bulk_audience(session, audience: str) -> int:
         return await session.scalar(
             select(func.count(func.distinct(Subscription.user_id))).where(
                 Subscription.status == SubStatus.ACTIVE,
-                Subscription.client_name.notlike("%_demo"),
+                Subscription.billing_mode != "demo",
             )
         ) or 0
     elif audience == "inactive_subscription":
@@ -1531,10 +1701,10 @@ async def _count_bulk_audience(session, audience: str) -> int:
         ) or 0
     elif audience == "demo_only":
         paid_users = select(Subscription.user_id).where(
-            Subscription.client_name.notlike("%_demo"),
+            Subscription.billing_mode != "demo",
         ).distinct()
         demo_users_q = select(func.distinct(Subscription.user_id)).where(
-            Subscription.client_name.like("%_demo"),
+            Subscription.billing_mode == "demo",
             ~Subscription.user_id.in_(paid_users),
         )
         return await session.scalar(
@@ -1557,7 +1727,7 @@ async def _get_bulk_user_ids(session, audience: str) -> list[tuple[int, int]]:
                 User.id.in_(
                     select(func.distinct(Subscription.user_id)).where(
                         Subscription.status == SubStatus.ACTIVE,
-                        Subscription.client_name.notlike("%_demo"),
+                        Subscription.billing_mode != "demo",
                     )
                 ),
                 User.is_blocked == False,  # noqa: E712
@@ -1587,10 +1757,10 @@ async def _get_bulk_user_ids(session, audience: str) -> list[tuple[int, int]]:
         )
     elif audience == "demo_only":
         paid_users = select(Subscription.user_id).where(
-            Subscription.client_name.notlike("%_demo"),
+            Subscription.billing_mode != "demo",
         ).distinct()
         demo_users_q = select(func.distinct(Subscription.user_id)).where(
-            Subscription.client_name.like("%_demo"),
+            Subscription.billing_mode == "demo",
             ~Subscription.user_id.in_(paid_users),
         )
         result = await session.execute(

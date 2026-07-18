@@ -12,9 +12,9 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import func, select
+from sqlalchemy import func, select, delete, text
 from sqlalchemy.orm import selectinload
 
 from bot.config import settings
@@ -34,29 +34,35 @@ from bot.keyboards.admin import (
     tariffs_admin_kb,
     user_actions_kb,
     user_search_kb,
+    user_reset_confirm_kb,
 )
 from bot.keyboards.client import back_to_menu_kb
 from bot.models import (
     AdTrackingLink,
     BotSettings,
+    MTProtoAccount,
     Payment,
     PaymentMethod,
     PaymentStatus,
     Partner,
     Platform,
     PlatformGuide,
+    ProxyAccount,
+    RecurringPaymentProfile,
     Server,
     SubStatus,
     Subscription,
+    SubscriptionNotificationLog,
     Tariff,
     TariffType,
     User,
+    AdaptSubscription,
 )
 from bot.services.client_names import build_client_name
 from bot.services.device_slots import get_included_device_slots
 from bot.services.legal_docs import LEGAL_DOCS, get_all_legal_doc_urls
 from bot.services.tariff_utils import format_duration_days, format_subscription_duration
-from bot.services.adapt_routing import is_adapt_tariff
+from bot.services.adapt_routing import is_adapt_subscription, is_adapt_tariff, get_adapt_uuid_from_subscription
 from bot.services.vhq_routing import is_vhq_subscription, is_vhq_tariff
 from bot.services.vhq_subscription_proxy import (
     get_subscription_display_key,
@@ -89,6 +95,52 @@ from bot.utils.texts import (
 logger = logging.getLogger(__name__)
 router = Router(name="admin")
 
+import asyncio
+from typing import Any, Callable, Awaitable
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+
+class MediaGroupMiddleware(BaseMiddleware):
+    def __init__(self, latency: float = 0.5):
+        super().__init__()
+        self.latency = latency
+        self.cache: dict[str, list[Message]] = {}
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if not isinstance(event, Message) or event.media_group_id is None:
+            return await handler(event, data)
+
+        media_group_id = event.media_group_id
+        
+        if media_group_id not in self.cache:
+            self.cache[media_group_id] = [event]
+            await asyncio.sleep(self.latency)
+            messages = self.cache.pop(media_group_id, [])
+            messages.sort(key=lambda m: m.message_id)
+            data["album"] = messages
+            return await handler(event, data)
+        else:
+            self.cache[media_group_id].append(event)
+            return None
+
+router.message.middleware(MediaGroupMiddleware())
+
+
+def _format_dt_msk(dt: datetime | None, include_time: bool = True) -> str:
+    if not dt:
+        return "—"
+    from datetime import timezone, timedelta
+    msk = timezone(timedelta(hours=3))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    fmt = "%d.%m.%Y %H:%M" if include_time else "%d.%m.%Y"
+    return dt.astimezone(msk).strftime(fmt)
+
 
 def _code(value: object) -> str:
     return f"<code>{html.escape(str(value or ''))}</code>"
@@ -104,6 +156,14 @@ def _format_subscription_key_block(subscription: Subscription) -> str:
         lines = [f"🔗 Наш ключ:\n{_code(public_key)}"]
         if original_key and original_key != public_key:
             lines.append(f"🔗 Оригинал VHQ:\n{_code(original_key)}")
+        return "\n\n".join(lines)
+
+    if is_adapt_subscription(subscription):
+        adapt_uuid = get_adapt_uuid_from_subscription(subscription)
+        original_key = f"https://network-api.adaptgroup.app/sub/{adapt_uuid}" if adapt_uuid else ""
+        lines = [f"🔗 Наш ключ:\n{_code(public_key)}"]
+        if original_key and original_key != public_key:
+            lines.append(f"🔗 Оригинал Adapt:\n{_code(original_key)}")
         return "\n\n".join(lines)
 
     return f"🔗 Ключ:\n{_code(public_key)}"
@@ -301,7 +361,7 @@ async def _show_ad_link_detail(message, bot, link_id: int, edit: bool = True) ->
         f"• Купили хотя бы раз: <b>{buyers}</b>\n"
         f"• Всего успешных оплат: <b>{payments_count}</b>\n"
         f"• Конверсия в покупку: <b>{conversion:.1f}%</b>\n\n"
-        f"Создана: <b>{link.created_at.strftime('%d.%m.%Y %H:%M')}</b>"
+        f"Создана: <b>{_format_dt_msk(link.created_at)}</b>"
     )
     markup = ad_link_detail_kb(link.id, bool(link.is_active))
     if edit:
@@ -344,6 +404,11 @@ class AdminStates(StatesGroup):
     waiting_legal_doc_url         = State()
     # Platform guide media
     waiting_guide_media           = State()
+    waiting_guide_text            = State()
+    guide_buttons                 = State()
+    guide_btn_type                = State()
+    guide_btn_text                = State()
+    guide_btn_url                 = State()
     # Ad links
     waiting_ad_link_title         = State()
 
@@ -591,9 +656,12 @@ async def admin_stats_overview(callback: CallbackQuery) -> None:
         new_today = await session.scalar(
             select(func.count(User.id)).where(User.created_at >= today)
         )
-        active_subs = await session.scalar(
-            select(func.count(Subscription.id)).where(Subscription.status == SubStatus.ACTIVE)
+        active_subs_res = await session.execute(
+            select(Subscription).where(Subscription.status == SubStatus.ACTIVE)
         )
+        active_list = active_subs_res.scalars().all()
+        active_subs = len(active_list)
+
         expired_subs = await session.scalar(
             select(func.count(Subscription.id)).where(Subscription.status == SubStatus.EXPIRED)
         )
@@ -602,11 +670,27 @@ async def admin_stats_overview(callback: CallbackQuery) -> None:
         )
         server_count = await session.scalar(select(func.count(Server.id)))
 
+        # Group and count active subscriptions
+        marzban_paid = sum(1 for s in active_list if not is_adapt_subscription(s) and not is_vhq_subscription(s) and s.billing_mode != "demo")
+        marzban_demo = sum(1 for s in active_list if not is_adapt_subscription(s) and not is_vhq_subscription(s) and s.billing_mode == "demo")
+        adapt_paid = sum(1 for s in active_list if is_adapt_subscription(s) and s.billing_mode != "demo")
+        adapt_demo = sum(1 for s in active_list if is_adapt_subscription(s) and s.billing_mode == "demo")
+        vhq_paid = sum(1 for s in active_list if is_vhq_subscription(s) and s.billing_mode != "demo")
+        vhq_demo = sum(1 for s in active_list if is_vhq_subscription(s) and s.billing_mode == "demo")
+
+        details = (
+            f"├ Marzban: <b>{marzban_paid}</b> (демо: <b>{marzban_demo}</b>)\n"
+            f"├ Adapt: <b>{adapt_paid}</b> (демо: <b>{adapt_demo}</b>)\n"
+        )
+        if vhq_paid > 0 or vhq_demo > 0:
+            details += f"├ VHQ: <b>{vhq_paid}</b> (демо: <b>{vhq_demo}</b>)\n"
+
     await callback.message.edit_text(
         ADMIN_STATS.format(
             total_users=total_users or 0,
             new_today=new_today or 0,
             active_subs=active_subs or 0,
+            details=details,
             expired_subs=expired_subs or 0,
             total_payments=total_payments or 0,
             server_count=server_count or 0,
@@ -726,7 +810,7 @@ async def admin_stats_users(callback: CallbackQuery) -> None:
         paying_users = await session.scalar(
             select(func.count(func.distinct(Subscription.user_id))).where(
                 Subscription.status == SubStatus.ACTIVE,
-                Subscription.client_name.notlike("%_demo"),
+                Subscription.billing_mode != "demo",
             )
         )
 
@@ -760,14 +844,14 @@ async def admin_stats_conversion(callback: CallbackQuery) -> None:
         # Demo users = users who have at least one demo subscription
         demo_users = await session.scalar(
             select(func.count(func.distinct(Subscription.user_id))).where(
-                Subscription.client_name.like("%_demo"),
+                Subscription.billing_mode == "demo",
             )
         ) or 0
 
         # Converted = demo users who also paid (have Payment record)
         converted = await session.scalar(
             select(func.count(func.distinct(Subscription.user_id))).where(
-                Subscription.client_name.like("%_demo"),
+                Subscription.billing_mode == "demo",
                 Subscription.user_id.in_(paid_user_ids_q),
             )
         ) or 0
@@ -784,7 +868,7 @@ async def admin_stats_conversion(callback: CallbackQuery) -> None:
         # Of those who paid, how many still have active paid subs
         still_active = await session.scalar(
             select(func.count(func.distinct(Subscription.user_id))).where(
-                Subscription.client_name.notlike("%_demo"),
+                Subscription.billing_mode != "demo",
                 Subscription.status == SubStatus.ACTIVE,
                 Subscription.user_id.in_(paid_user_ids_q),
             )
@@ -796,7 +880,7 @@ async def admin_stats_conversion(callback: CallbackQuery) -> None:
         # Manual keys (no Payment record)
         manual_users = await session.scalar(
             select(func.count(func.distinct(Subscription.user_id))).where(
-                Subscription.client_name.notlike("%_demo"),
+                Subscription.billing_mode != "demo",
                 ~Subscription.user_id.in_(paid_user_ids_q),
             )
         ) or 0
@@ -875,7 +959,7 @@ async def admin_stats_tariffs(callback: CallbackQuery) -> None:
                 func.count(Subscription.id),
                 func.count(Subscription.id).filter(Subscription.status == SubStatus.ACTIVE),
             )
-            .where(Subscription.client_name.notlike("%_demo"))
+            .where(Subscription.billing_mode != "demo")
             .group_by(Subscription.tariff_days, Subscription.tariff_months)
             .order_by(func.count(Subscription.id).desc())
         )
@@ -973,7 +1057,7 @@ async def admin_server_info(callback: CallbackQuery) -> None:
             load=stats.get("load", "0%"),
             online="🟢 Да" if stats.get("online") else "🔴 Нет",
             status="🟢 Активен" if server.is_active else "🔴 Выключен",
-            created=server.created_at.strftime("%d.%m.%Y"),
+            created=_format_dt_msk(server.created_at, include_time=False),
         ),
         reply_markup=server_actions_kb(server.id, server.is_active),
         parse_mode="HTML",
@@ -1248,6 +1332,86 @@ async def admin_toggle_block(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("adm_usr_reset_conf_"))
+async def admin_user_reset_conf(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    telegram_id = int(callback.data.split("_")[-1])
+    kb = user_reset_confirm_kb(telegram_id)
+    text = (
+        "⚠️ <b>ВНИМАНИЕ!</b>\n\n"
+        "Вы собираетесь ПОЛНОСТЬЮ обнулить этот аккаунт.\n"
+        "Будут удалены все подписки, ключи доступа и баланс.\n\n"
+        "Вы уверены?"
+    )
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_usr_reset_do_"))
+async def admin_user_reset_do(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    telegram_id = int(callback.data.split("_")[-1])
+    
+    async with async_session() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+        if not user:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+
+        # Disable FK checks for the duration of this wipe
+        await session.execute(text("PRAGMA foreign_keys = OFF"))
+
+        subs = await session.scalars(select(Subscription.id).where(Subscription.user_id == user.id))
+        sub_ids = subs.all()
+        
+        if sub_ids:
+            try:
+                from bot.models import VhqSubscription
+                await session.execute(delete(VhqSubscription).where(VhqSubscription.subscription_id.in_(sub_ids)))
+            except (ImportError, Exception):
+                pass
+            
+            await session.execute(delete(AdaptSubscription).where(AdaptSubscription.subscription_id.in_(sub_ids)))
+            await session.execute(delete(SubscriptionNotificationLog).where(SubscriptionNotificationLog.subscription_id.in_(sub_ids)))
+            await session.execute(delete(RecurringPaymentProfile).where(RecurringPaymentProfile.subscription_id.in_(sub_ids)))
+            await session.execute(delete(ProxyAccount).where(ProxyAccount.subscription_id.in_(sub_ids)))
+            await session.execute(delete(Payment).where(Payment.subscription_id.in_(sub_ids)))
+            await session.execute(delete(Subscription).where(Subscription.id.in_(sub_ids)))
+        
+        # Delete any remaining user-level records
+        await session.execute(delete(ProxyAccount).where(ProxyAccount.user_id == user.id))
+        await session.execute(delete(MTProtoAccount).where(MTProtoAccount.user_id == user.id))
+        await session.execute(delete(Payment).where(Payment.user_id == user.id))
+        
+        user.balance = 0
+        user.referral_balance = 0
+        user.balance_rub = 0
+
+        try:
+            from webstore.models import WebOrder, WebProfileLink
+            profile_link = await session.scalar(
+                select(WebProfileLink).where(WebProfileLink.telegram_id == telegram_id)
+            )
+            if profile_link:
+                await session.execute(
+                    delete(WebOrder)
+                    .where(WebOrder.profile_token == profile_link.profile_token)
+                    .where(WebOrder.tariff_key == "basic_1")
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Failed to clear web orders: %s", e)
+        
+        await session.commit()
+        await session.execute(text("PRAGMA foreign_keys = ON"))
+    
+    await callback.answer("Аккаунт успешно обнулён!", show_alert=True)
+    # Refresh to show empty profile
+    await admin_refresh_user(callback)
+
+
 @router.callback_query(F.data.startswith("adm_usr_refresh_"))
 async def admin_refresh_user(callback: CallbackQuery) -> None:
     """Refresh user card info."""
@@ -1376,7 +1540,10 @@ async def admin_user_subs(callback: CallbackQuery) -> None:
     async with async_session() as session:
         result = await session.execute(
             select(User)
-            .options(selectinload(User.subscriptions).selectinload(Subscription.server))
+            .options(
+                selectinload(User.subscriptions).selectinload(Subscription.server),
+                selectinload(User.subscriptions).selectinload(Subscription.tariff),
+            )
             .where(User.telegram_id == telegram_id)
         )
         user = result.scalar_one_or_none()
@@ -1411,23 +1578,66 @@ async def admin_user_subs(callback: CallbackQuery) -> None:
     billing_labels = {"tariff": "тариф", "balance": "баланс", "demo": "демо"}
     billing_text = billing_labels.get(sub.billing_mode, sub.billing_mode)
 
-    device_slots = max(sub.device_slots or 0, included_slots)
-    started = sub.started_at.strftime("%d.%m.%Y") if sub.started_at else "—"
-    expires = sub.expires_at.strftime("%d.%m.%Y %H:%M")
+    from bot.services.adapt_routing import is_adapt_subscription
+    if is_adapt_subscription(sub):
+        device_slots = sub.device_slots or 1
+    else:
+        device_slots = max(sub.device_slots or 0, included_slots)
+    
+    started = _format_dt_msk(sub.started_at, include_time=True)
+    expires = _format_dt_msk(sub.expires_at, include_time=True)
     duration = f"{sub.tariff_days} дн." if sub.tariff_days else (f"{sub.tariff_months} мес." if sub.tariff_months else "—")
     key_block = _format_subscription_key_block(sub)
+    if getattr(sub, "billing_mode", None) == "demo":
+        tariff_name = "Демо-доступ"
+    else:
+        tariff_name = sub.tariff.label if sub.tariff else "—"
+
+    extra_adapt = ""
+    if is_adapt_subscription(sub):
+        connected_devices = "—"
+        used_traffic_gb = "—"
+        limit_traffic_gb = "—"
+        adapt_uuid = get_adapt_uuid_from_subscription(sub)
+        if adapt_uuid:
+            try:
+                from bot.services.adapt_api import AdaptAPI
+                devices = await AdaptAPI().get_devices(adapt_uuid)
+                connected_devices = len(devices)
+            except Exception as exc:
+                logger.error(f"Error fetching devices for adapt sub {sub.id}: {exc}")
+                connected_devices = "ошибка"
+
+            try:
+                from bot.services.adapt_api import AdaptAPI
+                status_data = await AdaptAPI().get_status(adapt_uuid)
+                used_bytes = status_data.get("used_traffic_bytes") or 0
+                limit_bytes = status_data.get("traffic_limit_bytes") or 0
+                used_traffic_gb = f"{used_bytes / (1024**3):.2f}"
+                limit_traffic_gb = f"{limit_bytes / (1024**3):.0f}"
+            except Exception as exc:
+                logger.error(f"Error fetching status for adapt sub {sub.id}: {exc}")
+                used_traffic_gb = "ошибка"
+                limit_traffic_gb = "ошибка"
+        
+        extra_adapt = (
+            f"🖥 Подключено устройств: <b>{connected_devices}</b>\n"
+            f"⚡️Трафик: <b>{used_traffic_gb}</b> из <b>{limit_traffic_gb}</b> Гб\n"
+        )
 
     text = (
         f"📊 <b>Подписка #{sub.id}</b>  [{page}/{total_items}]\n"
         f"Клиент: <code>{telegram_id}</code>\n\n"
         f"Статус: {status_text}\n"
+        f"Тариф: <b>{tariff_name}</b>\n"
         f"Тип оплаты: <b>{billing_text}</b>\n"
         f"Платформа: {sub.platform.value if sub.platform else '—'}\n"
         f"Сервер: {srv_emoji} {srv_name}\n"
-        f"Начало: {started}\n"
-        f"Истекает: <b>{expires}</b>\n"
+        f"Начало: {started} МСК\n"
+        f"Истекает: <b>{expires} МСК</b>\n"
         f"Срок тарифа: {duration}\n"
         f"Устройств: {device_slots}\n"
+        f"{extra_adapt}"
         f"Клиент Marzban: <code>{html.escape(sub.client_name)}</code>\n\n"
         f"{key_block}"
     )
@@ -1449,6 +1659,155 @@ async def admin_user_subs(callback: CallbackQuery) -> None:
             await callback.message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
 
     await callback.answer()
+
+
+# ── Admin User Devices ────────────────────────────────
+
+@router.callback_query(F.data.startswith("adm_usr_devices_"))
+async def admin_user_devices(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+
+    telegram_id = int(callback.data.split("_")[-1])
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(User)
+            .options(
+                selectinload(User.subscriptions).selectinload(Subscription.server),
+                selectinload(User.subscriptions).selectinload(Subscription.tariff),
+            )
+            .where(User.telegram_id == telegram_id)
+        )
+        user = result.scalar_one_or_none()
+        if not user:
+            await callback.answer("Клиент не найден.", show_alert=True)
+            return
+
+        active_subs = [s for s in user.subscriptions if s.status == SubStatus.ACTIVE]
+        # Prioritize Adapt subscriptions
+        subscription = next((sub for sub in active_subs if is_adapt_subscription(sub)), None)
+        if not subscription:
+            # Fallback to general subscription
+            subscription = next((sub for sub in active_subs if not is_vhq_subscription(sub)), None)
+
+        if not subscription:
+            await callback.answer("У этого пользователя нет активной подписки.", show_alert=True)
+            return
+
+        if is_vhq_subscription(subscription):
+            await callback.answer("Для этого тарифа управление устройствами недоступно.", show_alert=True)
+            return
+
+        if is_adapt_subscription(subscription):
+            adapt_uuid = get_adapt_uuid_from_subscription(subscription)
+            if not adapt_uuid:
+                await callback.answer("Ошибка: не найден UUID подписки Adapt.", show_alert=True)
+                return
+
+            try:
+                from bot.services.adapt_api import AdaptAPI, AdaptAPIError
+                devices = await AdaptAPI().get_devices(adapt_uuid)
+            except AdaptAPIError as exc:
+                logger.error(f"Failed to get adapt devices for sub {subscription.id}: {exc}")
+                await callback.answer("Не удалось получить список устройств. Сервер временно недоступен.", show_alert=True)
+                return
+
+            used_slots = len(devices)
+            limit = subscription.device_slots or 1
+            expires_str = _format_dt_msk(subscription.expires_at, include_time=True)
+            tariff_name = subscription.tariff.label if subscription.tariff else "Adapt"
+
+            text = (
+                f"🖥 <b>Управление устройствами (Админ)</b>\n"
+                f"Клиент: <code>{telegram_id}</code>\n"
+                f"Тариф: <b>{tariff_name}</b>\n\n"
+                f"📅 Подписка до: <b>{expires_str} МСК</b>\n"
+                f"Подключено устройств: <b>{used_slots}</b> из <b>{limit}</b>\n"
+            )
+
+            if not devices:
+                text += "\nУстройства пока не подключены."
+            else:
+                for idx, dev in enumerate(devices, 1):
+                    dev_id = dev.get("id") or dev.get("device_id", "N/A")
+                    dev_name = dev.get("name") or dev.get("client_name") or f"Устройство {dev_id}"
+                    last_ip = dev.get("last_ip") or dev.get("ip") or "неизвестно"
+                    text += f"\n\n🖥 <b>{idx}. {dev_name}</b>\n🔹 Последний IP: <code>{last_ip}</code>"
+
+            # Let's build a keyboard allowing the admin to delete any of these devices
+            kb = InlineKeyboardBuilder()
+            for dev in devices:
+                dev_id = dev.get("id") or dev.get("device_id")
+                dev_name = dev.get("name") or dev.get("client_name") or f"Устройство {dev_id}"
+                if dev_id is not None:
+                    kb.row(InlineKeyboardButton(text=f"❌ Кикнуть {dev_name}", callback_data=f"adm_del_dev_{subscription.id}_{dev_id}_{telegram_id}"))
+
+            kb.row(InlineKeyboardButton(text="◀️ Назад к карточке", callback_data=f"adm_usr_refresh_{telegram_id}"))
+
+            await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+            await callback.answer()
+            return
+
+        # non-adapt logic (Marzban)
+        proxy_result = await session.execute(
+            select(ProxyAccount).where(ProxyAccount.subscription_id == subscription.id)
+        )
+        proxies = proxy_result.scalars().all()
+        used_slots = len(proxies)
+
+        expires_str = _format_dt_msk(subscription.expires_at, include_time=True)
+        tariff_name = subscription.tariff.label if subscription.tariff else "Лайт"
+        text = (
+            f"🖥 <b>Управление устройствами (Админ)</b>\n"
+            f"Клиент: <code>{telegram_id}</code>\n"
+            f"Тариф: <b>{tariff_name}</b>\n\n"
+            f"📅 Подписка до: <b>{expires_str} МСК</b>\n"
+            f"Используется слотов: <b>{used_slots}</b> из <b>{subscription.device_slots}</b>\n\n"
+            f"Ключи:\n"
+        )
+        for proxy in proxies:
+            text += f"\n🔑 Location {proxy.server_id}: <code>{proxy.sub_url}</code>\n"
+
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text="◀️ Назад к карточке", callback_data=f"adm_usr_refresh_{telegram_id}"))
+        await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_del_dev_"))
+async def admin_delete_device(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    parts = callback.data.split("_")
+    sub_id = int(parts[3])
+    device_id = parts[4]
+    telegram_id = int(parts[5])
+
+    async with async_session() as session:
+        sub = await session.get(Subscription, sub_id)
+        if not sub:
+            await callback.answer("Подписка не найдена.", show_alert=True)
+            return
+        adapt_uuid = get_adapt_uuid_from_subscription(sub)
+        if not adapt_uuid:
+            await callback.answer("Не найден UUID подписки Adapt.", show_alert=True)
+            return
+
+    try:
+        from bot.services.adapt_api import AdaptAPI
+        success = await AdaptAPI().delete_device(adapt_uuid, int(device_id))
+        if success:
+            await callback.answer("Устройство удалено!", show_alert=True)
+        else:
+            await callback.answer("Не удалось удалить устройство (API вернул false).", show_alert=True)
+    except Exception as exc:
+        logger.error(f"Failed to delete adapt device {device_id} for sub {sub_id} by admin: {exc}")
+        await callback.answer(f"Ошибка при удалении устройства: {exc}", show_alert=True)
+
+    # Refresh the device list page for admin!
+    callback.data = f"adm_usr_devices_{telegram_id}"
+    await admin_user_devices(callback)
 
 
 # ── User Payments List ────────────────────────────────
@@ -1521,7 +1880,7 @@ async def admin_user_payments(callback: CallbackQuery) -> None:
         discount_str = f" (скидка {p.discount_applied:.0f}%)" if p.discount_applied else ""
         order_str = f"\n   Заказ: <code>{html.escape(p.provider_payment_id)}</code>" if p.provider_payment_id else ""
         lines.append(
-            f"{s} #{p.id} | {p.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+            f"{s} #{p.id} | {_format_dt_msk(p.created_at)}\n"
             f"   {method} | <b>{amount_str}</b>{discount_str}{order_str}"
         )
 
@@ -1714,7 +2073,7 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
             bool(proxy_link),
         )
 
-        expires_str = subscription.expires_at.strftime("%d.%m.%Y") if subscription else "N/A"
+        expires_str = _format_dt_msk(subscription.expires_at, include_time=False) if subscription else "N/A"
 
     # Confirm to admin
     type_labels = {
@@ -1785,6 +2144,7 @@ async def _show_user_info(message: Message, user: User) -> None:
             select(User)
             .options(
                 selectinload(User.subscriptions).selectinload(Subscription.server),
+                selectinload(User.subscriptions).selectinload(Subscription.tariff),
                 selectinload(User.payments),
                 selectinload(User.proxy_accounts),
             )
@@ -1822,7 +2182,11 @@ async def _show_user_info(message: Message, user: User) -> None:
 
         # Total device slots across active subs
         included_slots = await get_included_device_slots(session)
-        total_device_slots = sum(max(s.device_slots or 0, included_slots) for s in active_subs) if active_subs else 0
+        from bot.services.adapt_routing import is_adapt_subscription
+        total_device_slots = sum(
+            (s.device_slots or 1) if is_adapt_subscription(s) else max(s.device_slots or 0, included_slots)
+            for s in active_subs
+        ) if active_subs else 0
 
         # Proxy accounts (keys)
         proxy_count = len(u.proxy_accounts)
@@ -1857,21 +2221,45 @@ async def _show_user_info(message: Message, user: User) -> None:
             f"👤 Username: @{u.username}\n"
         )
 
+    # Under "Устройств:" row add details if they have an active adapt subscription
+    adapt_sub = next((s for s in active_subs if is_adapt_subscription(s)), None)
+    connected_line = ""
+    traffic_line = ""
+    if adapt_sub:
+        adapt_uuid = get_adapt_uuid_from_subscription(adapt_sub)
+        if adapt_uuid:
+            try:
+                from bot.services.adapt_api import AdaptAPI
+                devices = await AdaptAPI().get_devices(adapt_uuid)
+                connected_count = len(devices)
+            except Exception as e:
+                logger.error(f"Error fetching adapt devices: {e}")
+                connected_count = "ошибка"
+
+            try:
+                from bot.services.adapt_api import AdaptAPI
+                status_data = await AdaptAPI().get_status(adapt_uuid)
+                used_bytes = status_data.get("used_traffic_bytes") or 0
+                limit_bytes = status_data.get("traffic_limit_bytes") or 0
+                used_traffic_gb = f"{used_bytes / (1024**3):.2f}"
+                limit_traffic_gb = f"{limit_bytes / (1024**3):.0f}"
+            except Exception as e:
+                logger.error(f"Error fetching adapt status: {e}")
+                used_traffic_gb = "ошибка"
+                limit_traffic_gb = "ошибка"
+
+            connected_line = f"├ 🖥 Подключено: <b>{connected_count}</b>\n"
+            traffic_line = f"├ ⚡️Трафик для обходов: <b>{used_traffic_gb}</b> из <b>{limit_traffic_gb}</b> Гб\n"
+
     text += (
         f"📱 Платформа: {u.platform.value if u.platform else '-'}\n"
         f"🚫 Заблокирован: {'Да' if u.is_blocked else 'Нет'}\n"
-        f"📅 Регистрация: {u.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+        f"📅 Регистрация: {_format_dt_msk(u.created_at)}\n"
         f"🤝 Партнёрка: {'Да' if partner else 'Нет'}\n"
         f"\n"
         f"<b>💰 Финансы</b>\n"
         f"├ Баланс: <b>{(u.balance_rub or 0.0):.2f} ₽</b>\n"
-        f"├ Автосписание: <b>{'включено' if balance_autodebit_enabled else 'выключено'}</b>\n"
-        + (
-            f"├ Следующее списание: <b>{next_daily_charge_at.strftime('%d.%m.%Y %H:%M') if next_daily_charge_at else '-'}</b>\n"
-            if balance_autodebit_enabled
-            else ""
-        )
-        + f"├ Оплат всего: <b>{len(completed_payments)}</b>\n"
+        f"├ Оплат всего: <b>{len(completed_payments)}</b>\n"
         f"└ Оплачено суммарно: <b>{total_paid:.0f} ₽</b>\n"
         f"\n"
         f"<b>🔗 Рефералы</b>\n"
@@ -1882,6 +2270,8 @@ async def _show_user_info(message: Message, user: User) -> None:
         f"├ Активных: <b>{len(active_subs)}</b>\n"
         f"├ Истекших: <b>{len(expired_subs)}</b>\n"
         f"├ Устройств: <b>{total_device_slots}</b>\n"
+        f"{connected_line}"
+        f"{traffic_line}"
         f"└ Ключей (proxy): <b>{proxy_count}</b>\n"
     )
 
@@ -1899,12 +2289,21 @@ async def _show_user_info(message: Message, user: User) -> None:
         for s in active_subs:
             srv_name = s.server.name if s.server else "?"
             srv_emoji = s.server.country_emoji if s.server else "🌍"
-            exp = s.expires_at.strftime("%d.%m.%Y")
-            text += f"  {srv_emoji} {srv_name} - до {exp} ({max(s.device_slots or 0, included_slots)} устр.)\n"
+            exp = _format_dt_msk(s.expires_at, include_time=True)
+            if is_adapt_subscription(s):
+                slots = s.device_slots or 1
+            else:
+                slots = max(s.device_slots or 0, included_slots)
+            text += f"  {srv_emoji} {srv_name} - до {exp} МСК ({slots} устр.)\n"
 
     await message.answer(
         text,
-        reply_markup=user_actions_kb(u.telegram_id, u.is_blocked, partner_id=partner.id if partner else None),
+        reply_markup=user_actions_kb(
+            u.telegram_id,
+            u.is_blocked,
+            partner_id=partner.id if partner else None,
+            has_active_sub=len(active_subs) > 0,
+        ),
         parse_mode="HTML",
     )
 
@@ -2744,6 +3143,47 @@ async def admin_doc_edit_save(message: Message, state: FSMContext) -> None:
 from bot.keyboards.admin import guides_menu_kb, guide_detail_kb, PLATFORM_LABELS
 
 
+async def _show_guide_detail(callback: CallbackQuery, platform: str) -> None:
+    from bot.handlers.start import _guide_text
+    from bot.handlers.mailing import _buttons_preview
+
+    async with async_session() as session:
+        pg = await session.get(PlatformGuide, platform)
+
+    has_media = bool(pg and pg.media_file_id)
+    has_text = bool(pg and pg.guide_text)
+    has_buttons = bool(pg and pg.buttons_json)
+
+    current_text = pg.guide_text if has_text else _guide_text(platform)
+    media_info = f"📎 Медиа: <b>{pg.media_type}</b>" if has_media else "📎 Медиа: <i>не загружено</i>"
+    buttons_info = "🔘 Кнопки: <i>не настроены</i>"
+    if has_buttons:
+        buttons_info = f"🔘 Кнопки:\n{_buttons_preview(pg.buttons_json)}"
+
+    text_info = f"📝 <b>Текст гайда:</b>\n───────────────────\n{current_text}\n───────────────────"
+    if has_text:
+        text_status = "🟢 Используется собственный кастомный текст."
+    else:
+        text_status = "⚪️ Используется стандартный текст по умолчанию."
+
+    body = (
+        f"📚 <b>Гайд: {PLATFORM_LABELS[platform]}</b>\n\n"
+        f"{text_status}\n"
+        f"{media_info}\n"
+        f"{buttons_info}\n\n"
+        f"{text_info}"
+    )
+
+    try:
+        await callback.message.edit_text(
+            body,
+            reply_markup=guide_detail_kb(platform, has_media, has_text, has_buttons),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"Error rendering guide detail: {e}")
+
+
 @router.callback_query(F.data == "adm_guides")
 async def admin_guides_menu(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
@@ -2755,7 +3195,7 @@ async def admin_guides_menu(callback: CallbackQuery) -> None:
             has_media[p] = bool(pg and pg.media_file_id)
     try:
         await callback.message.edit_text(
-            "📚 <b>Гайды по платформам</b>\n\nВыберите платформу для загрузки фото/видео:",
+            "📚 <b>Гайды по платформам</b>\n\nВыберите платформу для настройки текста, медиа и кнопок:",
             reply_markup=guides_menu_kb(has_media),
             parse_mode="HTML",
         )
@@ -2764,7 +3204,7 @@ async def admin_guides_menu(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("adm_guide_") & ~F.data.startswith("adm_guide_upload_") & ~F.data.startswith("adm_guide_clear_"))
+@router.callback_query(F.data.startswith("adm_guide_") & ~F.data.startswith("adm_guide_upload_") & ~F.data.startswith("adm_guide_clear_") & ~F.data.startswith("adm_guide_etext_") & ~F.data.startswith("adm_guide_rtext_") & ~F.data.startswith("adm_guide_btns_") & ~F.data.startswith("adm_guide_bdone_") & ~F.data.startswith("adm_guide_prev_"))
 async def admin_guide_detail(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         return
@@ -2772,18 +3212,7 @@ async def admin_guide_detail(callback: CallbackQuery) -> None:
     if platform not in PLATFORM_LABELS:
         await callback.answer("Платформа не найдена", show_alert=True)
         return
-    async with async_session() as session:
-        pg = await session.get(PlatformGuide, platform)
-    has_media = bool(pg and pg.media_file_id)
-    media_info = f"📎 Медиа: {pg.media_type}" if has_media else "Медиа не загружено"
-    try:
-        await callback.message.edit_text(
-            f"📚 <b>{PLATFORM_LABELS[platform]}</b>\n\n{media_info}",
-            reply_markup=guide_detail_kb(platform, has_media),
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
+    await _show_guide_detail(callback, platform)
     await callback.answer()
 
 
@@ -2797,10 +3226,15 @@ async def admin_guide_upload_start(callback: CallbackQuery, state: FSMContext) -
         return
     await state.set_state(AdminStates.waiting_guide_media)
     await state.update_data(guide_platform=platform)
+    
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"adm_guide_{platform}")]
+    ])
+    
     await callback.message.edit_text(
-        f"📤 Отправьте <b>фото или видео</b> для гайда «{PLATFORM_LABELS[platform]}».\n\n"
-        f"Или нажмите «◀️ Отмена».",
-        reply_markup=admin_back_kb(),
+        f"📤 Отправьте <b>фото, видео или альбом</b> для гайда «{PLATFORM_LABELS[platform]}».\n\n"
+        f"Или нажмите «◀️ Отмена» для возврата.",
+        reply_markup=cancel_kb,
         parse_mode="HTML",
     )
     await callback.answer()
@@ -2817,29 +3251,57 @@ async def admin_guide_clear(callback: CallbackQuery) -> None:
             pg.media_file_id = None
             pg.media_type = None
             await session.commit()
-    await callback.answer("Медиа удалено", show_alert=True)
-    await admin_guide_detail(callback)
+    await callback.answer("Медиа удалено", show_alert=False)
+    await _show_guide_detail(callback, platform)
 
 
 @router.message(AdminStates.waiting_guide_media)
-async def admin_guide_media_received(message: Message, state: FSMContext) -> None:
+async def admin_guide_media_received(message: Message, state: FSMContext, album: list[Message] | None = None) -> None:
     if not _is_admin(message.from_user.id):
         return
     data = await state.get_data()
     platform = data.get("guide_platform", "")
 
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        media_type = "photo"
-    elif message.video:
-        file_id = message.video.file_id
-        media_type = "video"
-    elif message.animation:
-        file_id = message.animation.file_id
-        media_type = "video"
+    file_id = None
+    media_type = None
+
+    if album:
+        media_list = []
+        for msg in album:
+            if msg.photo:
+                media_list.append(f"photo:{msg.photo[-1].file_id}")
+            elif msg.video:
+                media_list.append(f"video:{msg.video.file_id}")
+        if media_list:
+            file_id = ",".join(media_list)
+            media_type = "album"
     else:
-        await message.answer("❌ Отправьте фото или видео.")
+        if message.photo:
+            file_id = message.photo[-1].file_id
+            media_type = "photo"
+        elif message.video:
+            file_id = message.video.file_id
+            media_type = "video"
+        elif message.animation:
+            file_id = message.animation.file_id
+            media_type = "video"
+
+    if not file_id:
+        await message.answer("❌ Отправьте фото, видео или альбом.")
         return
+
+    # Delete messages to keep chat clean
+    if album:
+        for msg in album:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+    else:
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
     async with async_session() as session:
         pg = await session.get(PlatformGuide, platform)
@@ -2856,9 +3318,207 @@ async def admin_guide_media_received(message: Message, state: FSMContext) -> Non
         await session.commit()
 
     await state.clear()
+    
+    await message.answer(f"✅ Медиа для «{PLATFORM_LABELS.get(platform, platform)}» успешно сохранено.")
+    
+    # Send detail view
+    from bot.handlers.start import _guide_text
+    async with async_session() as session:
+        pg = await session.get(PlatformGuide, platform)
+    has_media = bool(pg and pg.media_file_id)
+    has_text = bool(pg and pg.guide_text)
+    has_buttons = bool(pg and pg.buttons_json)
+    
+    current_text = pg.guide_text if has_text else _guide_text(platform)
+    media_info = f"📎 Медиа: <b>{pg.media_type}</b>" if has_media else "📎 Медиа: <i>не загружено</i>"
+    from bot.handlers.mailing import _buttons_preview
+    buttons_info = f"🔘 Кнопки:\n{_buttons_preview(pg.buttons_json)}" if has_buttons else "🔘 Кнопки: <i>не настроены</i>"
+    text_info = f"📝 <b>Текст гайда:</b>\n───────────────────\n{current_text}\n───────────────────"
+    text_status = "🟢 Используется собственный кастомный текст." if has_text else "⚪️ Используется стандартный текст по умолчанию."
+    
+    body = (
+        f"📚 <b>Гайд: {PLATFORM_LABELS.get(platform, platform)}</b>\n\n"
+        f"{text_status}\n"
+        f"{media_info}\n"
+        f"{buttons_info}\n\n"
+        f"{text_info}"
+    )
     await message.answer(
-        f"✅ Медиа для «{PLATFORM_LABELS.get(platform, platform)}» сохранено.",
-        reply_markup=admin_menu_kb(),
+        body,
+        reply_markup=guide_detail_kb(platform, has_media, has_text, has_buttons),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("adm_guide_etext_"))
+async def admin_guide_edit_text_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    platform = callback.data[len("adm_guide_etext_"):]
+    if platform not in PLATFORM_LABELS:
+        await callback.answer("Платформа не найдена", show_alert=True)
+        return
+        
+    await state.set_state(AdminStates.waiting_guide_text)
+    await state.update_data(guide_platform=platform)
+    
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"adm_guide_{platform}")]
+    ])
+    
+    await callback.message.edit_text(
+        f"📝 <b>Редактирование текста гайда «{PLATFORM_LABELS[platform]}»</b>\n\n"
+        f"Отправьте новый текст инструкции. Поддерживается HTML-разметка.\n\n"
+        f"Или нажмите «◀️ Отмена» для возврата.",
+        reply_markup=cancel_kb,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_guide_text, F.text)
+async def admin_guide_text_received(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    platform = data.get("guide_platform", "")
+    new_text = message.html_text
+    
+    try:
+        await message.delete()
+    except Exception:
+        pass
+        
+    async with async_session() as session:
+        pg = await session.get(PlatformGuide, platform)
+        if pg:
+            pg.guide_text = new_text
+            pg.updated_at = datetime.utcnow()
+        else:
+            session.add(PlatformGuide(
+                platform=platform,
+                guide_text=new_text,
+            ))
+        await session.commit()
+        
+    await state.clear()
+    
+    # Send details screen
+    from bot.handlers.start import _guide_text
+    async with async_session() as session:
+        pg = await session.get(PlatformGuide, platform)
+    has_media = bool(pg and pg.media_file_id)
+    has_text = bool(pg and pg.guide_text)
+    has_buttons = bool(pg and pg.buttons_json)
+    
+    current_text = pg.guide_text if has_text else _guide_text(platform)
+    media_info = f"📎 Медиа: <b>{pg.media_type}</b>" if has_media else "📎 Медиа: <i>не загружено</i>"
+    from bot.handlers.mailing import _buttons_preview
+    buttons_info = f"🔘 Кнопки:\n{_buttons_preview(pg.buttons_json)}" if has_buttons else "🔘 Кнопки: <i>не настроены</i>"
+    text_info = f"📝 <b>Текст гайда:</b>\n───────────────────\n{current_text}\n───────────────────"
+    text_status = "🟢 Используется собственный кастомный текст." if has_text else "⚪️ Используется стандартный текст по умолчанию."
+    
+    body = (
+        f"📚 <b>Гайд: {PLATFORM_LABELS.get(platform, platform)}</b>\n\n"
+        f"{text_status}\n"
+        f"{media_info}\n"
+        f"{buttons_info}\n\n"
+        f"{text_info}"
+    )
+    await message.answer(
+        body,
+        reply_markup=guide_detail_kb(platform, has_media, has_text, has_buttons),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("adm_guide_rtext_"))
+async def admin_guide_reset_text(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    platform = callback.data[len("adm_guide_rtext_"):]
+    async with async_session() as session:
+        pg = await session.get(PlatformGuide, platform)
+        if pg:
+            pg.guide_text = None
+            pg.updated_at = datetime.utcnow()
+            await session.commit()
+            
+    await callback.answer("Текст сброшен к стандартному", show_alert=False)
+    await _show_guide_detail(callback, platform)
+
+
+@router.callback_query(F.data.startswith("adm_guide_btns_"))
+async def admin_guide_buttons_editor(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    platform = callback.data[len("adm_guide_btns_"):]
+    if platform not in PLATFORM_LABELS:
+        await callback.answer("Платформа не найдена", show_alert=True)
+        return
+        
+    async with async_session() as session:
+        pg = await session.get(PlatformGuide, platform)
+        
+    from bot.handlers.mailing import _parse_buttons, _btn_editor_kb
+    buttons = _parse_buttons(pg.buttons_json if pg else None)
+    
+    await state.set_state(AdminStates.guide_buttons)
+    await state.update_data(guide_platform=platform, buttons=buttons, btn_context="guide")
+    
+    btn_text = f"🔘 <b>Редактор кнопок для гайда «{PLATFORM_LABELS[platform]}»</b>\n\nДобавьте кнопки или нажмите «Готово»."
+    btn_kb = _btn_editor_kb(buttons, f"adm_guide_bdone_{platform}")
+    await callback.message.edit_text(btn_text, reply_markup=btn_kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_guide_bdone_"), AdminStates.guide_buttons)
+async def admin_guide_buttons_done(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    platform = callback.data[len("adm_guide_bdone_"):]
+    data = await state.get_data()
+    buttons = data.get("buttons", [])
+    
+    from bot.handlers.mailing import _buttons_to_json
+    async with async_session() as session:
+        pg = await session.get(PlatformGuide, platform)
+        if pg:
+            pg.buttons_json = _buttons_to_json(buttons)
+            pg.updated_at = datetime.utcnow()
+        else:
+            session.add(PlatformGuide(
+                platform=platform,
+                buttons_json=_buttons_to_json(buttons),
+            ))
+        await session.commit()
+        
+    await state.clear()
+    await callback.answer("Кнопки сохранены", show_alert=False)
+    await _show_guide_detail(callback, platform)
+
+
+@router.callback_query(F.data.startswith("adm_guide_prev_"))
+async def admin_guide_preview(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    platform = callback.data[len("adm_guide_prev_"):]
+    if platform not in PLATFORM_LABELS:
+        await callback.answer("Платформа не найдена", show_alert=True)
+        return
+        
+    await callback.answer("Гайд отправлен ниже", show_alert=False)
+    
+    from bot.handlers.start import _guide_text
+    from bot.services.guide_service import send_guide
+    await send_guide(
+        callback.bot,
+        callback.from_user.id,
+        platform,
+        _guide_text(platform),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад к редактированию", callback_data=f"adm_guide_{platform}")]
+        ])
     )
 
 

@@ -303,8 +303,10 @@ async def test_partner_dashboard_shows_only_active_links(monkeypatch, db_session
     await db_session.commit()
     await db_session.flush()
 
-    db_session.add(Payment(user_id=users[0].id, amount=500, currency="RUB", method=PaymentMethod.BALANCE, status=PaymentStatus.COMPLETED))
-    db_session.add(PartnerEarning(partner_id=partner.id, user_id=users[0].id, amount=100))
+    payment1 = Payment(user_id=users[0].id, amount=500, currency="RUB", method=PaymentMethod.BALANCE, status=PaymentStatus.COMPLETED)
+    db_session.add(payment1)
+    await db_session.flush()
+    db_session.add(PartnerEarning(partner_id=partner.id, user_id=users[0].id, payment_id=payment1.id, amount=100))
     db_session.add(WebPartnerEarning(
         partner_id=partner.id,
         partner_link_id=active_link.id,
@@ -315,17 +317,20 @@ async def test_partner_dashboard_shows_only_active_links(monkeypatch, db_session
         payment_amount_rub=500,
         earning_amount_rub=50,
     ))
-    db_session.add(Payment(
+    payment2 = Payment(
         user_id=users[2].id,
         amount=400,
         currency="RUB",
         method=PaymentMethod.BALANCE,
         status=PaymentStatus.COMPLETED,
         created_at=datetime.utcnow() - timedelta(days=45),
-    ))
+    )
+    db_session.add(payment2)
+    await db_session.flush()
     db_session.add(PartnerEarning(
         partner_id=partner.id,
         user_id=users[2].id,
+        payment_id=payment2.id,
         amount=80,
         created_at=datetime.utcnow() - timedelta(days=45),
     ))

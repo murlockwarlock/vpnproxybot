@@ -49,6 +49,14 @@ def _fmt_msk(dt) -> str:
     return dt.astimezone(_MSK).strftime("%d.%m.%Y %H:%M")
 
 
+def _fmt_msk_short(dt) -> str:
+    if not dt:
+        return "-"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_MSK).strftime("%d.%m %H:%M")
+
+
 def _fmt_iso_msk(iso_str: str | None) -> str:
     """Parse an ISO-8601 string (possibly with Z suffix) and format in MSK."""
     if not iso_str:
@@ -76,6 +84,10 @@ def _subscription_product_label(sub: Subscription, mtproto_accounts: list[MTProt
 
 
 def _subscription_tariff_label(sub: Subscription, mtproto_accounts: list[MTProtoAccount]) -> str:
+    if getattr(sub, "billing_mode", None) == "demo":
+        return "Демо-доступ"
+    if sub.tariff:
+        return sub.tariff.label
     duration = format_subscription_duration(
         tariff_days=sub.tariff_days,
         tariff_months=sub.tariff_months,
@@ -85,7 +97,9 @@ def _subscription_tariff_label(sub: Subscription, mtproto_accounts: list[MTProto
 
 def _subscription_device_slots(sub: Subscription, included_slots: int) -> int:
     slots = int(sub.device_slots or 0)
-    if is_vhq_subscription(sub) or is_adapt_subscription(sub):
+    if is_adapt_subscription(sub):
+        return max(slots, 1)
+    if is_vhq_subscription(sub):
         return max(slots, included_slots)
     return max(slots, 1)
 
@@ -136,7 +150,10 @@ async def show_profile(callback: CallbackQuery) -> None:
     async with async_session() as session:
         result = await session.execute(
             select(User)
-            .options(selectinload(User.subscriptions).selectinload(Subscription.server))
+            .options(
+                selectinload(User.subscriptions).selectinload(Subscription.server),
+                selectinload(User.subscriptions).selectinload(Subscription.tariff),
+            )
             .where(User.telegram_id == callback.from_user.id)
         )
         user = result.scalar_one_or_none()
@@ -152,7 +169,7 @@ async def show_profile(callback: CallbackQuery) -> None:
             .where(RecurringPaymentProfile.is_active == True)  # noqa: E712
         )
         rec_profile = rec_result.scalar_one_or_none()
-        has_recurring = rec_profile is not None
+        has_recurring = rec_profile is not None and settings.recurring_payments_enabled
         recurring_active = rec_profile.consent_granted if rec_profile else False
 
         # MTProto proxy accounts
@@ -211,7 +228,7 @@ async def show_profile(callback: CallbackQuery) -> None:
         for sub in user.subscriptions
     )
     purchase_button_text = (
-        "🔄 Продлить доступ"
+        "Оплатить подписку 💳"
         if active_sub_count > 0 or has_expired_paid_subs
         else "🛒 Купить доступ"
     )
@@ -252,7 +269,7 @@ async def show_profile(callback: CallbackQuery) -> None:
         for item in balance_history:
             sign = "+" if item.direction.value == "credit" else "-"
             text += (
-                f"\n• {item.created_at.strftime('%d.%m %H:%M')} · "
+                f"\n• {_fmt_msk_short(item.created_at)} · "
                 f"{sign}{item.amount_rub:.2f} ₽ · {item.description or 'Операция'}"
             )
 
@@ -274,7 +291,7 @@ async def show_profile(callback: CallbackQuery) -> None:
                 status_emoji=status_emoji,
                 status=status_text,
                 tariff=_subscription_tariff_label(sub, mtproto_accounts),
-                expires=sub.expires_at.strftime("%d.%m.%Y"),
+                expires=_fmt_msk(sub.expires_at),
                 key_short=key_short,
             )
     else:
@@ -416,7 +433,7 @@ async def balance_history(callback: CallbackQuery) -> None:
         for item in transactions:
             sign = "+" if item.direction.value == "credit" else "-"
             lines.append(
-                f"• <b>{item.created_at.strftime('%d.%m.%Y %H:%M')}</b>"
+                f"• <b>{_fmt_msk(item.created_at)}</b>"
                 f"\n{sign}{item.amount_rub:.2f} ₽"
                 f"\n{item.description or 'Операция'}"
                 f"\nОстаток: {item.balance_after_rub:.2f} ₽"
@@ -576,15 +593,22 @@ async def _build_keys_page(
         sub = item
         location = sub.server.location if sub.server else "N/A"
         emoji = sub.server.country_emoji if sub.server else "🌍"
-        expires = sub.expires_at.strftime("%d.%m.%Y")
+        expires = _fmt_msk(sub.expires_at)
         provider_label = _provider_label(sub)
         tariff_line = ""
-        if sub.tariff:
+        if getattr(sub, "billing_mode", None) == "demo":
+            tariff_line = f"📦 Тариф: Демо-доступ\n"
+        elif sub.tariff:
             tariff_line = f"📦 Тариф: {sub.tariff.label}\n"
         elif provider_label:
             tariff_line = f"📦 Провайдер: {provider_label}\n"
+        if is_adapt_subscription(sub) or is_vhq_subscription(sub):
+            header = f"🔗 <b>Подписка Darimiru</b>"
+        else:
+            header = f"🔗 <b>{emoji} {location}</b>"
+
         text = (
-            f"🔗 <b>{emoji} {location}</b>\n"
+            f"{header}\n"
             f"{tariff_line}"
             f"📅 До: {expires}\n"
             f"🖥 Устройств: {_subscription_device_slots(sub, included_slots)}\n\n"
@@ -613,10 +637,6 @@ async def _build_keys_page(
                 adapt_kb_builder.row(InlineKeyboardButton(
                     text="❄️ Заморозить", callback_data=f"adapt_freeze:{sub.id}"
                 ))
-            adapt_kb_builder.row(
-                InlineKeyboardButton(text="⚡️ Докупить трафик", callback_data=f"adapt_traffic:{sub.id}"),
-                InlineKeyboardButton(text="⬆️ Апгрейд", callback_data=f"adapt_upgrade_menu:{sub.id}"),
-            )
             # Add nav buttons from standard kb
             nav_buttons = []
             if page > 1:
@@ -690,6 +710,10 @@ async def show_keys_paginated(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "recurring_toggle_off")
 async def recurring_off(callback: CallbackQuery) -> None:
     """Disable auto-renewal."""
+    if not settings.recurring_payments_enabled:
+        await callback.answer("Автопродление отключено для этого инстанса", show_alert=True)
+        return
+
     async with async_session() as session:
         result = await session.execute(
             select(RecurringPaymentProfile)
@@ -714,6 +738,10 @@ async def recurring_off(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "recurring_toggle_on")
 async def recurring_on(callback: CallbackQuery) -> None:
     """Re-enable auto-renewal."""
+    if not settings.recurring_payments_enabled:
+        await callback.answer("Автопродление отключено для этого инстанса", show_alert=True)
+        return
+
     async with async_session() as session:
         result = await session.execute(
             select(RecurringPaymentProfile)
@@ -981,18 +1009,31 @@ async def adapt_do_upgrade(callback: CallbackQuery) -> None:
             await callback.answer("Подписка Adapt не найдена", show_alert=True)
             return
 
+        new_tariff = await session.scalar(
+            select(Tariff).where(Tariff.adapt_plan_uuid == new_plan_uuid)
+        )
+        if not new_tariff:
+            await callback.answer("Тариф не найден", show_alert=True)
+            return
+
         try:
-            resp = await AdaptAPI().upgrade_subscription(adapt_record.adapt_uuid, new_plan_uuid)
+            resp = await AdaptAPI().renew_subscription_custom(adapt_record.adapt_uuid, new_tariff.days)
         except AdaptAPIError as exc:
             await callback.answer(f"Ошибка улучшения: {exc}", show_alert=True)
             return
 
         adapt_record.adapt_plan_uuid = new_plan_uuid
-        if resp.get("devices"):
-            sub.device_slots = int(resp["devices"])
+        
+        # update expires_at
+        new_end_str = resp.get("end_date")
+        if new_end_str:
+            from datetime import datetime
+            sub.expires_at = datetime.fromisoformat(new_end_str.replace("Z", "+00:00")).replace(tzinfo=None)
+            adapt_record.end_date = sub.expires_at
+
         await session.commit()
 
-        upgrade_price = resp.get("upgrade_price", "?")
+        upgrade_price = resp.get("total_price", "?")
 
-    await callback.answer(f"✅ Тариф улучшен! Стоимость: {upgrade_price} USD")
+    await callback.answer(f"✅ Тариф улучшен! Стоимость (в USD): {upgrade_price}")
     await show_profile(callback)

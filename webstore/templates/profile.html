@@ -567,6 +567,7 @@
         <a href="/buy#tariffs" class="primary-btn">Приобрести ключ</a>
         <button type="button" class="ghost-btn" onclick="resetProfile()">Войти в другой профиль</button>
       </div>
+
       <div class="balance-box" id="balanceBox" style="display:none;">
         <h2>Баланс</h2>
         <div class="balance-main" id="balanceAmount"></div>
@@ -581,6 +582,7 @@
         </div>
         <div class="balance-history" id="balanceHistory"></div>
       </div>
+
       <div class="lookup-box telegram-box">
         <div class="telegram-head">
           <div>
@@ -1040,7 +1042,6 @@
           historyBox.innerHTML = '<div class="empty-state">Пока без операций</div>';
         }
       }
-      box.style.display = "block";
     }
 
     function renderBalance(balance) {
@@ -1055,7 +1056,14 @@
         return;
       }
 
-      amount.textContent = `${Number(balance.balance_rub).toFixed(2)} ₽`;
+      const balance_rub = Number(balance.balance_rub || 0);
+      const balance_mode_enabled = !!balance.balance_mode_enabled;
+      if (balance_rub <= 0 && !balance_mode_enabled) {
+        box.style.display = "none";
+        return;
+      }
+
+      amount.textContent = `${balance_rub.toFixed(2)} ₽`;
       const parts = [];
       const enabled = !!(balance.balance_mode_enabled && balance.balance_autodebit_enabled);
       if (balance.status_text) {

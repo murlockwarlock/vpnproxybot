@@ -84,7 +84,7 @@ def _purchase_button_text(user: User | None) -> str:
     if not user:
         return "🛒 Купить доступ"
     if _has_active_subscription(user) or _has_expired_paid_subscription(user):
-        return "🔄 Продлить доступ"
+        return "Оплатить подписку 💳"
     return "🛒 Купить доступ"
 
 
@@ -99,7 +99,7 @@ def _format_date(dt: datetime) -> str:
 def _get_active_subscription_expiry(user: User) -> str | None:
     active_subs = [
         s for s in user.subscriptions
-        if s.status.value == "active" and not is_demo_subscription_row(s)
+        if s.status.value == "active"
     ]
     if not active_subs:
         return None
@@ -112,7 +112,7 @@ def _get_welcome_text(user: User, name: str) -> str:
     if active_expiry:
         from bot.utils.texts import WELCOME_BACK_ACTIVE
         return WELCOME_BACK_ACTIVE.format(name=name, expires=active_expiry)
-    if _purchase_button_text(user) == "🔄 Продлить доступ":
+    if _purchase_button_text(user) == "Оплатить подписку 💳":
         from bot.utils.texts import WELCOME_RENEW
         return WELCOME_RENEW
     from bot.utils.texts import WELCOME_BACK
@@ -137,6 +137,99 @@ def _with_balance_line(text: str, user: User | None) -> str:
 
 async def _maybe_create_demo_key(message: Message, user_db_id: int) -> None:
     """Create a free demo VPN key for a newly registered user if the feature is enabled."""
+    if settings.adapt_demo_enabled:
+        await _maybe_create_adapt_demo_key(message, user_db_id)
+    else:
+        await _maybe_create_marzban_demo_key(message, user_db_id)
+
+
+async def _maybe_create_adapt_demo_key(message: Message, user_db_id: int) -> None:
+    """Create a free demo ADAPT subscription for a newly registered user."""
+    from bot.models import Tariff
+
+    async with async_session() as session:
+        demo_enabled_row = await session.get(BotSettings, "demo_key_enabled")
+        if not demo_enabled_row or demo_enabled_row.value != "1":
+            return
+
+        demo_days_row = await session.get(BotSettings, "demo_key_days")
+        try:
+            demo_days = int(demo_days_row.value) if demo_days_row else 3
+        except ValueError:
+            demo_days = 3
+
+        demo_tariff = None
+        if settings.adapt_demo_plan_uuid:
+            demo_tariff_result = await session.execute(
+                select(Tariff)
+                .where(Tariff.adapt_plan_uuid == settings.adapt_demo_plan_uuid)
+                .limit(1)
+            )
+            demo_tariff = demo_tariff_result.scalar_one_or_none()
+
+        if not demo_tariff:
+            # Look for the ADAPT demo tariff. Prefer admin-only 7-day tariff,
+            # fallback to any cheapest 7-day ADAPT tariff.
+            demo_tariff_result = await session.execute(
+                select(Tariff)
+                .where(Tariff.adapt_plan_uuid.isnot(None))
+                .where(Tariff.is_admin_only == True)  # noqa: E712
+                .where(Tariff.days == 7)
+                .order_by(Tariff.price_rub)
+                .limit(1)
+            )
+            demo_tariff = demo_tariff_result.scalar_one_or_none()
+            if not demo_tariff:
+                demo_tariff_result = await session.execute(
+                    select(Tariff)
+                    .where(Tariff.adapt_plan_uuid.isnot(None))
+                    .where(Tariff.days == 7)
+                    .order_by(Tariff.price_rub)
+                    .limit(1)
+                )
+                demo_tariff = demo_tariff_result.scalar_one_or_none()
+
+    if not demo_tariff:
+        logger.error("ADAPT demo tariff (7 days, admin_only or cheapest) not found in DB.")
+        return
+
+    if demo_tariff.days:
+        demo_days = demo_tariff.days
+
+    async with async_session() as session:
+        user = await session.get(User, user_db_id)
+        if not user:
+            return
+
+        from bot.services.subscription_service import create_adapt_demo_subscription
+        subscription, vpn_key = await create_adapt_demo_subscription(
+            session,
+            user=user,
+            tariff=demo_tariff,
+            platform=Platform.ANDROID,
+        )
+
+        if not subscription or not vpn_key:
+            logger.error(f"Failed to issue ADAPT demo for user {user_db_id}")
+            return
+
+        await session.commit()
+
+    await message.answer(
+        f"🎁 <b>Вам выдан демо-доступ на {demo_days} дн.!</b>\n\n"
+        f"Ссылка на подписку:\n<code>{vpn_key}</code>\n"
+        f"<i>Нажмите на ссылку выше, чтобы скопировать её.</i>\n\n"
+        f"📱 Демо-доступ работает на <b>1 устройстве</b>.\n"
+        f"Полный тариф даёт доступ на <b>3 устройства</b>.\n\n"
+        f"Найти ключ позже: «👤 Мой профиль» → «🔑 Мои ключи».",
+        parse_mode="HTML",
+        reply_markup=demo_key_kb(),
+    )
+    logger.info(f"ADAPT Demo key created for user {user_db_id}")
+
+
+async def _maybe_create_marzban_demo_key(message: Message, user_db_id: int) -> None:
+    """Create a free demo Marzban VPN key for a newly registered user."""
     from bot.services import vpn_manager
 
     async with async_session() as session:
@@ -212,7 +305,9 @@ async def _maybe_create_demo_key(message: Message, user_db_id: int) -> None:
         f"🎁 <b>Вам выдан демо-доступ на {demo_days} дн.!</b>\n\n"
         f"Ссылка на подписку:\n<code>{vpn_key}</code>\n"
         f"<i>Нажмите на ссылку выше, чтобы скопировать её.</i>\n\n"
-        f"Работает на всех платформах. Найти ключ позже: «👤 Мой профиль» → «🔑 Мои ключи».",
+        f"📱 Демо-доступ работает на <b>1 устройстве</b>.\n"
+        f"Полный тариф даёт доступ на <b>3 устройства</b>.\n\n"
+        f"Найти ключ позже: «👤 Мой профиль» → «🔑 Мои ключи».",
         parse_mode="HTML",
         reply_markup=demo_key_kb(),
     )
@@ -449,7 +544,14 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
             await session.refresh(user, attribute_names=["subscriptions"])
             purchase_button_text = _purchase_button_text(user)
             is_partner = await _is_partner(session, message.from_user.id)
-            welcome_text = _get_welcome_text(user, message.from_user.first_name)
+            
+            # If user was reset (no active or expired paid subs, and no demo subs either since they are deleted), treat as new
+            if not user.subscriptions:
+                new_user_id = user.id
+                welcome_text = partner_obj.welcome_text if (partner_obj and partner_obj.welcome_text) else WELCOME
+            else:
+                welcome_text = _get_welcome_text(user, message.from_user.first_name)
+                
             await message.answer(
                 _with_balance_line(welcome_text, user),
                 reply_markup=main_menu_kb(btn_name, purchase_button_text, is_partner=is_partner,

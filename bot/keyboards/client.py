@@ -22,15 +22,15 @@ def main_menu_kb(
         InlineKeyboardButton(text=purchase_button_text, callback_data="buy"),
     )
     builder.row(
-        InlineKeyboardButton(text="💰 Пополнить баланс", callback_data="balance_menu"),
-    )
-    builder.row(
         InlineKeyboardButton(text="🔑 Мои ключи", callback_data="my_keys"),
         InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
     )
     builder.row(
         InlineKeyboardButton(text="📲 Как подключить", callback_data="guide_menu"),
         InlineKeyboardButton(text="❓ Помощь", callback_data="help"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📱 Управление устройствами", callback_data="my_devices"),
     )
     if ref_btn_name:
         builder.row(
@@ -52,7 +52,7 @@ def main_menu_kb(
 def renew_kb() -> InlineKeyboardMarkup:
     """Single-button keyboard for expiry notifications."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Продлить доступ", callback_data="buy")]
+        [InlineKeyboardButton(text="Оплатить подписку 💳", callback_data="buy")]
     ])
 
 
@@ -239,7 +239,7 @@ def payment_kb(
         InlineKeyboardButton(
             text="◀️ Назад",
             callback_data=back_callback or f"tariff_{tariff_id}",
-        )
+        ),
     )
     return builder.as_markup()
 
@@ -273,25 +273,26 @@ def profile_kb(
         builder.row(
             InlineKeyboardButton(text=purchase_button_text, callback_data="buy"),
         )
-    builder.row(
-        InlineKeyboardButton(text="💰 Пополнить баланс", callback_data="balance_menu"),
-    )
-    balance_toggle_text = (
-        "🟢 Ежедневные списания включены"
-        if balance_mode_enabled and balance_autodebit_enabled
-        else "⚪️ Ежедневные списания выключены"
-    )
-    row_balance = [
-        InlineKeyboardButton(text=balance_toggle_text, callback_data="balance_toggle"),
-        InlineKeyboardButton(text="📜 История баланса", callback_data="balance_history"),
-    ]
-    builder.row(*row_balance)
-    if has_daily_charge_tariff_choice:
+    if balance_mode_enabled or balance_autodebit_enabled:
         builder.row(
-            InlineKeyboardButton(
-                text="⚙️ Тариф для списаний", callback_data="daily_charge_tariff_choice"
-            )
+            InlineKeyboardButton(text="💰 Пополнить баланс", callback_data="balance_menu"),
         )
+        balance_toggle_text = (
+            "🟢 Ежедневные списания включены"
+            if balance_mode_enabled and balance_autodebit_enabled
+            else "⚪️ Ежедневные списания выключены"
+        )
+        row_balance = [
+            InlineKeyboardButton(text=balance_toggle_text, callback_data="balance_toggle"),
+            InlineKeyboardButton(text="📜 История баланса", callback_data="balance_history"),
+        ]
+        builder.row(*row_balance)
+        if has_daily_charge_tariff_choice:
+            builder.row(
+                InlineKeyboardButton(
+                    text="⚙️ Тариф для списаний", callback_data="daily_charge_tariff_choice"
+                )
+            )
     if has_recurring:
         if recurring_active:
             builder.row(

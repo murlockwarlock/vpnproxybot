@@ -23,6 +23,7 @@ _PASSTHROUGH_HEADERS = {
     "subscription-userinfo",
     "sub-info-text",
     "profile-update-interval",
+    "subscription-refill-date",
 }
 _OVERRIDDEN_HEADERS = {
     "profile-title",
@@ -210,6 +211,7 @@ def build_vhq_response_headers(
     *,
     expires_at: datetime | None = None,
     key_id: str | None = None,
+    tariff_label: str | None = None,
 ) -> dict[str, str]:
     headers: dict[str, str] = {}
 
@@ -220,7 +222,28 @@ def build_vhq_response_headers(
         if lowered in _PASSTHROUGH_HEADERS:
             headers[name] = value
 
+    if expires_at:
+        dt = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+        expire_ts = int(dt.timestamp())
+        headers["subscription-userinfo"] = f"upload=0; download=0; total=0; expire={expire_ts}"
+
     title = _setting_str("subscription_profile_title")
+    if title and tariff_label:
+        title_lower = title.lower()
+        if "премиум" in tariff_label.lower():
+            if "базовый" in title_lower:
+                title = title.replace("Базовый", "Премиум").replace("базовый", "премиум")
+            else:
+                title = "ДариМир Премиум"
+        elif "лайт" in tariff_label.lower():
+            if "базовый" in title_lower:
+                title = title.replace("Базовый", "Лайт").replace("базовый", "лайт")
+            else:
+                title = "ДариМир Лайт"
+        elif "базовый" in tariff_label.lower():
+            if "базовый" not in title_lower:
+                title = "ДариМир Базовый"
+
     if title:
         headers["profile-title"] = _header_text(title)
 
@@ -261,6 +284,7 @@ async def fetch_vhq_mirror_payload(
     *,
     expires_at: datetime | None = None,
     key_id: str | None = None,
+    tariff_label: str | None = None,
 ) -> tuple[int, bytes, dict[str, str]]:
     forwarded_headers = {
         name: value
@@ -271,7 +295,12 @@ async def fetch_vhq_mirror_payload(
     async with aiohttp.ClientSession(timeout=_TIMEOUT) as http:
         async with http.get(upstream_url, headers=forwarded_headers) as response:
             body = await response.read()
-            headers = build_vhq_response_headers(response.headers, expires_at=expires_at, key_id=key_id)
+            headers = build_vhq_response_headers(
+                response.headers,
+                expires_at=expires_at,
+                key_id=key_id,
+                tariff_label=tariff_label,
+            )
             return response.status, body, headers
 
 

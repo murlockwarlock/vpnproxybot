@@ -177,6 +177,13 @@ async def credit_referral(
     if amount_rub <= 0:
         return
 
+    if payment_id is not None:
+        from bot.models import Payment, PaymentMethod
+        payment = await session.get(Payment, payment_id)
+        if payment and payment.method == PaymentMethod.BALANCE:
+            logger.info(f"Skipping referral credit because payment {payment_id} was paid from balance.")
+            return
+
     config = await session.get(ReferralConfig, 1)
     if not config or not config.is_enabled:
         return
@@ -219,9 +226,10 @@ async def credit_referral(
         try:
             from bot.utils.texts import fmt_user
             user_info = fmt_user(user.telegram_id, user.username, user.full_name)
+            pct = int(config.commission_percent) if config.commission_percent.is_integer() else config.commission_percent
             await bot.send_message(
                 referrer.telegram_id,
-                f"💰 Вам начислено <b>{earning}₽</b> на баланс за платеж пользователя {user_info}",
+                f"💰 Вам начислено <b>{earning}₽</b> ({pct}% от фактической оплаты {amount_rub:.2f}₽) на баланс за платеж пользователя {user_info}",
                 parse_mode="HTML"
             )
         except Exception as e:
@@ -245,6 +253,13 @@ async def credit_partner(
 
     if amount_rub <= 0:
         return
+
+    if payment_id is not None:
+        from bot.models import Payment, PaymentMethod
+        payment = await session.get(Payment, payment_id)
+        if payment and payment.method == PaymentMethod.BALANCE:
+            logger.info(f"Skipping partner credit because payment {payment_id} was paid from balance.")
+            return
 
     user = await session.get(User, user_db_id)
     if not user or not user.partner_id:
@@ -277,9 +292,10 @@ async def credit_partner(
         try:
             from bot.utils.texts import fmt_user
             user_info = fmt_user(user.telegram_id, user.username, user.full_name)
+            pct = int(partner.commission_percent) if partner.commission_percent.is_integer() else partner.commission_percent
             await bot.send_message(
                 partner.telegram_id,
-                f"💰 Партнёрское начисление: <b>{earning}₽</b> за платеж пользователя {user_info}",
+                f"💰 Партнёрское начисление: <b>{earning}₽</b> ({pct}% от фактической оплаты {amount_rub:.2f}₽) за платеж пользователя {user_info}",
                 parse_mode="HTML",
             )
         except Exception as e:
@@ -323,7 +339,7 @@ async def create_yookassa_payment(
                 "chat_id": str(chat_id),
             },
         }
-        if settings.yookassa_save_payment_method:
+        if settings.yookassa_save_payment_method and settings.recurring_payments_enabled:
             payload["save_payment_method"] = True
         return yookassa.Payment.create(
             payload

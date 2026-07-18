@@ -19,14 +19,21 @@ server {
     }
 
 
-def test_check_expected_routes_detects_mismatch_and_unexpected_routes():
+def test_check_expected_routes_detects_mismatch_and_unexpected_routes(monkeypatch):
+    from bot.services import relay_health
+    monkeypatch.setattr(relay_health, "EXPECTED_ROUTES", {
+        "test-relay": {
+            "eh1.vk.com": "72.56.71.124:443",
+            "default": "45.92.174.214:443",
+        }
+    })
     routes = {
         "eh1.vk.com": "81.200.156.43:443",
         "default": "45.92.174.214:443",
         "unexpected.example.com": "1.2.3.4:443",
     }
 
-    problems = check_expected_routes("relay-ru", routes)
+    problems = check_expected_routes("test-relay", routes)
 
-    assert "relay-ru: route mismatch for eh1.vk.com: expected 72.56.71.124:443, got 81.200.156.43:443" in problems
-    assert "relay-ru: unexpected route present for unexpected.example.com: 1.2.3.4:443" in problems
+    assert "test-relay: route mismatch for eh1.vk.com: expected 72.56.71.124:443, got 81.200.156.43:443" in problems
+    assert "test-relay: unexpected route present for unexpected.example.com: 1.2.3.4:443" in problems

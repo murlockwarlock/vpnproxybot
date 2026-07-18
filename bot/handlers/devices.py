@@ -5,20 +5,34 @@ import logging
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, LabeledPrice
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from bot.config import settings
 from bot.database import async_session
-from bot.keyboards.devices import buy_device_pay_kb, devices_kb
+from bot.keyboards.devices import buy_device_pay_kb, devices_kb, adapt_devices_kb
 from bot.models import BotSettings, ProxyAccount, Subscription
 from bot.services.device_slots import get_included_device_slots, get_max_device_slots
 from bot.services.payment_service import (
     create_yookassa_payment,
 )
 from bot.services.vhq_routing import is_vhq_subscription
+from bot.services.adapt_routing import is_adapt_subscription, get_adapt_uuid_from_subscription
+from bot.services.adapt_api import AdaptAPI, AdaptAPIError
+from bot.services.vhq_subscription_proxy import get_subscription_display_key
 from bot.utils.texts import BUY_DEVICE_SLOT, DEVICES_HEADER
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+
+def _format_dt_msk(dt) -> str:
+    if not dt:
+        return "-"
+    from datetime import timezone, timedelta
+    msk = timezone(timedelta(hours=3))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(msk).strftime("%d.%m.%Y %H:%M")
 
 
 @router.callback_query(F.data == "my_devices")
@@ -30,15 +44,25 @@ async def show_my_devices(callback: CallbackQuery) -> None:
         # Get active subscription
         result = await session.execute(
             select(Subscription)
+            .options(selectinload(Subscription.tariff))
             .where(Subscription.user.has(telegram_id=telegram_id))
             .where(Subscription.status == "ACTIVE")
             .order_by(Subscription.expires_at.desc())
         )
         subscriptions = result.scalars().all()
+        
+        # Prioritize Adapt subscriptions first
         subscription = next(
-            (sub for sub in subscriptions if not is_vhq_subscription(sub)),
-            subscriptions[0] if subscriptions else None,
+            (sub for sub in subscriptions if is_adapt_subscription(sub)),
+            None
         )
+        
+        # Fallback to any non-VHQ subscription (e.g. Marzban)
+        if not subscription:
+            subscription = next(
+                (sub for sub in subscriptions if not is_vhq_subscription(sub)),
+                subscriptions[0] if subscriptions else None,
+            )
 
         if not subscription:
             await callback.answer("У вас нет активной подписки.", show_alert=True)
@@ -47,7 +71,55 @@ async def show_my_devices(callback: CallbackQuery) -> None:
             await callback.answer("Для этого тарифа дополнительные устройства недоступны.", show_alert=True)
             return
 
-        # Get bot settings for max devices and prices
+        # Handle Adapt subscriptions specially
+        if is_adapt_subscription(subscription):
+            adapt_uuid = get_adapt_uuid_from_subscription(subscription)
+            if not adapt_uuid:
+                await callback.answer("Ошибка: не найден UUID подписки Adapt.", show_alert=True)
+                return
+            
+            try:
+                devices = await AdaptAPI().get_devices(adapt_uuid)
+            except AdaptAPIError as exc:
+                logger.error(f"Failed to get adapt devices for sub {subscription.id}: {exc}")
+                await callback.answer("Не удалось получить список устройств. Сервер временно недоступен.", show_alert=True)
+                return
+
+            used_slots = len(devices)
+            expires_str = _format_dt_msk(subscription.expires_at)
+            limit = subscription.device_slots or 1
+            if getattr(subscription, "billing_mode", None) == "demo":
+                tariff_name = "Демо-доступ"
+            else:
+                tariff_name = subscription.tariff.label if subscription.tariff else "Adapt"
+            sub_url = get_subscription_display_key(subscription) or subscription.vpn_key or "-"
+            
+            text = (
+                f"📱 <b>Управление устройствами</b>\n\n"
+                f"📦 Тариф: <b>{tariff_name}</b>\n"
+                f"📅 Подписка до: <b>{expires_str} МСК</b>\n"
+                f"🔗 Ссылка подписки: <code>{sub_url}</code>\n"
+                f"Подключено устройств: <b>{used_slots}</b> из <b>{limit}</b>\n"
+            )
+            
+            if not devices:
+                text += "\nУстройства пока не подключены."
+            else:
+                for idx, dev in enumerate(devices, 1):
+                    dev_id = dev.get("id") or dev.get("device_id", "N/A")
+                    dev_name = dev.get("name") or dev.get("client_name") or f"Устройство {dev_id}"
+                    last_ip = dev.get("last_ip") or dev.get("ip") or "неизвестно"
+                    text += f"\n\n🖥 <b>{idx}. {dev_name}</b>\n🔹 Последний IP: <code>{last_ip}</code>"
+
+            kb = adapt_devices_kb(subscription.id, devices)
+            try:
+                await callback.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+            except Exception:
+                pass
+            await callback.answer()
+            return
+
+        # Get bot settings for max devices and prices (Old Logic for Non-Adapt)
         settings_result = await session.execute(select(BotSettings))
         all_settings = settings_result.scalars().all()
         s_dict = {s.key: s.value for s in all_settings}
@@ -78,12 +150,20 @@ async def show_my_devices(callback: CallbackQuery) -> None:
                 f"Ещё можно докупить: <b>{remaining}</b>"
             )
         
-    expires_str = subscription.expires_at.strftime("%d.%m.%Y")
-    text = DEVICES_HEADER.format(
-        expires=expires_str,
-        used_slots=used_slots,
-        included_slots=included_slots,
-        extra_slots_text=extra_slots_text,
+    expires_str = _format_dt_msk(subscription.expires_at)
+    if getattr(subscription, "billing_mode", None) == "demo":
+        tariff_name = "Демо-доступ"
+    else:
+        tariff_name = subscription.tariff.label if subscription.tariff else "Лайт"
+    sub_url = get_subscription_display_key(subscription) or subscription.vpn_key or "-"
+    text = (
+        f"📱 <b>Управление устройствами</b>\n\n"
+        f"📦 Тариф: <b>{tariff_name}</b>\n"
+        f"📅 Подписка до: <b>{expires_str} МСК</b>\n"
+        f"🔗 Ссылка подписки: <code>{sub_url}</code>\n"
+        f"Подключено устройств: <b>{used_slots}</b> из <b>{included_slots}</b> включённых\n"
+        f"{extra_slots_text}\n\n"
+        f"Ниже ключи для ваших устройств:"
     )
     
     for proxy in proxies:
@@ -97,6 +177,38 @@ async def show_my_devices(callback: CallbackQuery) -> None:
     except Exception:
         pass
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("del_adapt_dev_"))
+async def delete_adapt_device(callback: CallbackQuery) -> None:
+    """Handle deletion of an Adapt device."""
+    parts = callback.data.split("_")
+    sub_id = int(parts[3])
+    device_id = parts[4]
+
+    async with async_session() as session:
+        sub = await session.get(Subscription, sub_id)
+        if not sub:
+            await callback.answer("Подписка не найдена.", show_alert=True)
+            return
+            
+        adapt_uuid = get_adapt_uuid_from_subscription(sub)
+        if not adapt_uuid:
+            await callback.answer("Ошибка: не найден UUID подписки Adapt.", show_alert=True)
+            return
+
+    try:
+        success = await AdaptAPI().delete_device(adapt_uuid, device_id)
+        if success:
+            await callback.answer("Устройство успешно удалено!", show_alert=True)
+        else:
+            await callback.answer("Не удалось удалить устройство (API вернул false).", show_alert=True)
+    except AdaptAPIError as exc:
+        logger.error(f"Failed to delete adapt device {device_id} for sub {sub_id}: {exc}")
+        await callback.answer(f"Ошибка при удалении устройства: {exc}", show_alert=True)
+
+    # Refresh the device list
+    await show_my_devices(callback)
 
 
 @router.callback_query(F.data.startswith("buy_device_"))

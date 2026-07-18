@@ -86,9 +86,9 @@ def test_webstore_replaces_static_monthly_basic_with_adapt_when_uuid_is_set(monk
         assert reloaded.TARIFFS_BY_KEY["basic_30"]["adapt_plan_uuid"] == "adapt-plan"
         assert "39 ГБ" not in reloaded.TARIFFS_BY_KEY["basic_30"]["description"]
         assert "1 устройство" in reloaded.TARIFFS_BY_KEY["basic_30"]["description"]
-        assert "1 устройство" in reloaded.TARIFFS_BY_KEY["basic_30"]["features"]
+        assert any("1 устройство" in feature for feature in reloaded.TARIFFS_BY_KEY["basic_30"]["features"])
         assert all("3 устройства" not in feature for feature in reloaded.TARIFFS_BY_KEY["basic_30"]["features"])
-        assert any("ГБ на обходы" in feature for feature in reloaded.TARIFFS_BY_KEY["basic_30"]["features"])
+        assert any("обходов" in feature for feature in reloaded.TARIFFS_BY_KEY["basic_30"]["features"])
     finally:
         monkeypatch.delenv("ADAPT_PLAN_UUID_BASIC_30", raising=False)
         monkeypatch.delenv("WEBSTORE_TARIFF_ADAPT_30_PRICE_RUB", raising=False)

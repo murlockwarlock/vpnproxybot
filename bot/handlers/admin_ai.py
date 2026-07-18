@@ -370,7 +370,12 @@ async def ai_list_docs(callback: CallbackQuery) -> None:
 
     text = "📚 <b>Загруженные документы (База знаний ИИ):</b>\n\n"
     for d in docs:
-        date_str = d.uploaded_at.strftime("%Y-%m-%d %H:%M")
+        from datetime import timezone, timedelta
+        dt = d.uploaded_at
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        msk_tz = timezone(timedelta(hours=3))
+        date_str = dt.astimezone(msk_tz).strftime("%Y-%m-%d %H:%M")
         text += f"• <code>{d.filename}</code> <i>({date_str})</i>\n"
 
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=ai_back_kb())

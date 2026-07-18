@@ -34,6 +34,17 @@ from bot.models import (
 logger = logging.getLogger(__name__)
 router = Router(name="partner")
 
+from datetime import timezone, timedelta
+_MSK = timezone(timedelta(hours=3))
+
+def _fmt_msk(dt: datetime | None, include_time: bool = True) -> str:
+    if not dt:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    fmt = "%d.%m.%Y %H:%M" if include_time else "%d.%m.%Y"
+    return dt.astimezone(_MSK).strftime(fmt)
+
 ESCAPE_COMMANDS = {"/start", "/help", "/admin", "/policy", "/agree", "/oferta"}
 ITEMS_PER_PAGE = 10
 
@@ -772,7 +783,7 @@ async def _render_admin_partner_application_detail(message, application_id: int,
             return
 
     status = _format_application_status(application.status)
-    processed_at = application.processed_at.strftime("%d.%m.%Y %H:%M") if application.processed_at else "—"
+    processed_at = _fmt_msk(application.processed_at) if application.processed_at else "—"
     text = (
         f"📝 <b>Заявка #{application.id}</b>\n\n"
         f"Статус: <b>{status}</b>\n"
@@ -784,7 +795,7 @@ async def _render_admin_partner_application_detail(message, application_id: int,
     if application.contact_info:
         text += f"Контакт: {application.contact_info}\n"
     text += (
-        f"Создана: <b>{application.created_at.strftime('%d.%m.%Y %H:%M')}</b>\n"
+        f"Создана: <b>{_fmt_msk(application.created_at)}</b>\n"
         f"Обработана: <b>{processed_at}</b>\n"
     )
     if application.notes:
@@ -1059,7 +1070,7 @@ async def _show_partner_detail(message, partner_id: int, edit: bool = True) -> N
             )
 
     status = "🟢 Активен" if partner.is_active else "🔴 Неактивен"
-    valid = f"\nДействует до: <b>{partner.valid_until.strftime('%d.%m.%Y')}</b>" if partner.valid_until else ""
+    valid = f"\nДействует до: <b>{_fmt_msk(partner.valid_until, include_time=False)}</b>" if partner.valid_until else ""
 
     # Purchases from partner users
     async with async_session() as session:
@@ -1910,13 +1921,13 @@ async def _render_admin_payout_detail(message, payout_id: int, edit: bool = True
             return
         partner = await session.get(Partner, payout.partner_id)
         status = _format_payout_status(payout.status)
-        processed_at = payout.processed_at.strftime("%d.%m.%Y %H:%M") if payout.processed_at else "—"
+        processed_at = _fmt_msk(payout.processed_at) if payout.processed_at else "—"
         text = (
             f"💸 <b>Заявка #{payout.id}</b>\n\n"
             f"Партнёр: <b>{partner.name if partner else payout.partner_id}</b>\n"
             f"Сумма: <b>{payout.amount:.2f}₽</b>\n"
             f"Статус: <b>{status}</b>\n"
-            f"Создана: <b>{payout.requested_at.strftime('%d.%m.%Y %H:%M')}</b>\n"
+            f"Создана: <b>{_fmt_msk(payout.requested_at)}</b>\n"
             f"Обработана: <b>{processed_at}</b>\n"
         )
         if payout.details:
@@ -2644,14 +2655,14 @@ async def partner_earnings_history(callback: CallbackQuery) -> None:
                 user_label = f"User #{earning.user_id}"
             items.append((earning.created_at, earning.id, (
                 f"• <b>{earning.amount:.2f}₽</b> от {user_label}"
-                f"\n  {earning.created_at.strftime('%d.%m.%Y %H:%M')}"
+                f"\n  {_fmt_msk(earning.created_at)}"
             )))
             if earning.payment_id:
                 items[-1] = (items[-1][0], items[-1][1], items[-1][2] + f"\n  Платёж #{earning.payment_id}")
         for earning in web_earnings:
             line = (
                 f"• <b>{earning.earning_amount_rub:.2f}₽</b> с сайта"
-                f"\n  {earning.created_at.strftime('%d.%m.%Y %H:%M')}"
+                f"\n  {_fmt_msk(earning.created_at)}"
             )
             if earning.tariff_label:
                 line += f"\n  Тариф: {earning.tariff_label}"
@@ -2709,7 +2720,7 @@ async def partner_payout_history(callback: CallbackQuery) -> None:
         for payout in payouts:
             line = (
                 f"• #{payout.id} - <b>{payout.amount:.2f}₽</b> - {_format_payout_status(payout.status)}"
-                f"\n  {payout.requested_at.strftime('%d.%m.%Y %H:%M')}"
+                f"\n  {_fmt_msk(payout.requested_at)}"
             )
             if payout.admin_comment:
                 line += f"\n  Комментарий: {payout.admin_comment}"

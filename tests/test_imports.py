@@ -7,7 +7,9 @@ import bot.handlers
 
 
 if "openai" not in sys.modules:
+    import importlib.machinery
     openai_stub = types.ModuleType("openai")
+    openai_stub.__spec__ = importlib.machinery.ModuleSpec("openai", None)
 
     class _AsyncOpenAI:
         def __init__(self, *args, **kwargs):

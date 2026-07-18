@@ -129,14 +129,31 @@ def migrate(db_path):
         print(f"⚠️ users.referral_depth: {e}")
 
     # Back-fill referral_root_partner_id / referral_depth for existing direct-partner users
-    cursor.execute("""
-        UPDATE users
-        SET referral_root_partner_id = partner_id,
-            referral_depth = 1
-        WHERE partner_id IS NOT NULL
-          AND referral_root_partner_id IS NULL
-    """)
-    print(f"✅ Back-filled referral chain for {cursor.rowcount} existing partner users")
+    try:
+        cursor.execute("""
+            UPDATE users
+            SET referral_root_partner_id = partner_id,
+                referral_depth = 1
+            WHERE partner_id IS NOT NULL
+              AND referral_root_partner_id IS NULL
+        """)
+        print(f"✅ Back-filled referral chain for {cursor.rowcount} existing partner users")
+    except sqlite3.OperationalError as e:
+        print(f"⚠️ users back-fill: {e}")
+
+    # 10. Add tariff_id to payments
+    try:
+        cursor.execute("ALTER TABLE payments ADD COLUMN tariff_id INTEGER REFERENCES tariffs(id)")
+        print("✅ Added 'tariff_id' to payments")
+    except sqlite3.OperationalError as e:
+        print(f"⚠️ payments.tariff_id: {e}")
+
+    # 11. Add platform to payments
+    try:
+        cursor.execute("ALTER TABLE payments ADD COLUMN platform VARCHAR(32)")
+        print("✅ Added 'platform' to payments")
+    except sqlite3.OperationalError as e:
+        print(f"⚠️ payments.platform: {e}")
 
     conn.commit()
     conn.close()

@@ -76,8 +76,9 @@ async def notify_admins_payment(
             return  # disabled
 
     uname = f"@{username}" if username else "—"
+    title = "💎 <b>Оплата с баланса!</b>" if "баланс" in method.lower() else "💰 <b>Новая оплата!</b>"
     text = (
-        f"💰 <b>Новая оплата!</b>\n\n"
+        f"{title}\n\n"
         f"👤 {full_name} (<code>{telegram_id}</code>, {uname})\n"
         f"🛒 Тариф: <b>{tariff_label}</b>\n"
         f"💵 Сумма: <b>{amount_rub:.0f} ₽</b>\n"

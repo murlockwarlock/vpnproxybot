@@ -37,12 +37,15 @@ class MarzbanAPI:
     """Client for interacting with the Marzban Panel API."""
 
     def __init__(self, server: Server):
-        if not server.api_url or not server.api_username or not server.api_password:
+        import os
+        fallback_password = os.getenv("MARZBAN_API_PASSWORD", "")
+        password = server.api_password or fallback_password
+        if not server.api_url or not server.api_username or not password:
             raise ValueError(f"Server {server.name} missing Marzban API credentials.")
-        
+
         self.api_url = server.api_url.rstrip("/")
         self.username = server.api_username
-        self.password = server.api_password
+        self.password = password
         self.token: Optional[str] = None
         self._session: Optional[aiohttp.ClientSession] = None
 

@@ -78,6 +78,8 @@ async def _run_migrations() -> None:
         ("tariffs", "tariff_type", "VARCHAR(16) NOT NULL DEFAULT 'VPN'"),
         ("tariffs", "adapt_plan_uuid", "VARCHAR(64)"),
         ("tariffs", "vhq_tier", "VARCHAR(16)"),
+        ("platform_guides", "guide_text", "TEXT"),
+        ("platform_guides", "buttons_json", "TEXT"),
     ]
     async with engine.begin() as conn:
         for table, column, col_def in migrations:

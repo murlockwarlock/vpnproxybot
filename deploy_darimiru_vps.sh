@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Deploy @darimiru_bot to YOUR_SERVER_IP
+# Deploy @darimiru_bot to 45.92.174.214
 # Uses shared venv at /root/telegram_bots/venv
 # Runs via PM2 alongside other bots
 set -euo pipefail
 
-REMOTE_HOST="YOUR_SERVER_IP"
+REMOTE_HOST="45.92.174.214"
 REMOTE_USER="root"
 APP_DIR="/root/telegram_bots/darimiru_bot"
 VENV="/root/telegram_bots/venv"

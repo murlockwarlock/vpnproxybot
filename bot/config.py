@@ -134,6 +134,9 @@ class Settings:
     yookassa_save_payment_method: bool = field(
         default_factory=lambda: _env_bool("YOOKASSA_SAVE_PAYMENT_METHOD", True)
     )
+    recurring_payments_enabled: bool = field(
+        default_factory=lambda: _env_bool("RECURRING_PAYMENTS_ENABLED", True)
+    )
 
     # Robokassa
     robokassa_merchant_login: str = field(
@@ -238,6 +241,13 @@ class Settings:
         default_factory=lambda: os.getenv(
             "ADAPT_BASE_URL", "https://network-api.adaptgroup.app"
         )
+    )
+
+    adapt_demo_enabled: bool = field(
+        default_factory=lambda: _env_bool("ADAPT_DEMO_ENABLED", False)
+    )
+    adapt_demo_plan_uuid: str = field(
+        default_factory=lambda: os.getenv("ADAPT_DEMO_PLAN_UUID", "00cce2fe-ee55-4c0d-8bfa-9e6e47cd99a4")
     )
 
     @property

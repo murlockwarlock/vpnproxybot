@@ -22,7 +22,7 @@ _RELAY_FAIL_COUNT_KEY = "relay_health_fail_count"
 _NODE_STATE_KEY = "xray_node_health_state"
 _CROSS_UPSTREAM_STATE_KEY = "cross_upstream_health_state"
 _CROSS_UPSTREAM_FAIL_COUNT_KEY = "cross_upstream_health_fail_count"
-_CROSS_UPSTREAMS = (("NL subscription upstream", "72.56.71.124", 443),)
+_CROSS_UPSTREAMS = ()
 
 
 async def _ping_server(server: Server) -> bool:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
@@ -96,6 +96,64 @@ async def _latest_demo_subscription(session, user_id: int) -> Subscription | Non
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def _latest_adapt_subscription_for_plan(
+    session,
+    *,
+    user_id: int,
+    adapt_plan_uuid: str,
+) -> tuple[Subscription | None, AdaptSubscription | None]:
+    result = await session.execute(
+        select(Subscription, AdaptSubscription)
+        .join(AdaptSubscription, AdaptSubscription.subscription_id == Subscription.id)
+        .where(Subscription.user_id == user_id)
+        .where(Subscription.client_name.like(f"{ADAPT_CLIENT_PREFIX}%"))
+        .where(AdaptSubscription.adapt_plan_uuid == adapt_plan_uuid)
+        .order_by(Subscription.expires_at.desc(), Subscription.id.desc())
+        .limit(1)
+    )
+    row = result.first()
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
+async def _latest_adapt_subscription(
+    session,
+    *,
+    user_id: int,
+) -> tuple[Subscription | None, AdaptSubscription | None]:
+    result = await session.execute(
+        select(Subscription, AdaptSubscription)
+        .join(AdaptSubscription, AdaptSubscription.subscription_id == Subscription.id)
+        .where(Subscription.user_id == user_id)
+        .where(Subscription.client_name.like(f"{ADAPT_CLIENT_PREFIX}%"))
+        .order_by(Subscription.expires_at.desc(), Subscription.id.desc())
+        .limit(1)
+    )
+    row = result.first()
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
+def _extract_devices_from_tariff(tariff: Tariff) -> int | None:
+    import re
+    if not tariff or not tariff.label:
+        return None
+    match = re.search(r"(\d+)\s*📱", tariff.label)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _naive_utc(value) -> datetime:
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 async def _ensure_marzban_user(server: Server, client_name: str, expires_at: datetime) -> str | None:
@@ -490,8 +548,52 @@ async def _create_vhq_paid_subscription(
         logger.error(issue.admin_message)
         raise issue
 
+    # Look for an existing VHQ subscription to reuse and keep the same subscription URL
+    result = await session.execute(
+        select(Subscription)
+        .where(Subscription.user_id == user.id)
+        .where(Subscription.client_name.like(f"{VHQ_CLIENT_PREFIX}%"))
+        .order_by(Subscription.expires_at.desc(), Subscription.id.desc())
+        .limit(1)
+    )
+    existing = result.scalar_one_or_none()
+
     now = datetime.utcnow()
-    expires_at = now + timedelta(days=int(vhq_spec["days"]))
+    if existing:
+        base_expires = existing.expires_at if existing.expires_at > now else now
+        expires_at = base_expires + timedelta(days=int(vhq_spec["days"]))
+    else:
+        expires_at = now + timedelta(days=int(vhq_spec["days"]))
+
+    if existing:
+        existing.vpn_key = upstream_url
+        existing.expires_at = expires_at
+        existing.tariff_days = tariff.days
+        existing.tariff_months = tariff.days // 30
+        existing.status = SubStatus.ACTIVE
+        existing.platform = platform
+        if tariff.id:
+            existing.tariff_id = tariff.id
+        _disable_balance_autodebit_after_tariff_purchase(user)
+
+        logger.info(
+            "VHQ subscription updated: user_id=%s subscription_id=%s tariff_id=%s order_id=%s expires_at=%s",
+            user.id,
+            existing.id,
+            getattr(tariff, 'id', None),
+            order.get("order_id"),
+            expires_at.isoformat(),
+        )
+        plog(
+            "ВЫДАЧА_ПРОДЛЕНИЕ",
+            provider="VHQ",
+            user_id=user.telegram_id,
+            tariff=tariff.label,
+            order_id=order.get("order_id") or "",
+            subscription_id=existing.id,
+        )
+        return existing, build_vhq_subscription_ref_url(existing.id) or upstream_url
+
     order_id = str(order.get("order_id", "")).strip() or f"{user.telegram_id}_{int(now.timestamp())}"
     client_name = f"{VHQ_CLIENT_PREFIX}{order_id}"[:64]
     included_slots = await get_included_device_slots(session)
@@ -532,39 +634,15 @@ async def _create_vhq_paid_subscription(
     return subscription, build_vhq_subscription_ref_url(subscription.id) or upstream_url
 
 
-async def _create_adapt_paid_subscription(
+async def _adapt_create_new_subscription(
     session,
     *,
     user: User,
     tariff: Tariff,
     platform: Platform,
+    server: Server,
 ) -> tuple[Subscription | None, str | None]:
-    """Create a new subscription via the Adapt Group API."""
-    server = await get_primary_active_server(session)
-    if not server:
-        issue = build_internal_access_error(
-            provider="adapt",
-            code="missing_server",
-            admin_message=(
-                "No placeholder server available for Adapt subscription "
-                f"user_id={user.id} telegram_id={user.telegram_id} tariff_id={getattr(tariff, 'id', None)}"
-            ),
-            client_message=(
-                "Оплата прошла, но выдача доступа временно недоступна. "
-                "Мы уже получили уведомление и разбираемся."
-            ),
-        )
-        plog(
-            "ОШИБКА_ВЫДАЧИ",
-            provider="Adapt",
-            user_id=user.telegram_id,
-            tariff=tariff.label,
-            code=issue.code,
-            detail=issue.admin_message,
-        )
-        logger.error(issue.admin_message)
-        raise issue
-
+    """Create a brand-new Adapt subscription (new UUID + URL)."""
     plan_uuid = str(tariff.adapt_plan_uuid).strip()
     try:
         order = await AdaptAPI().create_subscription(
@@ -695,6 +773,324 @@ async def _create_adapt_paid_subscription(
     return subscription, branded_url or upstream_url
 
 
+async def _create_adapt_paid_subscription(
+    session,
+    *,
+    user: User,
+    tariff: Tariff,
+    platform: Platform,
+) -> tuple[Subscription | None, str | None]:
+    """Fulfill an Adapt tariff purchase: renew, upgrade or create fresh."""
+    server = await get_primary_active_server(session)
+    if not server:
+        issue = build_internal_access_error(
+            provider="adapt",
+            code="missing_server",
+            admin_message=(
+                "No placeholder server available for Adapt subscription "
+                f"user_id={user.id} telegram_id={user.telegram_id} tariff_id={getattr(tariff, 'id', None)}"
+            ),
+            client_message=(
+                "Оплата прошла, но выдача доступа временно недоступна. "
+                "Мы уже получили уведомление и разбираемся."
+            ),
+        )
+        plog(
+            "ОШИБКА_ВЫДАЧИ",
+            provider="Adapt",
+            user_id=user.telegram_id,
+            tariff=tariff.label,
+            code=issue.code,
+            detail=issue.admin_message,
+        )
+        logger.error(issue.admin_message)
+        raise issue
+
+    plan_uuid = str(tariff.adapt_plan_uuid).strip()
+    existing, adapt_record = await _latest_adapt_subscription(
+        session,
+        user_id=user.id,
+    )
+
+    # No previous Adapt subscription → create fresh
+    if not existing or not adapt_record:
+        return await _adapt_create_new_subscription(
+            session, user=user, tariff=tariff, platform=platform, server=server
+        )
+
+    current_plan_uuid = str(adapt_record.adapt_plan_uuid).strip()
+    same_plan = current_plan_uuid == plan_uuid
+
+    plans = None
+    new_devices = _extract_devices_from_tariff(tariff)
+    if new_devices is None or not same_plan:
+        try:
+            plans = await AdaptAPI().list_plans()
+        except Exception as exc:
+            logger.error(f"Failed to fetch Adapt plans: {exc}")
+
+    if plans:
+        # Resolve new devices count if not parsed
+        if new_devices is None:
+            for p in plans:
+                p_uuid = str(p.get("uuid") or p.get("plan_uuid") or "").strip()
+                if p_uuid == plan_uuid:
+                    new_devices = p.get("devices")
+                    break
+
+    if new_devices is None:
+        new_devices = existing.device_slots or 3
+
+    # If device limit is the same, we can reuse the existing subscription
+    # BUT only if it is the same plan, a demo-to-paid transition, or doesn't cause a wholesale financial loss.
+    reuse_existing = False
+    if new_devices == (existing.device_slots or 3):
+        if same_plan:
+            reuse_existing = True
+        elif existing.billing_mode == "demo":
+            # Transition from demo to paid: always allow to keep URL
+            reuse_existing = True
+        elif plans:
+            # Locate plans to check Adapt wholesale prices
+            current_adapt_plan = None
+            new_adapt_plan = None
+            for p in plans:
+                p_uuid = str(p.get("uuid") or p.get("plan_uuid") or "").strip()
+                if p_uuid == current_plan_uuid:
+                    current_adapt_plan = p
+                if p_uuid == plan_uuid:
+                    new_adapt_plan = p
+            
+            if current_adapt_plan and new_adapt_plan:
+                try:
+                    old_price_usd = float(current_adapt_plan.get("price_usd") or 0)
+                    old_days = int(current_adapt_plan.get("days") or 0)
+                    new_price_usd = float(new_adapt_plan.get("price_usd") or 0)
+                    if old_days > 0:
+                        old_rate_usd = old_price_usd / old_days
+                        expected_cost_usd = old_rate_usd * tariff.days
+                        extra_usd = expected_cost_usd - new_price_usd
+                        extra_rub = extra_usd * 95 # approx conversion
+                        # Allow custom renewal if the extra wholesale cost is <= 15 rubles
+                        if extra_rub <= 15:
+                            reuse_existing = True
+                except Exception as exc:
+                    logger.error(f"Error in Adapt wholesale profitability check: {exc}")
+
+    if reuse_existing:
+        now = datetime.utcnow()
+        if same_plan:
+            # Same plan → always renew (works even if expired)
+            renewed = await renew_adapt_subscription(
+                session,
+                adapt_record=adapt_record,
+                tariff_days=tariff.days,
+            )
+            if not renewed:
+                issue = build_internal_access_error(
+                    provider="adapt",
+                    code="adapt_renew_failed",
+                    admin_message=(
+                        "Adapt renewal failed for existing subscription "
+                        f"user_id={user.id} telegram_id={user.telegram_id} "
+                        f"subscription_id={existing.id} adapt_uuid={adapt_record.adapt_uuid} "
+                        f"tariff_id={getattr(tariff, 'id', None)} plan_uuid={plan_uuid}"
+                    ),
+                    client_message=(
+                        "Оплата прошла, но продление доступа временно недоступна. "
+                        "Мы уже получили уведомление и разбираемся."
+                    ),
+                )
+                plog(
+                    "ОШИБКА_ПРОДЛЕНИЯ",
+                    provider="Adapt",
+                    user_id=user.telegram_id,
+                    tariff=tariff.label,
+                    code=issue.code,
+                    detail=issue.admin_message,
+                )
+                logger.error(issue.admin_message)
+                raise issue
+
+            expires_at = (
+                _naive_utc(adapt_record.end_date)
+                if adapt_record.end_date
+                else (existing.expires_at if existing.expires_at > now else now) + timedelta(days=tariff.days)
+            )
+            branded_url = build_adapt_mirror_url(adapt_record.adapt_uuid)
+            upstream_url = f"https://network-api.adaptgroup.app/sub/{adapt_record.adapt_uuid}"
+
+            existing.server_id = server.id
+            existing.tariff_months = tariff.days // 30
+            existing.tariff_days = tariff.days
+            existing.billing_mode = "tariff"
+            existing.status = SubStatus.ACTIVE
+            existing.platform = platform
+            existing.expires_at = expires_at
+            existing.vpn_key = branded_url or upstream_url
+            existing.client_name = build_adapt_client_name(adapt_record.adapt_uuid)
+            existing.tariff_id = tariff.id if tariff.id else None
+            adapt_record.adapt_plan_uuid = plan_uuid
+            adapt_record.end_date = expires_at
+            _disable_balance_autodebit_after_tariff_purchase(user)
+
+            logger.info(
+                "Adapt subscription renewed: user_id=%s subscription_id=%s adapt_uuid=%s plan_uuid=%s expires_at=%s",
+                user.id,
+                existing.id,
+                adapt_record.adapt_uuid,
+                plan_uuid,
+                expires_at.isoformat(),
+            )
+            plog(
+                "ПРОДЛЕНИЕ",
+                provider="Adapt",
+                user_id=user.telegram_id,
+                tariff=tariff.label,
+                adapt_uuid=adapt_record.adapt_uuid,
+                subscription_id=existing.id,
+            )
+            return existing, branded_url or upstream_url
+        else:
+            # Different plan but same device count (active or expired) and profitable → use renew_custom
+            try:
+                resp = await AdaptAPI().renew_subscription_custom(adapt_record.adapt_uuid, tariff.days)
+            except AdaptAPIError as exc:
+                issue = build_internal_access_error(
+                    provider="adapt",
+                    code="adapt_renew_custom_failed",
+                    admin_message=(
+                        f"Adapt custom renew failed for {existing.id} adapt_uuid={adapt_record.adapt_uuid} "
+                        f"days={tariff.days}: {exc}"
+                    ),
+                    client_message="Оплата прошла, но смена плана временно недоступна."
+                )
+                logger.error(issue.admin_message)
+                raise issue
+
+            new_end_str = resp.get("end_date")
+            if new_end_str:
+                try:
+                    parsed = datetime.fromisoformat(
+                        str(new_end_str).replace("Z", "+00:00")
+                    )
+                    expires_at = _naive_utc(parsed)
+                except Exception:
+                    expires_at = (existing.expires_at if existing.expires_at > now else now) + timedelta(days=tariff.days)
+            else:
+                expires_at = (existing.expires_at if existing.expires_at > now else now) + timedelta(days=tariff.days)
+
+            branded_url = build_adapt_mirror_url(adapt_record.adapt_uuid)
+            upstream_url = f"https://network-api.adaptgroup.app/sub/{adapt_record.adapt_uuid}"
+
+            existing.server_id = server.id
+            existing.tariff_months = tariff.days // 30
+            existing.tariff_days = tariff.days
+            existing.billing_mode = "tariff"
+            existing.status = SubStatus.ACTIVE
+            existing.platform = platform
+            existing.expires_at = expires_at
+            existing.vpn_key = branded_url or upstream_url
+            existing.client_name = build_adapt_client_name(adapt_record.adapt_uuid)
+            existing.tariff_id = tariff.id if tariff.id else None
+            adapt_record.adapt_plan_uuid = plan_uuid
+            adapt_record.end_date = expires_at
+            _disable_balance_autodebit_after_tariff_purchase(user)
+
+            logger.info(
+                "Adapt subscription custom renewed (duration/plan change): user_id=%s subscription_id=%s adapt_uuid=%s plan_uuid=%s expires_at=%s",
+                user.id,
+                existing.id,
+                adapt_record.adapt_uuid,
+                plan_uuid,
+                expires_at.isoformat(),
+            )
+            plog(
+                "ПРОДЛЕНИЕ_КАСТОМ",
+                provider="Adapt",
+                user_id=user.telegram_id,
+                tariff=tariff.label,
+                adapt_uuid=adapt_record.adapt_uuid,
+                subscription_id=existing.id,
+            )
+            return existing, branded_url or upstream_url
+
+    # Different device count or unprofitable plan change → create fresh (new URL)
+    return await _adapt_create_new_subscription(
+        session, user=user, tariff=tariff, platform=platform, server=server
+    )
+
+
+async def create_adapt_demo_subscription(
+    session,
+    *,
+    user: User,
+    tariff: Tariff,
+    platform: Platform,
+) -> tuple[Subscription | None, str | None]:
+    """Create a new demo subscription via the Adapt Group API."""
+    server = await get_primary_active_server(session)
+    if not server:
+        return None, None
+
+    plan_uuid = str(tariff.adapt_plan_uuid).strip()
+
+    try:
+        order = await AdaptAPI().create_subscription(
+            plan_uuid,
+            external_user_id=str(user.telegram_id),
+        )
+    except Exception as exc:
+        logger.error(f"Failed to create Adapt demo subscription: {exc}")
+        return None, None
+
+    adapt_uuid = str(order.get("subscription_uuid", "")).strip()
+    if not adapt_uuid:
+        return None, None
+
+    now = datetime.utcnow()
+    expires_at = now + timedelta(days=int(order.get("days") or tariff.days))
+    
+    client_name = build_adapt_client_name(adapt_uuid)
+    included_slots = await get_included_device_slots(session)
+    branded_url = build_adapt_mirror_url(adapt_uuid)
+    upstream_url = str(order.get("subscription_url", "")).strip() or branded_url
+
+    subscription = Subscription(
+        user_id=user.id,
+        server_id=server.id,
+        tariff_months=0,
+        tariff_days=tariff.days,
+        billing_mode="demo",
+        vpn_key=branded_url or upstream_url,
+        client_name=client_name,
+        platform=platform,
+        device_slots=int(order.get("devices") or included_slots),
+        expires_at=expires_at,
+        tariff_id=None,
+    )
+    session.add(subscription)
+    await session.flush()
+
+    adapt_record = AdaptSubscription(
+        subscription_id=subscription.id,
+        adapt_uuid=adapt_uuid,
+        adapt_plan_uuid=plan_uuid,
+        end_date=expires_at,
+        traffic_limit_bytes=order.get("traffic_limit_bytes"),
+    )
+    session.add(adapt_record)
+
+    logger.info(
+        "Adapt DEMO subscription created: user_id=%s subscription_id=%s adapt_uuid=%s expires_at=%s",
+        user.id,
+        subscription.id,
+        adapt_uuid,
+        expires_at.isoformat(),
+    )
+    return subscription, branded_url or upstream_url
+
+
 async def renew_adapt_subscription(
     session,
     *,
@@ -717,9 +1113,10 @@ async def renew_adapt_subscription(
         if result.get("end_date"):
             from datetime import datetime as _dt
             try:
-                adapt_record.end_date = _dt.fromisoformat(
+                parsed = _dt.fromisoformat(
                     str(result["end_date"]).replace("Z", "+00:00")
                 )
+                adapt_record.end_date = _naive_utc(parsed)
             except Exception:
                 pass
         return True

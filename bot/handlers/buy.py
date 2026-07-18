@@ -268,6 +268,9 @@ async def renew_tariff(callback: CallbackQuery) -> None:
     if not tariff.is_active:
         await callback.answer("Этот тариф больше недоступен", show_alert=True)
         return
+    if tariff.tariff_type in (TariffType.VPN, TariffType.BOTH) and not tariff.adapt_plan_uuid and not tariff.vhq_tier:
+        await callback.answer("Этот тариф больше недоступен", show_alert=True)
+        return
 
     # Simulate a tariff_ callback to reuse existing select_tariff logic
     callback.data = f"tariff_{tariff_id}"
@@ -407,6 +410,9 @@ async def select_platform(callback: CallbackQuery) -> None:
 
     if not tariff:
         await callback.answer("Тариф не найден", show_alert=True)
+        return
+    if not tariff.is_active or tariff.is_admin_only:
+        await callback.answer("Этот тариф больше недоступен", show_alert=True)
         return
 
     platform_labels = {

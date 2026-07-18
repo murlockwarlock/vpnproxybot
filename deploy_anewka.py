@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy @anewkabot/@uskoritelinternetabot to YOUR_SERVER_IP via paramiko (password auth)."""
+"""Deploy @anewkabot/@uskoritelinternetabot to 72.56.71.124 via paramiko (password auth)."""
 
 import os
 import hashlib
@@ -8,7 +8,7 @@ import paramiko
 
 from scripts.deploy_guard import ensure_clean_git, load_local_env, require_env
 
-HOST = "YOUR_SERVER_IP"
+HOST = "72.56.71.124"
 USER = "root"
 load_local_env(os.path.dirname(os.path.abspath(__file__)))
 PASSWORD = require_env("ANEWKA_SSH_PASSWORD")

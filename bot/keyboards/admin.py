@@ -75,17 +75,31 @@ def guides_menu_kb(has_media: dict[str, bool]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def guide_detail_kb(platform: str, has_media: bool) -> InlineKeyboardMarkup:
+def guide_detail_kb(platform: str, has_media: bool, has_text: bool, has_buttons: bool) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(
-        text="📤 Загрузить медиа (фото/видео)",
-        callback_data=f"adm_guide_upload_{platform}",
-    ))
+    builder.row(
+        InlineKeyboardButton(text="✏️ Изменить текст", callback_data=f"adm_guide_etext_{platform}"),
+    )
+    if has_text:
+        builder.row(
+            InlineKeyboardButton(text="🗑 Сбросить текст к исходному", callback_data=f"adm_guide_rtext_{platform}"),
+        )
+    builder.row(
+        InlineKeyboardButton(text="📥 Загрузить медиа (фото/видео/альбом)", callback_data=f"adm_guide_upload_{platform}"),
+    )
     if has_media:
-        builder.row(InlineKeyboardButton(
-            text="🗑 Удалить медиа",
-            callback_data=f"adm_guide_clear_{platform}",
-        ))
+        builder.row(
+            InlineKeyboardButton(text="🗑 Удалить медиа", callback_data=f"adm_guide_clear_{platform}"),
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"🔘 Изменить кнопки (установлены)" if has_buttons else "🔘 Изменить кнопки",
+            callback_data=f"adm_guide_btns_{platform}",
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(text="👁 Предпросмотр", callback_data=f"adm_guide_prev_{platform}"),
+    )
     builder.row(InlineKeyboardButton(text="◀️ К гайдам", callback_data="adm_guides"))
     return builder.as_markup()
 
@@ -184,7 +198,12 @@ def user_search_kb(users: list = None, page: int = 1, total_pages: int = 1) -> I
     return builder.as_markup()
 
 
-def user_actions_kb(telegram_id: int, is_blocked: bool, partner_id: int | None = None) -> InlineKeyboardMarkup:
+def user_actions_kb(
+    telegram_id: int,
+    is_blocked: bool,
+    partner_id: int | None = None,
+    has_active_sub: bool = False,
+) -> InlineKeyboardMarkup:
     block_text = "🔓 Разблокировать" if is_blocked else "🚫 Заблокировать"
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -193,6 +212,9 @@ def user_actions_kb(telegram_id: int, is_blocked: bool, partner_id: int | None =
     )
     builder.row(
         InlineKeyboardButton(text="🔑 Выдать ключ", callback_data=f"adm_usr_key_{telegram_id}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="☠️ Сбросить аккаунт", callback_data=f"adm_usr_reset_conf_{telegram_id}"),
     )
     builder.row(
         InlineKeyboardButton(text="📊 Подписки (подробно)", callback_data=f"adm_usr_subs_{telegram_id}"),
@@ -206,7 +228,20 @@ def user_actions_kb(telegram_id: int, is_blocked: bool, partner_id: int | None =
         builder.row(
             InlineKeyboardButton(text="📊 Открыть партнёра", callback_data=f"adm_pt_{partner_id}"),
         )
+    if has_active_sub:
+        builder.row(
+            InlineKeyboardButton(text="📱 Управление устройствами", callback_data=f"adm_usr_devices_{telegram_id}"),
+        )
     builder.row(InlineKeyboardButton(text="◀️ К списку клиентов", callback_data="adm_users"))
+    return builder.as_markup()
+
+
+def user_reset_confirm_kb(telegram_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm_usr_info_{telegram_id}"),
+        InlineKeyboardButton(text="⚠️ ДА, СБРОСИТЬ", callback_data=f"adm_usr_reset_do_{telegram_id}"),
+    )
     return builder.as_markup()
 
 

@@ -1608,35 +1608,6 @@
         </div>
 
         <div class="tariffs" id="tariffCards"></div>
-      </div>
-    </section>
-
-    <section class="section" id="balance-topup">
-      <div class="section-card">
-        <div class="section-head">
-          <h2>Или пополните баланс</h2>
-          <p>Можно положить на баланс любую сумму и держать деньги в профиле с запасом. Туда же приходят бонусы за друзей.</p>
-        </div>
-        <div class="balance-section">
-          <div class="balance-copy">
-            <h3>Как это работает</h3>
-            <p>Баланс подходит тем, кто не хочет каждый раз платить ровно за один срок. Пополнили один раз, а дальше деньги лежат в вашем профиле.</p>
-            <div class="balance-points">
-              <div>Пополняете на любую удобную сумму.</div>
-              <div>Если включить списания, сейчас будет списываться {{DAILY_CHARGE_RUB}} ₽ в день за базовый доступ.</div>
-              <div>В профиле видно остаток и все операции.</div>
-              <div>Бонусы за приглашения тоже падают туда.</div>
-              <div>Если захотите, в профиле можно включить ежедневные списания.</div>
-            </div>
-          </div>
-          <div class="balance-form">
-            <strong>Пополнить баланс</strong>
-            <span>Введите сумму в рублях. Если вы ещё не вошли, сначала откроется регистрация или вход.</span>
-            <input type="number" min="10" max="50000" step="1" class="balance-input" id="balanceAmountInput" placeholder="Например, 300">
-            <button type="button" class="buy-btn balance-topup-btn" id="balanceTopupBtn">Пополнить баланс</button>
-          </div>
-        </div>
-      </div>
     </section>
 
     <section class="section">
@@ -1926,7 +1897,6 @@
     }
     let authMode = "login";
     let pendingTariffKey = "";
-    let pendingBalanceTopup = false;
     let pendingDemoAccess = false;
     const contactModes = {
       email: {
@@ -2369,14 +2339,11 @@
         syncAuthButtons();
         showToast(authMode === "register" ? "Профиль создан" : "Вы вошли");
         const tariff = pendingTariffKey;
-        const resumeBalanceTopup = pendingBalanceTopup;
         const resumeDemoAccess = pendingDemoAccess;
         pendingTariffKey = "";
-        pendingBalanceTopup = false;
         pendingDemoAccess = false;
         if (tariff) buyTariff(tariff);
-        if (!tariff && resumeBalanceTopup) createBalanceTopup();
-        if (!tariff && !resumeBalanceTopup && resumeDemoAccess) requestDemoAccess();
+        if (!tariff && resumeDemoAccess) requestDemoAccess();
       } catch {
         showToast("Ошибка сети. Попробуйте ещё раз.");
       } finally {
@@ -2424,47 +2391,6 @@
           return;
         }
         showToast(data.error || "Произошла ошибка");
-      } catch (e) {
-        showToast("Ошибка сети. Попробуйте ещё раз.");
-      } finally {
-        setLoading(false);
-      }
-    }
-
-    async function createBalanceTopup() {
-      const input = document.getElementById("balanceAmountInput");
-      const amount = Number((input?.value || "").trim());
-      const token = getSavedProfileToken();
-      if (!amount || amount < 10 || amount > 50000) {
-        showToast("Введите сумму от 10 до 50 000 ₽");
-        return;
-      }
-      if (!token) {
-        pendingBalanceTopup = true;
-        openAuthModal("register");
-        showToast("Сначала создайте личный кабинет. После входа откроется пополнение.");
-        return;
-      }
-
-      setLoading(true);
-      try {
-        const resp = await fetch("/api/store/create-balance-topup", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token, amount_rub: amount }),
-        });
-        const data = await resp.json();
-        if (data.redirect_url) {
-          window.location.href = data.redirect_url;
-          return;
-        }
-        if (resp.status === 401 && data.auth_required) {
-          pendingBalanceTopup = true;
-          openAuthModal("login");
-          showToast(data.error || "Сначала войдите");
-          return;
-        }
-        showToast(data.error || "Не удалось открыть оплату");
       } catch (e) {
         showToast("Ошибка сети. Попробуйте ещё раз.");
       } finally {
@@ -2550,7 +2476,6 @@
       }
       openAuthModal("register");
     });
-    document.getElementById("balanceTopupBtn").addEventListener("click", createBalanceTopup);
     document.getElementById("authSubmitBtn").addEventListener("click", submitAuth);
     document.getElementById("authModalClose").addEventListener("click", closeAuthModal);
     document.getElementById("authOverlay").addEventListener("click", (e) => {

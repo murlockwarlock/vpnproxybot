@@ -426,7 +426,7 @@ async def _process_and_deliver(
                     )
                 except Exception:
                     pass
-                return None, None
+                return user.id, None
             if not subscription or not vpn_key:
                 logger.error(
                     "Webhook VPN delivery failed: telegram_user_id=%s tariff_id=%s",
@@ -440,7 +440,7 @@ async def _process_and_deliver(
                     )
                 except Exception:
                     pass
-                return None, None
+                return user.id, None
 
         # MTProto part
         if is_tg_proxy_only or is_both:
@@ -800,6 +800,8 @@ async def handle_yookassa(request: web.Request) -> web.Response:
                 if payment:
                     payment.status = PaymentStatus.COMPLETED
                     payment.subscription_id = subscription_id
+                    payment.tariff_id = tariff_id
+                    payment.platform = platform_str
                     discount = payment.discount_applied
                 else:
                     payment = Payment(
@@ -810,6 +812,8 @@ async def handle_yookassa(request: web.Request) -> web.Response:
                         method=PaymentMethod.YOOKASSA,
                         status=PaymentStatus.COMPLETED,
                         provider_payment_id=yookassa_payment_id,
+                        tariff_id=tariff_id,
+                        platform=platform_str,
                     )
                     session.add(payment)
                     discount = 0.0
@@ -840,7 +844,7 @@ async def handle_yookassa(request: web.Request) -> web.Response:
 
                 # Save payment method for recurring charges
                 pm = obj.get("payment_method", {})
-                if pm.get("saved") and pm.get("id") and subscription_id and tariff_id:
+                if settings.recurring_payments_enabled and pm.get("saved") and pm.get("id") and subscription_id and tariff_id:
                     pm_id = pm["id"]
                     card_info = pm.get("card", {})
                     last4 = card_info.get("last4", "")
@@ -1036,6 +1040,8 @@ async def handle_robokassa_result(request: web.Request) -> web.Response:
                     method=PaymentMethod.ROBOKASSA,
                     status=PaymentStatus.COMPLETED,
                     provider_payment_id=str(inv_id),
+                    tariff_id=tariff_id,
+                    platform=platform_str,
                 )
                 session.add(payment)
 
@@ -1539,6 +1545,7 @@ async def handle_vhq_subscription_proxy(request: web.Request) -> web.Response:
     upstream_url: str | None = None
     expires_at = None
     key_id = None
+    tariff_label = None
     if token_payload.get("kind") == "subscription":
         subscription_id = int(token_payload["subscription_id"])
         async with async_session() as session:
@@ -1548,6 +1555,10 @@ async def handle_vhq_subscription_proxy(request: web.Request) -> web.Response:
             upstream_url = subscription.vpn_key
             expires_at = subscription.expires_at
             key_id = str(subscription.id)
+            if subscription.tariff_id:
+                tariff = await session.get(Tariff, subscription.tariff_id)
+                if tariff:
+                    tariff_label = tariff.label
     else:
         upstream_url = str(token_payload.get("upstream_url") or "").strip()
         key_id = str(token_payload.get("order_id") or "").strip() or None
@@ -1561,6 +1572,7 @@ async def handle_vhq_subscription_proxy(request: web.Request) -> web.Response:
             request.headers,
             expires_at=expires_at,
             key_id=key_id,
+            tariff_label=tariff_label,
         )
     except aiohttp.ClientError as exc:
         logger.warning("VHQ proxy request failed: %s", exc)
@@ -1578,25 +1590,29 @@ _ADAPT_WEBHOOK_IP = "139.60.162.7"
 
 
 async def handle_adapt_subscription_proxy(request: web.Request) -> web.Response:
-    """Proxy GET /adapt-sub/{uuid} → Adapt subscription endpoint."""
+    """Proxy GET /adapt-sub/{uuid} → Adapt subscription endpoint.
+
+    UUIDs may come from two sources:
+    - Bot DB (adapt_subscriptions table) — bot-side purchases
+    - Webstore DB (web_orders table) — webstore purchases stored in a separate DB
+
+    We validate UUID format and proxy to upstream Adapt, which handles
+    its own authentication.  Non-existent UUIDs will get a 404 from upstream.
+    """
     adapt_uuid = request.match_info.get("uuid", "").strip()
     if not adapt_uuid:
         return web.Response(status=404, text="Not found")
 
-    # Validate UUID exists in our DB before proxying
-    async with async_session() as session:
-        from sqlalchemy import select as _select
-        from bot.models import AdaptSubscription as _AS
-        result = await session.execute(
-            _select(_AS).where(_AS.adapt_uuid == adapt_uuid).limit(1)
-        )
-        if not result.scalar_one_or_none():
-            return web.Response(status=404, text="Not found")
+    # Basic UUID format validation to prevent abuse / scanning
+    import re
+    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", adapt_uuid, re.IGNORECASE):
+        return web.Response(status=404, text="Not found")
 
     try:
         status, body, headers = await fetch_adapt_mirror_payload(
             adapt_uuid,
             request_headers=request.headers,
+            query_params=request.query,
         )
     except Exception as exc:
         logger.warning("Adapt proxy request failed for uuid=%s: %s", adapt_uuid, exc)

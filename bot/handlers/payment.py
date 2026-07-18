@@ -132,6 +132,26 @@ async def _ask_platform_before_key(message_or_callback, subscription_id: int) ->
         )
 
 
+async def _get_key_change_explanation(session, user_id: int, current_sub_id: int, current_client_name: str) -> str | None:
+    if not current_client_name or not current_client_name.startswith("vhq_"):
+        return None
+    previous = await session.scalar(
+        select(Subscription)
+        .where(Subscription.user_id == user_id)
+        .where(Subscription.id < current_sub_id)
+        .where(Subscription.client_name.like("adapt_%"))
+        .order_by(Subscription.id.desc())
+        .limit(1)
+    )
+    if previous:
+        return (
+            "ℹ️ <b>Почему ключ другой?</b> Вы перешли на премиум-сеть (VHQ), "
+            "поэтому для вас был сгенерирован новый, более быстрый ключ. "
+            "Старый ключ демо-доступа больше не понадобится."
+        )
+    return None
+
+
 async def _send_subscription_key_for_platform(
     bot,
     chat_id: int,
@@ -149,7 +169,9 @@ async def _send_subscription_key_for_platform(
         subscription.platform = platform
         user.platform = platform
         vpn_key = subscription.vpn_key
+        client_name = subscription.client_name
         expires_str = subscription.expires_at.strftime("%d.%m.%Y") if subscription.expires_at else "N/A"
+        explanation = await _get_key_change_explanation(session, user.id, subscription.id, client_name)
         await session.commit()
 
     if not vpn_key:
@@ -161,6 +183,9 @@ async def _send_subscription_key_for_platform(
         KEY_DELIVERED.format(key=key_display, expires=expires_str),
         parse_mode="HTML",
     )
+    if explanation:
+        await bot.send_message(chat_id, explanation, parse_mode="HTML")
+    
     await bot.send_message(
         chat_id,
         f"📋 <b>Полный ключ (нажмите чтобы скопировать):</b>\n\n<code>{vpn_key}</code>",
@@ -259,9 +284,15 @@ async def _ensure_completed_payment_record(
     currency: str,
     discount_applied: float = 0.0,
     subscription_id: int | None = None,
+    tariff_id: int | None = None,
+    platform: str | None = None,
 ) -> Payment:
     existing = await _find_existing_payment(session, provider_payment_id)
     if existing:
+        if tariff_id and not existing.tariff_id:
+            existing.tariff_id = tariff_id
+        if platform and not existing.platform:
+            existing.platform = platform
         return existing
 
     payment = Payment(
@@ -273,6 +304,8 @@ async def _ensure_completed_payment_record(
         status=PaymentStatus.COMPLETED,
         provider_payment_id=provider_payment_id,
         discount_applied=discount_applied,
+        tariff_id=tariff_id,
+        platform=platform,
     )
     session.add(payment)
     await session.commit()
@@ -968,6 +1001,8 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
             method=PaymentMethod.BALANCE,
             status=PaymentStatus.COMPLETED,
             provider_payment_id="balance_" + str(uuid.uuid4()),
+            tariff_id=tariff.id,
+            platform=delivery_platform.value if hasattr(delivery_platform, "value") else str(delivery_platform),
         )
         session.add(payment)
         await session.flush()
@@ -1000,10 +1035,18 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
         elif vpn_key:
             from bot.utils.texts import KEY_DELIVERED, GUIDE_ANDROID, GUIDE_IOS, GUIDE_MAC, GUIDE_WINDOWS, GUIDE_ANDROID_TV
             key_display = vpn_key if len(vpn_key) <= 200 else vpn_key[:200] + "..."
+            
+            client_name = subscription.client_name if subscription else ""
+            explanation = await _get_key_change_explanation(session, user.id, subscription.id if subscription else 0, client_name)
+            
             await callback.message.edit_text(
                 KEY_DELIVERED.format(key=key_display, expires=expires_str),
                 parse_mode="HTML",
             )
+            
+            if explanation:
+                await callback.message.answer(explanation, parse_mode="HTML")
+            
             await callback.message.answer(
                 f"📋 <b>Полный ключ:</b>\n\n<code>{vpn_key}</code>",
                 parse_mode="HTML",
@@ -1071,6 +1114,9 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
     if not tariff:
         await callback.answer("Некорректный тариф", show_alert=True)
         return
+    if not tariff.is_active or tariff.is_admin_only:
+        await callback.answer("Этот тариф больше недоступен", show_alert=True)
+        return
     if not await _ensure_intro_basic_available(callback, tariff):
         return
 
@@ -1112,6 +1158,8 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
             status=PaymentStatus.PENDING,
             telegram_chat_id=callback.message.chat.id,
             discount_applied=discount,
+            tariff_id=tariff_id,
+            platform=platform_str,
         )
         session.add(payment)
         await session.flush()
@@ -1254,11 +1302,53 @@ async def initiate_robokassa_payment(callback: CallbackQuery) -> None:
 
 @router.pre_checkout_query()
 async def process_pre_checkout(pre_checkout: PreCheckoutQuery) -> None:
-    """Validate pre-checkout - always approve for Stars."""
+    """Validate pre-checkout payload before approving Telegram Pay / Stars charge.
+
+    Decline if the invoice references a tariff that is no longer active or is
+    admin-only. This blocks replay of old invoices whose tariff was disabled
+    after the invoice was originally sent.
+    """
+    payload_str = pre_checkout.invoice_payload
+
+    if payload_str.startswith("dev_") or payload_str.startswith("topup_"):
+        logger.info(
+            "Pre-checkout approved: user_id=%s payload=%s currency=%s total_amount=%s",
+            pre_checkout.from_user.id,
+            payload_str,
+            pre_checkout.currency,
+            pre_checkout.total_amount,
+        )
+        await pre_checkout.answer(ok=True)
+        return
+
+    try:
+        tariff_id = int(payload_str.split("_", 1)[0])
+    except (ValueError, IndexError):
+        logger.error(
+            "Pre-checkout rejected (malformed payload): user_id=%s payload=%s",
+            pre_checkout.from_user.id,
+            payload_str,
+        )
+        await pre_checkout.answer(ok=False, error_message="Платёж не может быть обработан")
+        return
+
+    tariff = await _get_tariff(tariff_id)
+    if not tariff or not tariff.is_active or tariff.is_admin_only:
+        logger.warning(
+            "Pre-checkout rejected (inactive/admin-only tariff): user_id=%s payload=%s tariff_id=%s is_active=%s is_admin_only=%s",
+            pre_checkout.from_user.id,
+            payload_str,
+            tariff_id,
+            getattr(tariff, "is_active", None),
+            getattr(tariff, "is_admin_only", None),
+        )
+        await pre_checkout.answer(ok=False, error_message="Тариф больше недоступен")
+        return
+
     logger.info(
         "Pre-checkout approved: user_id=%s payload=%s currency=%s total_amount=%s",
         pre_checkout.from_user.id,
-        pre_checkout.invoice_payload,
+        payload_str,
         pre_checkout.currency,
         pre_checkout.total_amount,
     )
@@ -1407,6 +1497,20 @@ async def process_successful_payment(message: Message) -> None:
         logger.error(f"Tariff {tariff_id} not found after payment!")
         await message.answer(ERROR, parse_mode="HTML")
         return
+    if not tariff.is_active or tariff.is_admin_only:
+        logger.error(
+            "Successful payment rejected (inactive/admin-only tariff): user_id=%s payload=%s tariff_id=%s is_active=%s is_admin_only=%s",
+            message.from_user.id,
+            payload_str,
+            tariff_id,
+            tariff.is_active,
+            tariff.is_admin_only,
+        )
+        await message.answer(
+            "❌ Этот тариф больше недоступен. Напишите в поддержку, если нужна помощь.",
+            parse_mode="HTML",
+        )
+        return
 
     is_tg_proxy_only = tariff.tariff_type == TariffType.TG_PROXY
     is_both = tariff.tariff_type == TariffType.BOTH
@@ -1445,6 +1549,8 @@ async def process_successful_payment(message: Message) -> None:
             amount=payment_info.total_amount,
             currency=payment_info.currency,
             discount_applied=discount,
+            tariff_id=tariff_id,
+            platform=platform_str,
         )
 
         subscription = None
@@ -1646,10 +1752,18 @@ async def process_successful_payment(message: Message) -> None:
             await _ask_platform_before_key(message, subscription.id)
         elif vpn_key:
             key_display = vpn_key if len(vpn_key) <= 200 else vpn_key[:200] + "..."
+            
+            client_name = subscription.client_name if subscription else ""
+            explanation = await _get_key_change_explanation(session, user.id, subscription.id if subscription else 0, client_name)
+            
             await message.answer(
                 KEY_DELIVERED.format(key=key_display, expires=expires_str),
                 parse_mode="HTML",
             )
+            
+            if explanation:
+                await message.answer(explanation, parse_mode="HTML")
+            
             await message.answer(
                 f"📋 <b>Полный ключ (нажмите чтобы скопировать):</b>\n\n"
                 f"<code>{vpn_key}</code>",

@@ -204,6 +204,13 @@ class WebStoreSettings:
     support_admin_password: str = field(
         default_factory=lambda: os.getenv("SUPPORT_ADMIN_PASSWORD", "")
     )
+    adapt_demo_enabled: bool = field(
+        default_factory=lambda: os.getenv("ADAPT_DEMO_ENABLED", "1" if "darimiru.ru" in os.getenv("SUBSCRIPTION_BASE_URL", "") else "0") == "1"
+    )
+    adapt_demo_plan_uuid: str = field(
+        default_factory=lambda: os.getenv("ADAPT_DEMO_PLAN_UUID", "00cce2fe-ee55-4c0d-8bfa-9e6e47cd99a4").strip()
+    )
+
 
     @property
     def yookassa_enabled(self) -> bool:
@@ -261,9 +268,16 @@ def _adapt_features() -> list[str]:
     ]
 
 
+def _parse_device_count(label: str, default_devices: int) -> int:
+    match = re.search(r"(\d+)\s*(?:📱|устройств)", label)
+    if match:
+        return int(match.group(1))
+    return default_devices
+
+
 def _label_family(label: str) -> str:
     normalized = label.lower().replace("ё", "е")
-    if "преми" in normalized:
+    if "преми" in normalized or "максим" in normalized:
         return "premium"
     if "базов" in normalized:
         return "basic"
@@ -282,9 +296,20 @@ def _provider_description(provider: str, label: str = "", vhq_tier: str = "") ->
         if provider == "marzban" and family == "light":
             return "Стабильная работа основных приложений и сервисов на Wi-Fi и мобильном интернете без блокировок. Без лимитов. Подключение до 3-х устройств."
         if family == "basic":
-            return "Быстрый VPN для любых задач. Без лимита на основные сервера. Сервера-обходы ⚡️ — используйте при глушении мобильного интернета (лимит на такие сервера в скобках). Подключение на 1 устройство."
+            devices = _parse_device_count(label, 1)
+            device_word = "устройство" if devices == 1 else "устройства" if devices < 5 else "устройств"
+            return (
+                "Быстрый VPN для любых задач. "
+                "Обходы ⚡️ — используйте при глушении мобильного интернета (лимит на трафик указан в названии тарифа и действует только на обходы, на основные локации ограничений нет). "
+                f"Подключение на {devices} {device_word}."
+            )
         if family == "premium" or (provider == "vhq" and vhq_tier == "basic"):
-            return "Максимальная стабильность и комфорт для активного использования сразу на нескольких устройствах. Увеличенный трафик на ⚡️ серверах."
+            devices = _parse_device_count(label, 3)
+            device_word = "устройство" if devices == 1 else "устройства" if devices < 5 else "устройств"
+            return (
+                "Максимальная стабильность и комфорт для активного использования без ограничений. Самые быстрые и надёжные серверы. "
+                f"Подключение на {devices} {device_word}."
+            )
     if provider == "adapt":
         return _adapt_description()
     if provider == "marzban":
@@ -309,16 +334,20 @@ def _provider_features(provider: str, label: str = "", vhq_tier: str = "") -> li
                 "Стабильная работа основных сервисов",
             ]
         if family == "basic":
+            devices = _parse_device_count(label, 1)
+            device_text = f"{devices} {'устройство' if devices == 1 else 'устройства' if devices < 5 else 'устройств'} 📱"
             return [
                 "50 серверов 🌐 + 50 обходов ⚡️",
-                "1 устройство 📱",
+                device_text,
                 "Без лимита на основные сервера",
             ]
         if family == "premium" or (provider == "vhq" and vhq_tier == "basic"):
+            devices = _parse_device_count(label, 3)
+            device_text = f"{devices} {'устройство' if devices == 1 else 'устройства' if devices < 5 else 'устройств'} 📱"
             return [
-                "50 серверов 🌐 + 50 обходов ⚡️",
-                "3 устройства 📱📱📱",
-                "Увеличенный трафик на ⚡️ серверах",
+                "80 серверов 🌐 + 80 обходов ⚡️",
+                device_text,
+                "Безлимитный трафик на ⚡️ серверах",
             ]
     if provider == "adapt":
         return _adapt_features()

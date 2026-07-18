@@ -288,7 +288,7 @@ def _display_order_subscription_url(order: WebOrder) -> str | None:
     raw_url = str(order.subscription_url or "").strip()
     if not raw_url or order.status not in ("delivered", "demo"):
         return None
-    if "/proxy-subscription/" not in raw_url:
+    if "/proxy-subscription/" not in raw_url and "vhq-connect.xyz" not in raw_url:
         return raw_url
     return build_vhq_mirror_url(
         raw_url,
@@ -357,7 +357,7 @@ def _get_order_provider(order: WebOrder) -> str:
         return str(tariff["provider"])
     if order.marzban_username:
         return "marzban"
-    if order.subscription_url and "/proxy-subscription/" in order.subscription_url:
+    if order.subscription_url and ("/proxy-subscription/" in order.subscription_url or "vhq-connect.xyz" in order.subscription_url):
         return "vhq"
     return ""
 
@@ -441,12 +441,36 @@ async def _get_or_create_web_balance_account(
 
 
 async def _maybe_issue_web_demo_key(session, account: WebBalanceAccount) -> str | None:
-    """Issue a free demo Marzban key for a new web user if demo is enabled.
+    """Issue a free demo Marzban or Adapt key for a new web user if demo is enabled.
 
     Returns the subscription URL, or None if demo is disabled / already issued / failed.
     """
     if not settings.demo_key_enabled:
         return None
+
+    # Check if this profile token is linked to a telegram user who already got a demo subscription in the bot DB.
+    linked_profile = await session.get(WebProfileLink, account.profile_token)
+    if linked_profile and linked_profile.telegram_id:
+        from webstore.config import _bot_db_path
+        path = _bot_db_path()
+        if path and path.exists():
+            try:
+                import sqlite3
+                with sqlite3.connect(str(path)) as con:
+                    row = con.execute(
+                        """
+                        SELECT 1 FROM subscriptions s
+                        JOIN users u ON s.user_id = u.id
+                        WHERE u.telegram_id = ? AND s.billing_mode = 'demo'
+                        LIMIT 1
+                        """,
+                        (linked_profile.telegram_id,)
+                    ).fetchone()
+                    if row:
+                        logger.info("Demo key already issued in bot for telegram_id %s, refusing web demo key", linked_profile.telegram_id)
+                        return None
+            except Exception as e:
+                logger.error("Failed to check bot demo status for telegram_id %s: %s", linked_profile.telegram_id, e)
 
     existing = await session.execute(
         select(WebOrder).where(
@@ -458,47 +482,91 @@ async def _maybe_issue_web_demo_key(session, account: WebBalanceAccount) -> str 
         return None
 
     demo_days = settings.demo_key_days
-    username = f"wdemo_{account.profile_token[:16]}"
-    expire_ts = int((datetime.utcnow() + timedelta(days=demo_days)).timestamp())
 
-    try:
-        async with MarzbanClient() as marzban:
-            user_data = await marzban.create_user(
-                username=username,
-                expire=expire_ts,
-                note=f"web demo | {account.contact or account.profile_token[:8]}",
+    if settings.adapt_demo_enabled:
+        try:
+            api = AdaptAPI()
+            resp = await api.create_subscription(
+                plan_uuid=settings.adapt_demo_plan_uuid,
+                external_user_id=f"web_demo_{account.profile_token[:16]}",
             )
-            if not user_data:
-                logger.warning("Failed to create demo Marzban user for profile %s", account.profile_token[:8])
+            adapt_uuid = resp.get("uuid") or resp.get("subscription_uuid") or resp.get("id")
+            if not adapt_uuid:
+                logger.error("Adapt demo created but no UUID returned for profile %s: %s", account.profile_token[:8], resp)
                 return None
-
-            sub_url = await marzban.get_subscription_url(username)
+            
+            branded_url = build_adapt_mirror_url(adapt_uuid)
+            sub_url = branded_url or resp.get("subscription_url")
             if not sub_url:
-                logger.warning("No subscription URL for demo user %s", username)
+                logger.warning("No subscription URL for demo user adapt_%s", adapt_uuid)
                 return None
 
-        demo_order = WebOrder(
-            order_id=f"demo_{account.profile_token[:16]}",
-            contact=account.contact,
-            tariff_key="demo",
-            tariff_label=f"Демо-доступ {demo_days} дн.",
-            days=demo_days,
-            amount_rub=0,
-            original_amount_rub=0,
-            status="demo",
-            marzban_username=username,
-            subscription_url=sub_url,
-            profile_token=account.profile_token,
-            delivered_at=datetime.utcnow(),
-            access_expires_at=datetime.utcnow() + timedelta(days=demo_days),
-        )
-        session.add(demo_order)
-        logger.info("Web demo key issued for profile %s", account.profile_token[:8])
-        return sub_url
+            expires_at = _adapt_expires_at_from_response(resp, demo_days)
 
-    except Exception as e:
-        logger.error("Error issuing web demo key for profile %s: %s", account.profile_token[:8], e)
-        return None
+            demo_order = WebOrder(
+                order_id=f"demo_{account.profile_token[:16]}",
+                contact=account.contact,
+                tariff_key="demo",
+                tariff_label=f"Демо-доступ {demo_days} дн. (Adapt)",
+                days=demo_days,
+                amount_rub=0,
+                original_amount_rub=0,
+                status="demo",
+                marzban_username=f"adapt_{adapt_uuid}",
+                subscription_url=sub_url,
+                profile_token=account.profile_token,
+                delivered_at=datetime.utcnow(),
+                access_expires_at=expires_at,
+            )
+            session.add(demo_order)
+            logger.info("Web Adapt demo key issued for profile %s", account.profile_token[:8])
+            return sub_url
+        except Exception as e:
+            logger.error("Error issuing Adapt web demo key for profile %s: %s", account.profile_token[:8], e)
+            return None
+    else:
+        # Fallback to Marzban
+        username = f"wdemo_{account.profile_token[:16]}"
+        expire_ts = int((datetime.utcnow() + timedelta(days=demo_days)).timestamp())
+
+        try:
+            async with MarzbanClient() as marzban:
+                user_data = await marzban.create_user(
+                    username=username,
+                    expire=expire_ts,
+                    note=f"web demo | {account.contact or account.profile_token[:8]}",
+                )
+                if not user_data:
+                    logger.warning("Failed to create demo Marzban user for profile %s", account.profile_token[:8])
+                    return None
+
+                sub_url = await marzban.get_subscription_url(username)
+                if not sub_url:
+                    logger.warning("No subscription URL for demo user %s", username)
+                    return None
+
+            demo_order = WebOrder(
+                order_id=f"demo_{account.profile_token[:16]}",
+                contact=account.contact,
+                tariff_key="demo",
+                tariff_label=f"Демо-доступ {demo_days} дн.",
+                days=demo_days,
+                amount_rub=0,
+                original_amount_rub=0,
+                status="demo",
+                marzban_username=username,
+                subscription_url=sub_url,
+                profile_token=account.profile_token,
+                delivered_at=datetime.utcnow(),
+                access_expires_at=datetime.utcnow() + timedelta(days=demo_days),
+            )
+            session.add(demo_order)
+            logger.info("Web demo key issued for profile %s", account.profile_token[:8])
+            return sub_url
+
+        except Exception as e:
+            logger.error("Error issuing web demo key for profile %s: %s", account.profile_token[:8], e)
+            return None
 
 
 def _add_web_balance_transaction(
@@ -1689,7 +1757,7 @@ async def _fulfill_order(session, order: WebOrder) -> None:
     # Adapt provider
     adapt_plan_uuid = tariff.get("adapt_plan_uuid") if tariff else None
     if adapt_plan_uuid:
-        await _fulfill_adapt_order(order, adapt_plan_uuid)
+        await _fulfill_adapt_order(session, order, adapt_plan_uuid)
         return
 
     preferred_username: str | None = None
@@ -1873,8 +1941,77 @@ def _adapt_expires_at_from_response(resp: dict, fallback_days: int) -> datetime:
     return datetime.utcnow() + timedelta(days=max(days, 1))
 
 
-async def _fulfill_adapt_order(order: WebOrder, adapt_plan_uuid: str) -> None:
-    """Create Adapt subscription and store branded URL on the order."""
+def _extract_adapt_uuid_from_web_order(order: WebOrder) -> str | None:
+    raw_username = str(order.marzban_username or "").strip()
+    if raw_username.startswith("adapt_"):
+        return raw_username.removeprefix("adapt_").strip() or None
+
+    raw_url = str(order.subscription_url or "").strip()
+    marker = "/adapt-sub/"
+    if marker in raw_url:
+        return raw_url.rsplit(marker, 1)[-1].split("?", 1)[0].split("#", 1)[0].strip() or None
+    return None
+
+
+async def _fulfill_adapt_order(session, order: WebOrder, adapt_plan_uuid: str) -> None:
+    """Renew an existing Adapt web subscription when possible, otherwise create one."""
+    if order.profile_token:
+        primary = await _get_latest_web_access_order(session, order.profile_token)
+        if primary and primary.id != order.id and primary.tariff_key == order.tariff_key:
+            adapt_uuid = _extract_adapt_uuid_from_web_order(primary)
+            if adapt_uuid:
+                try:
+                    resp = await AdaptAPI().renew_subscription(adapt_uuid)
+                except AdaptAPIError as exc:
+                    issue = build_internal_access_error(
+                        provider="adapt",
+                        code=f"adapt_renew_{exc.status or 'error'}",
+                        admin_message=(
+                            f"Adapt renew error for order {order.order_id}: {exc} "
+                            f"primary_order={primary.order_id} adapt_uuid={adapt_uuid}"
+                        ),
+                        raw_message=str(exc),
+                    )
+                    logger.error(issue.admin_message)
+                    await _mark_order_failed(order, issue)
+                    return
+                except Exception as exc:
+                    issue = build_internal_access_error(
+                        provider="adapt",
+                        code="adapt_renew_runtime",
+                        admin_message=(
+                            f"Unexpected Adapt renew error for order {order.order_id}: {exc} "
+                            f"primary_order={primary.order_id} adapt_uuid={adapt_uuid}"
+                        ),
+                        raw_message=str(exc),
+                    )
+                    logger.error(issue.admin_message)
+                    await _mark_order_failed(order, issue)
+                    return
+
+                order.marzban_username = primary.marzban_username
+                order.subscription_url = primary.subscription_url or build_adapt_mirror_url(adapt_uuid)
+                order.status = "delivered"
+                order.failure_message = None
+                order.failure_reason = None
+                order.delivered_at = datetime.utcnow()
+                order.access_expires_at = _adapt_expires_at_from_response(resp, order.days)
+                _web_plog(
+                    "WEB_ПРОДЛЕНИЕ",
+                    order_id=order.order_id,
+                    tariff=order.tariff_label,
+                    provider="adapt",
+                    context=f"reused={primary.order_id} adapt_uuid={adapt_uuid}",
+                )
+                logger.info(
+                    "Order %s renewed via Adapt: primary_order=%s uuid=%s",
+                    order.order_id,
+                    primary.order_id,
+                    adapt_uuid,
+                )
+                return
+
+    # No matching previous Adapt order for this profile: issue a fresh subscription.
     try:
         api = AdaptAPI()
         resp = await api.create_subscription(

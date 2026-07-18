@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy the web store to the NL server (YOUR_SERVER_IP).
+"""Deploy the web store to the NL server (72.56.71.124).
 
 Uploads webstore/ and .env.webstore, installs as a systemd service,
 updates nginx config for darimiru.ru.
@@ -13,7 +13,7 @@ import paramiko
 
 from scripts.deploy_guard import ensure_clean_git, load_local_env, require_env
 
-NL_HOST = "YOUR_SERVER_IP"
+NL_HOST = "72.56.71.124"
 NL_USER = "root"
 load_local_env(os.path.dirname(os.path.abspath(__file__)))
 NL_PASS = require_env("NL_WEBSTORE_SSH_PASSWORD")

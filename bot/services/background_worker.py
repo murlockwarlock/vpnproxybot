@@ -177,6 +177,33 @@ async def _send_one(bot: Bot, chat_id: int, mailing: Mailing) -> None:
     pos = mailing.media_position or "media_top"
     reply_markup = build_user_kb(mailing.buttons_json)
 
+    # Album media type handling
+    if m_type == "album":
+        from bot.handlers.mailing import _parse_album_media
+
+        if text and not reply_markup and len(text) <= 1024 and pos == "media_top":
+            album_media = _parse_album_media(media, caption=text)
+            await bot.send_media_group(chat_id, media=album_media)
+            return
+
+        async def _send_album() -> None:
+            album_media = _parse_album_media(media, caption=None)
+            await bot.send_media_group(chat_id, media=album_media)
+
+        async def _text() -> None:
+            if text:
+                await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=reply_markup)
+            elif reply_markup:
+                await bot.send_message(chat_id, "🔗", reply_markup=reply_markup)
+
+        if pos == "media_top":
+            await _send_album()
+            await _text()
+        else:
+            await _text()
+            await _send_album()
+        return
+
     # Caption-combined send (photo/video with text ≤ 1024 chars)
     if media and text and len(text) <= 1024 and pos == "media_top":
         send_fn = bot.send_photo if m_type == "photo" else bot.send_video

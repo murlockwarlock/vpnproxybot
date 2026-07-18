@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Deploy @tgshop322bot to YOUR_SERVER_IP via paramiko (password auth)."""
+"""Deploy @tgshop322bot to 81.200.156.43 via paramiko (password auth)."""
 
 import os
 import paramiko
 
 from scripts.deploy_guard import ensure_clean_git, load_local_env, require_env
 
-HOST = "YOUR_SERVER_IP"
+HOST = "81.200.156.43"
 USER = "root"
 load_local_env(os.path.dirname(os.path.abspath(__file__)))
 PASSWORD = require_env("TGSHOP322_SSH_PASSWORD")
