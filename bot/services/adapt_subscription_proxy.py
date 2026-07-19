@@ -88,6 +88,13 @@ async def fetch_adapt_mirror_payload(
     async with aiohttp.ClientSession(timeout=_TIMEOUT) as http:
         async with http.get(upstream_url, headers=forward_headers, params=query_params) as resp:
             body = await resp.read()
+            if resp.status == 200:
+                content_type = resp.headers.get("content-type", "").lower()
+                if "text/html" in content_type:
+                    body = body.replace(b'<div class="footer">', b'<div class="footer" style="display:none !important;">')
+                    if settings.subscription_profile_title:
+                        body = body.replace(b"DARIMIR API", settings.subscription_profile_title.encode("utf-8"))
+
             out_headers: dict[str, str] = {}
             for h in _PASSTHROUGH_HEADERS:
                 val = resp.headers.get(h) or resp.headers.get(h.title())
