@@ -42,3 +42,9 @@ ops/nl-stack/data/*
 !ops/nl-stack/data/.gitkeep
 ops/nl-stack/local-packages/
 *.tar.gz
+
+# Deploy scripts
+deploy_*.py
+deploy_*.sh
+ssh_exec.py
+ssh_transfer.py
