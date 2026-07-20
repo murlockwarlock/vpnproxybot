@@ -49,6 +49,7 @@ from bot.services.payment_logger import plog
 from bot.services.provisioning_issues import AccessProvisionError
 from bot.services.subscription_semantics import is_demo_subscription_row, paid_access_clause
 from bot.services.subscription_service import create_or_extend_balance_subscription, create_or_extend_balance_adapt_subscription
+from bot.services.adapt_api import AdaptAPI, AdaptAPIError
 from bot.services.vhq_partner_api import VHQPartnerAPI, VHQPartnerAPIError
 
 logger = logging.getLogger(__name__)
@@ -168,6 +169,15 @@ def setup_scheduler(bot):
             hours=12,
             args=[bot],
             id="check_vhq_balance",
+            replace_existing=True,
+        )
+    if AdaptAPI().enabled:
+        scheduler.add_job(
+            check_adapt_balance,
+            "interval",
+            hours=12,
+            args=[bot],
+            id="check_adapt_balance",
             replace_existing=True,
         )
     if settings.run_daily_backup:
@@ -1646,6 +1656,49 @@ async def check_vhq_balance(bot) -> None:
             details=[
                 f"Текущий баланс: {balance:.0f} {currency}",
                 "Нужно пополнить баланс VHQ, иначе новые VHQ-тарифы не будут выдаваться.",
+            ],
+        )
+
+
+async def check_adapt_balance(bot) -> None:
+    """Check Adapt Group partner balance and notify admins when low or on error."""
+    api = AdaptAPI()
+    if not api.enabled:
+        return
+
+    try:
+        data = await api.get_balance()
+        balance = float(data.get("balance") or 0)
+        currency = str(data.get("currency") or "USD")
+        plog("ADAPT_БАЛАНС", provider="Adapt", balance=balance, currency=currency)
+        logger.info("Adapt balance check complete: balance=%s currency=%s", balance, currency)
+    except AdaptAPIError as exc:
+        logger.error("Adapt balance check failed: status=%s error=%s", exc.status, exc)
+        await notify_admins_issue(
+            bot,
+            title="Ошибка проверки баланса Adapt",
+            details=[
+                f"HTTP статус: {exc.status or '—'}",
+                f"Причина: {exc}",
+            ],
+        )
+        return
+    except Exception as exc:
+        logger.error("Unexpected Adapt balance check failure: %s", exc)
+        await notify_admins_issue(
+            bot,
+            title="Ошибка проверки баланса Adapt",
+            details=[f"Причина: {exc}"],
+        )
+        return
+
+    if balance < 10.0:
+        await notify_admins_issue(
+            bot,
+            title="Низкий баланс Adapt",
+            details=[
+                f"Текущий баланс: {balance:.2f} {currency}",
+                "Нужно пополнить баланс Adapt, иначе новые подписки Adapt не смогут выдаваться.",
             ],
         )
 

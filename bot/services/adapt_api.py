@@ -47,6 +47,15 @@ class AdaptAPI:
     def enabled(self) -> bool:
         return bool(self.api_id and self.api_key and self.base_url)
 
+    # ── Balance ────────────────────────────────────────────────────────────
+
+    async def get_balance(self) -> dict[str, Any]:
+        """Return the current integration balance in USD.
+        
+        Docs: https://docs.adaptgroup.pro/docs/api-vpn/check-balance
+        """
+        return await self._post("/balance/check", {})
+
     # ── Plans ──────────────────────────────────────────────────────────────
 
     async def list_plans(self) -> list[dict[str, Any]]:

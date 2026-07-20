@@ -241,3 +241,20 @@ async def test_auth_header_set():
         await api.create_subscription("plan-1")
     call_kwargs = session.post.call_args[1]
     assert call_kwargs["headers"]["X-Api-Key"] == "supersecret"
+
+
+# ── get_balance ───────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_balance_success():
+    payload = {"success": True, "balance": 15.5, "currency": "USD"}
+    resp = _mock_response(200, payload)
+    session = _mock_session(resp)
+    api = _make_api()
+    with patch("aiohttp.ClientSession", return_value=session):
+        result = await api.get_balance()
+    assert result["balance"] == 15.5
+    assert result["currency"] == "USD"
+    call_body = session.post.call_args[1]["json"]
+    assert call_body["api_key_id"] == 12
+
