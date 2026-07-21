@@ -951,37 +951,86 @@ async def admin_stats_tariffs(callback: CallbackQuery) -> None:
         return
 
     async with async_session() as session:
-        # Group subscriptions by tariff_id / Tariff label and duration
+        # Group subscriptions by tariff_id, Tariff fields, and subscription duration
         result = await session.execute(
             select(
                 Subscription.tariff_id,
                 Tariff.label,
+                Tariff.days.label("t_days"),
+                Tariff.tariff_type,
                 Subscription.tariff_days,
                 Subscription.tariff_months,
-                func.count(Subscription.id),
-                func.count(Subscription.id).filter(Subscription.status == SubStatus.ACTIVE),
+                func.count(Subscription.id).label("total_cnt"),
+                func.count(Subscription.id).filter(Subscription.status == SubStatus.ACTIVE).label("active_cnt"),
             )
             .outerjoin(Tariff, Subscription.tariff_id == Tariff.id)
             .where(Subscription.billing_mode != "demo")
-            .group_by(Subscription.tariff_id, Tariff.label, Subscription.tariff_days, Subscription.tariff_months)
+            .group_by(
+                Subscription.tariff_id,
+                Tariff.label,
+                Tariff.days,
+                Tariff.tariff_type,
+                Subscription.tariff_days,
+                Subscription.tariff_months,
+            )
             .order_by(func.count(Subscription.id).desc())
         )
         rows = result.all()
 
-    lines = []
-    for tid, tlabel, days, months, total_cnt, active_cnt in rows:
-        duration_str = format_subscription_duration(
-            tariff_days=days,
-            tariff_months=months,
-        )
-        if tlabel:
-            name = f"{tlabel}" if (duration_str in tlabel or not duration_str) else f"{tlabel} ({duration_str})"
+    if not rows:
+        await callback.message.edit_text("🏆 <b>Топ тарифов</b>\n\nНет данных", reply_markup=stats_back_kb(), parse_mode="HTML")
+        await callback.answer()
+        return
+
+    categories: dict[str, list[str]] = {
+        "🌐 Основные тарифы": [],
+        "🚀 Adapt Group": [],
+        "⚡️ VHQ": [],
+        "📱 TG-Ускоритель": [],
+        "📦 Прочие": [],
+    }
+
+    for tid, tlabel, t_days, t_type, s_days, s_months, total_cnt, active_cnt in rows:
+        days_val = s_days or t_days or 0
+        months_val = s_months or 0
+
+        if days_val > 0 or months_val > 0:
+            duration_str = format_subscription_duration(tariff_days=days_val, tariff_months=months_val)
         else:
-            name = duration_str or "Неизвестный тариф"
+            duration_str = ""
 
-        lines.append(f"  • <b>{name}</b>: <b>{total_cnt}</b> всего, <b>{active_cnt}</b> активных")
+        if duration_str == "N/A":
+            duration_str = ""
 
-    text = "🏆 <b>Топ тарифов</b>\n\n" + ("\n".join(lines) if lines else "Нет данных")
+        if tlabel:
+            if duration_str and duration_str not in tlabel:
+                title = f"{tlabel} ({duration_str})"
+            else:
+                title = tlabel
+        elif duration_str:
+            title = f"Тариф {duration_str}"
+        else:
+            title = f"Тариф #{tid}" if tid else "Стандартный доступ"
+
+        entry = f"  • <b>{title}</b>\n    └ Всего: <b>{total_cnt}</b> | Активных: <b>{active_cnt}</b>"
+
+        if t_type == TariffType.TG_PROXY:
+            categories["📱 TG-Ускоритель"].append(entry)
+        elif tlabel and "adapt" in tlabel.lower():
+            categories["🚀 Adapt Group"].append(entry)
+        elif tlabel and "vhq" in tlabel.lower():
+            categories["⚡️ VHQ"].append(entry)
+        elif t_type == TariffType.BOTH or t_type == TariffType.VPN:
+            categories["🌐 Основные тарифы"].append(entry)
+        else:
+            categories["📦 Прочие"].append(entry)
+
+    text_blocks = ["🏆 <b>Топ тарифов</b>\n"]
+    for cat_name, items in categories.items():
+        if items:
+            text_blocks.append(f"<b>{cat_name}</b>:\n" + "\n".join(items))
+
+    text = "\n\n".join(text_blocks)
 
     await callback.message.edit_text(text, reply_markup=stats_back_kb(), parse_mode="HTML")
     await callback.answer()
