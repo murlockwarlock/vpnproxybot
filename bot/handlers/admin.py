@@ -951,27 +951,35 @@ async def admin_stats_tariffs(callback: CallbackQuery) -> None:
         return
 
     async with async_session() as session:
-        # Count subscriptions by precise duration when available, with fallback to legacy months.
+        # Group subscriptions by tariff_id / Tariff label and duration
         result = await session.execute(
             select(
+                Subscription.tariff_id,
+                Tariff.label,
                 Subscription.tariff_days,
                 Subscription.tariff_months,
                 func.count(Subscription.id),
                 func.count(Subscription.id).filter(Subscription.status == SubStatus.ACTIVE),
             )
+            .outerjoin(Tariff, Subscription.tariff_id == Tariff.id)
             .where(Subscription.billing_mode != "demo")
-            .group_by(Subscription.tariff_days, Subscription.tariff_months)
+            .group_by(Subscription.tariff_id, Tariff.label, Subscription.tariff_days, Subscription.tariff_months)
             .order_by(func.count(Subscription.id).desc())
         )
         rows = result.all()
 
     lines = []
-    for days, months, total_cnt, active_cnt in rows:
-        label = format_subscription_duration(
+    for tid, tlabel, days, months, total_cnt, active_cnt in rows:
+        duration_str = format_subscription_duration(
             tariff_days=days,
             tariff_months=months,
         )
-        lines.append(f"  {label}: <b>{total_cnt}</b> всего, <b>{active_cnt}</b> активных")
+        if tlabel:
+            name = f"{tlabel}" if (duration_str in tlabel or not duration_str) else f"{tlabel} ({duration_str})"
+        else:
+            name = duration_str or "Неизвестный тариф"
+
+        lines.append(f"  • <b>{name}</b>: <b>{total_cnt}</b> всего, <b>{active_cnt}</b> активных")
 
     text = "🏆 <b>Топ тарифов</b>\n\n" + ("\n".join(lines) if lines else "Нет данных")
 
