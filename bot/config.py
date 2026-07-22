@@ -249,6 +249,9 @@ class Settings:
     adapt_demo_plan_uuid: str = field(
         default_factory=lambda: os.getenv("ADAPT_DEMO_PLAN_UUID", "00cce2fe-ee55-4c0d-8bfa-9e6e47cd99a4")
     )
+    adapt_min_balance: float = field(
+        default_factory=lambda: float(os.getenv("ADAPT_MIN_BALANCE", "10.0"))
+    )
 
     @property
     def mtproto_servers(self) -> list[dict]:

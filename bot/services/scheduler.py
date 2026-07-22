@@ -1692,7 +1692,7 @@ async def check_adapt_balance(bot) -> None:
         )
         return
 
-    if balance < 10.0:
+    if balance < settings.adapt_min_balance:
         await notify_admins_issue(
             bot,
             title="Низкий баланс Adapt",
