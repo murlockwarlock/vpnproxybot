@@ -250,7 +250,7 @@ class Settings:
         default_factory=lambda: os.getenv("ADAPT_DEMO_PLAN_UUID", "00cce2fe-ee55-4c0d-8bfa-9e6e47cd99a4")
     )
     adapt_min_balance: float = field(
-        default_factory=lambda: float(os.getenv("ADAPT_MIN_BALANCE", "10.0"))
+        default_factory=lambda: float(os.getenv("ADAPT_MIN_BALANCE", "5.0"))
     )
 
     @property
