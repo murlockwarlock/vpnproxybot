@@ -3350,14 +3350,13 @@ async def _notify_support_agents_message(ticket: SupportTicket, message_text: st
     agent_ids = await _get_all_target_agent_ids()
     if not agent_ids:
         return
-    pool = _support_ws_pool.get(ticket.token, {})
-    agents_online = [ws for ws in pool.get("agents", []) if not ws.closed]
-    if agents_online:
-        return  # Agents are watching, no need for TG notify
+    contact = ticket.client_contact or "—"
     text = (
         f"💬 <b>Новое сообщение в тикете</b>\n"
-        f"<code>{ticket.token[:12]}…</code>\n\n"
-        f"<i>{html.escape(message_text[:200])}</i>"
+        f"🎫 Тикет: <code>{ticket.token[:12]}…</code>\n"
+        f"📞 Контакт: {html.escape(contact)}\n\n"
+        f"💬 <i>{html.escape(message_text[:200])}</i>\n\n"
+        f"👉 {settings.subscription_base_url}/support/admin"
     )
     api_url = f"https://api.telegram.org/bot{settings.admin_bot_token}/sendMessage"
     try:
