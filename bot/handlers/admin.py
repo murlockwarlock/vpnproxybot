@@ -3859,15 +3859,38 @@ async def admin_web_client_query(message: Message, state: FSMContext) -> None:
 
     chunks = []
     for p in profiles[:3]:
+        orders = p.get("orders") or []
+        items = p.get("telegram_items") or []
+
         created_str = _fmt_dt_str_msk(p.get("created_at"))
+        if created_str == "—" and orders:
+            order_dts = [o.get("created_at") for o in orders if o.get("created_at")]
+            if order_dts:
+                created_str = _fmt_dt_str_msk(min(order_dts))
+
+        # Detect traffic source from orders
+        source_str = "—"
+        for o in orders:
+            ref = o.get("entry_referrer") or o.get("ref_source") or ""
+            url = o.get("entry_url") or ""
+            if "vk.ru" in ref or "vk.com" in ref or "vk" in url:
+                source_str = "ВКонтакте (VK)"
+                break
+            elif ref or url:
+                source_str = html.escape(ref or url)[:35]
+                break
+
+        total_paid_rub = sum(o.get("amount_rub") or 0 for o in orders if o.get("status") in ("delivered", "paid"))
 
         lines = [
             "🌐 <b>Клиент сайта</b>",
             f"Контакт: <code>{html.escape(str(p.get('contact') or '—'))}</code>",
             f"Профиль: <code>{html.escape(str(p.get('profile_token') or '—'))}</code>",
             f"Регистрация: <b>{created_str}</b>",
+            f"Источник: <b>{source_str}</b>",
             f"Пароль задан: {'да' if p.get('has_password') else 'нет'}",
             f"Баланс сайта: <b>{float(p.get('balance_rub') or 0):.2f} ₽</b>",
+            f"Оплачено всего: <b>{total_paid_rub} ₽</b>",
         ]
         tg = p.get("telegram")
         if tg:
@@ -3876,8 +3899,6 @@ async def admin_web_client_query(message: Message, state: FSMContext) -> None:
                 f"<code>{html.escape(str(tg.get('id') or ''))}</code> "
                 f"@{html.escape(str(tg.get('username') or ''))}"
             )
-        orders = p.get("orders") or []
-        items = p.get("telegram_items") or []
 
         delivered_orders = [o for o in orders if o.get("status") in ("delivered", "paid")]
         demo_orders = [o for o in orders if o.get("status") == "demo" or o.get("tariff_key") == "demo"]
