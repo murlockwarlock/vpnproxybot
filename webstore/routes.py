@@ -325,7 +325,9 @@ def _serialize_orders(orders: list[WebOrder]) -> list[dict[str, str | int | None
             "original_amount_rub": o.original_amount_rub or o.amount_rub,
             "bonus_applied_rub": o.bonus_applied_rub or 0,
             "status": o.status,
+            "provider": _get_order_provider(o),
             "subscription_url": _display_order_subscription_url(o),
+            "raw_subscription_url": o.subscription_url or "",
             "failure_message": o.failure_message if o.status == "failed" else None,
             "created_at": (o.created_at.isoformat() + "Z") if o.created_at else None,
             "paid_at": (o.paid_at.isoformat() + "Z") if o.paid_at else None,
@@ -3032,9 +3034,15 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
                 or (link.telegram_username if link else None)
                 or "—"
             )
+            created_dt = (
+                (account.created_at if account and account.created_at else None)
+                or (balance.created_at if balance and balance.created_at else None)
+                or (orders[-1].created_at if orders and orders[-1].created_at else None)
+            )
             profiles.append({
                 "profile_token": token,
                 "contact": contact,
+                "created_at": (created_dt.isoformat() + "Z") if created_dt else None,
                 "has_password": bool(account),
                 "balance_rub": float(balance.balance_rub or 0) if balance else 0.0,
                 "telegram": (

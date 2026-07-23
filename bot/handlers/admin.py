@@ -3846,10 +3846,20 @@ async def admin_web_client_query(message: Message, state: FSMContext) -> None:
 
     chunks = []
     for p in profiles[:3]:
+        created_str = "—"
+        if p.get("created_at"):
+            try:
+                raw_c = str(p["created_at"]).rstrip("Z")
+                dt = datetime.fromisoformat(raw_c)
+                created_str = _format_dt_msk(dt)
+            except Exception:
+                created_str = str(p["created_at"])[:16]
+
         lines = [
             "🌐 <b>Клиент сайта</b>",
             f"Контакт: <code>{html.escape(str(p.get('contact') or '—'))}</code>",
             f"Профиль: <code>{html.escape(str(p.get('profile_token') or '—'))}</code>",
+            f"Регистрация: <b>{created_str}</b>",
             f"Пароль задан: {'да' if p.get('has_password') else 'нет'}",
             f"Баланс сайта: <b>{float(p.get('balance_rub') or 0):.2f} ₽</b>",
         ]
@@ -3861,20 +3871,64 @@ async def admin_web_client_query(message: Message, state: FSMContext) -> None:
                 f"@{html.escape(str(tg.get('username') or ''))}"
             )
         orders = p.get("orders") or []
-        if orders:
-            lines.append("\n<b>Заказы</b>")
-            for o in orders[:8]:
-                status = o.get("status") or "?"
-                sub = o.get("subscription_url")
-                lines.append(
-                    f"{status} | <code>{html.escape(str(o.get('order_id') or ''))}</code> | "
-                    f"{html.escape(str(o.get('tariff_label') or ''))} | {o.get('amount_rub') or 0} ₽"
-                )
-                if sub:
-                    lines.append(await _format_external_key_block(str(sub), label="Ссылка"))
-                if o.get("failure_message"):
-                    lines.append(f"Ошибка: {html.escape(str(o.get('failure_message')))}")
         items = p.get("telegram_items") or []
+
+        delivered_orders = [o for o in orders if o.get("status") in ("delivered", "paid")]
+        demo_orders = [o for o in orders if o.get("status") == "demo" or o.get("tariff_key") == "demo"]
+        pending_orders = [o for o in orders if o.get("status") == "pending"]
+        failed_orders = [o for o in orders if o.get("status") == "failed"]
+
+        if delivered_orders:
+            lines.append("\n🟢 <b>Оплаченные подписки и ключи</b>")
+            for o in delivered_orders:
+                sub = o.get("subscription_url") or o.get("raw_subscription_url")
+                prov = str(o.get("provider") or "vpn").upper()
+                exp = str(o.get("access_expires_at") or "—")
+                lines.append(
+                    f"✅ <code>{html.escape(str(o.get('order_id') or ''))}</code> | "
+                    f"{html.escape(str(o.get('tariff_label') or ''))} | {o.get('amount_rub') or 0} ₽ | <b>{prov}</b>"
+                )
+                if exp and exp != "—":
+                    lines.append(f"└ Доступ до: <code>{html.escape(exp[:16])}</code>")
+                if sub:
+                    lines.append(await _format_external_key_block(str(sub), label=f"Ссылка ({prov})"))
+
+        if demo_orders:
+            lines.append("\n🎁 <b>Выданные демо-ключи</b>")
+            for o in demo_orders:
+                sub = o.get("subscription_url") or o.get("raw_subscription_url")
+                prov = str(o.get("provider") or "vpn").upper()
+                created = str(o.get("created_at") or "—")
+                exp = str(o.get("access_expires_at") or "—")
+                lines.append(
+                    f"🎁 <code>{html.escape(str(o.get('order_id') or ''))}</code> | "
+                    f"Провайдер: <b>{prov}</b> | Создан: {html.escape(created[:16])}"
+                )
+                if exp and exp != "—":
+                    lines.append(f"└ Срок до: <code>{html.escape(exp[:16])}</code>")
+                if sub:
+                    lines.append(await _format_external_key_block(str(sub), label=f"Ссылка демо ({prov})"))
+
+        if failed_orders:
+            lines.append("\n⚠️ <b>Ошибки выдачи</b>")
+            for o in failed_orders[:3]:
+                lines.append(
+                    f"⚠️ <code>{html.escape(str(o.get('order_id') or ''))}</code> | {html.escape(str(o.get('failure_message') or 'Ошибка'))}"
+                )
+
+        if pending_orders:
+            lines.append(f"\n⏳ <b>Неоплаченные попытки:</b> {len(pending_orders)} шт. (счета созданы, карта не введена)")
+            for o in pending_orders[:3]:
+                created = str(o.get("created_at") or "—")
+                lines.append(
+                    f"• <code>{html.escape(str(o.get('order_id') or ''))}</code> | {html.escape(str(o.get('tariff_label') or ''))} ({o.get('amount_rub')} ₽) | {html.escape(created[:16])}"
+                )
+            if len(pending_orders) > 3:
+                lines.append(f"<i>...и ещё {len(pending_orders) - 3} неоплаченных попыток</i>")
+
+        if not orders and not items:
+            lines.append("\n<i>Заказов и ключей нет</i>")
+
         if items:
             lines.append("\n<b>Ключи из Telegram-профиля</b>")
             for item in items[:5]:
