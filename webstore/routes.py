@@ -3024,8 +3024,16 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
         profiles = []
         for token in sorted(tokens):
             orders, link, telegram_items = await _get_profile_bundle(session, token)
-            account = await session.scalar(select(WebAccount).where(WebAccount.profile_token == token).limit(1))
-            balance = await session.get(WebBalanceAccount, token)
+            account = await session.scalar(
+                select(WebAccount).where(
+                    or_(WebAccount.profile_token == token, WebAccount.contact == token)
+                ).limit(1)
+            )
+            balance = await session.scalar(
+                select(WebBalanceAccount).where(
+                    or_(WebBalanceAccount.profile_token == token, WebBalanceAccount.contact == token)
+                ).limit(1)
+            )
             contact = (
                 (account.contact if account else None)
                 or (balance.contact if balance else None)
