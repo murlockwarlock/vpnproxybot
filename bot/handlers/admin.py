@@ -3836,7 +3836,7 @@ async def admin_web_clients_list(callback: CallbackQuery) -> None:
             f"├ Баланс: <b>{bal:.2f} ₽</b> | Оплат: <b>{paid_sum} ₽</b> ({paid_count} шт.)\n"
             f"└ Профиль: <code>{token}</code>"
         )
-        kb.row(InlineKeyboardButton(text=f"🔍 Карточка #{idx}: {contact[:20]}", callback_data=f"adm_wb_prof_q:{short_token}"))
+        kb.row(InlineKeyboardButton(text=f"🔍 Карточка #{idx}: {contact[:20]}", callback_data=f"adm_wb_prof_q:{token}"))
 
     divider = "\n━━━━━━━━━━━━━━━━━━━━\n"
     text = (

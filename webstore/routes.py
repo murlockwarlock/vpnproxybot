@@ -3000,6 +3000,7 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
                     WebOrder.contact == query,
                     WebOrder.email == query,
                     WebOrder.profile_token == query,
+                    WebOrder.profile_token.like(f"{query}%"),
                 )
             )
         )
@@ -3008,7 +3009,11 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
 
         accounts_result = await session.execute(
             select(WebAccount).where(
-                or_(WebAccount.contact == query, WebAccount.profile_token == query)
+                or_(
+                    WebAccount.contact == query,
+                    WebAccount.profile_token == query,
+                    WebAccount.profile_token.like(f"{query}%"),
+                )
             )
         )
         accounts = accounts_result.scalars().all()
@@ -3016,7 +3021,11 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
 
         balances_result = await session.execute(
             select(WebBalanceAccount).where(
-                or_(WebBalanceAccount.contact == query, WebBalanceAccount.profile_token == query)
+                or_(
+                    WebBalanceAccount.contact == query,
+                    WebBalanceAccount.profile_token == query,
+                    WebBalanceAccount.profile_token.like(f"{query}%"),
+                )
             )
         )
         balances = balances_result.scalars().all()
