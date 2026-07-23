@@ -355,10 +355,14 @@ def _get_order_provider(order: WebOrder) -> str:
     tariff = get_store_tariffs_by_key().get(order.tariff_key)
     if tariff and tariff.get("provider"):
         return str(tariff["provider"])
-    if order.marzban_username:
-        return "marzban"
-    if order.subscription_url and ("/proxy-subscription/" in order.subscription_url or "vhq-connect.xyz" in order.subscription_url):
+    sub_url = str(order.subscription_url or "")
+    m_user = str(order.marzban_username or "")
+    if m_user.startswith("adapt_") or "/adapt-sub/" in sub_url or "adaptgroup" in sub_url:
+        return "adapt"
+    if "/proxy-subscription/" in sub_url or "vhq-connect" in sub_url or "/vhq-sub/" in sub_url:
         return "vhq"
+    if m_user:
+        return "marzban"
     return ""
 
 
