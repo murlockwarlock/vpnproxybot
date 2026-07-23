@@ -3298,9 +3298,28 @@ def _verify_tg_login(data: dict, bot_token: str) -> bool:
     return computed == check_hash
 
 
+async def _get_all_target_agent_ids() -> set[int]:
+    agent_ids = set(settings.support_agent_ids)
+    agent_ids.update(settings.admin_ids)
+    try:
+        from bot.models import User
+        from bot.database import async_session as bot_async_session
+        async with bot_async_session() as bot_sess:
+            db_adm = await bot_sess.execute(select(User.telegram_id).where(User.is_admin == True))
+            for uid in db_adm.scalars().all():
+                if uid:
+                    agent_ids.add(int(uid))
+    except Exception as e:
+        logger.warning("Failed to fetch bot DB admins for support notify: %s", e)
+    return agent_ids
+
+
 async def _notify_support_agents(ticket: SupportTicket, first_message: str) -> None:
     """Send Telegram notification to support agents about a new ticket."""
-    if not settings.admin_bot_token or not settings.support_agent_ids:
+    if not settings.admin_bot_token:
+        return
+    agent_ids = await _get_all_target_agent_ids()
+    if not agent_ids:
         return
     contact = ticket.client_contact or "—"
     messenger = ticket.client_messenger or "—"
@@ -3315,7 +3334,7 @@ async def _notify_support_agents(ticket: SupportTicket, first_message: str) -> N
     api_url = f"https://api.telegram.org/bot{settings.admin_bot_token}/sendMessage"
     try:
         async with aiohttp.ClientSession() as http:
-            for agent_id in settings.support_agent_ids:
+            for agent_id in agent_ids:
                 try:
                     await http.post(api_url, json={"chat_id": agent_id, "text": text, "parse_mode": "HTML"})
                 except Exception:
@@ -3326,7 +3345,10 @@ async def _notify_support_agents(ticket: SupportTicket, first_message: str) -> N
 
 async def _notify_support_agents_message(ticket: SupportTicket, message_text: str) -> None:
     """Notify agents about a new client message in an existing ticket."""
-    if not settings.admin_bot_token or not settings.support_agent_ids:
+    if not settings.admin_bot_token:
+        return
+    agent_ids = await _get_all_target_agent_ids()
+    if not agent_ids:
         return
     pool = _support_ws_pool.get(ticket.token, {})
     agents_online = [ws for ws in pool.get("agents", []) if not ws.closed]
@@ -3340,7 +3362,7 @@ async def _notify_support_agents_message(ticket: SupportTicket, message_text: st
     api_url = f"https://api.telegram.org/bot{settings.admin_bot_token}/sendMessage"
     try:
         async with aiohttp.ClientSession() as http:
-            for agent_id in settings.support_agent_ids:
+            for agent_id in agent_ids:
                 try:
                     await http.post(api_url, json={"chat_id": agent_id, "text": text, "parse_mode": "HTML"})
                 except Exception:
