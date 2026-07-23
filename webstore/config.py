@@ -186,7 +186,7 @@ class WebStoreSettings:
         default_factory=lambda: os.getenv("DEMO_KEY_ENABLED", "1") == "1"
     )
     demo_key_days: int = field(
-        default_factory=lambda: int(os.getenv("DEMO_KEY_DAYS", "3"))
+        default_factory=lambda: int(os.getenv("DEMO_KEY_DAYS", "7"))
     )
     extra_device_price_rub: int = field(
         default_factory=lambda: int(os.getenv("EXTRA_DEVICE_PRICE_RUB", "50"))
