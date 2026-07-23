@@ -13,13 +13,26 @@ logger = logging.getLogger(__name__)
 
 
 async def _send_admin_text(bot: Bot, text: str) -> None:
-    if not settings.admin_ids:
-        logger.warning("No ADMIN_IDS configured for admin notification")
+    admin_ids = set(settings.admin_ids)
+    try:
+        from sqlalchemy import select
+        from bot.database import async_session
+        from bot.models import User
+        async with async_session() as db_sess:
+            res = await db_sess.execute(select(User.telegram_id).where(User.is_admin == True))
+            for db_adm_id in res.scalars().all():
+                if db_adm_id:
+                    admin_ids.add(int(db_adm_id))
+    except Exception as e:
+        logger.warning(f"Failed to fetch DB admins: {e}")
+
+    if not admin_ids:
+        logger.warning("No admin IDs configured for admin notification")
         return
 
     sent = 0
     failed = 0
-    for admin_id in settings.admin_ids:
+    for admin_id in admin_ids:
         try:
             await bot.send_message(admin_id, text, parse_mode="HTML")
             sent += 1

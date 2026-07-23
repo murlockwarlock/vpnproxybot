@@ -753,7 +753,18 @@ async def feedback_receive(message: Message, state: FSMContext) -> None:
         f"{'─' * 20}"
     )
 
-    for admin_id in settings.admin_ids:
+    # Collect all admin IDs from env settings AND database
+    admin_ids_to_notify = set(settings.admin_ids)
+    try:
+        async with async_session() as db_sess:
+            db_adm_res = await db_sess.execute(select(User.telegram_id).where(User.is_admin == True))
+            for db_adm_id in db_adm_res.scalars().all():
+                if db_adm_id:
+                    admin_ids_to_notify.add(int(db_adm_id))
+    except Exception as e:
+        logger.warning("Error fetching DB admins for feedback: %s", e)
+
+    for admin_id in admin_ids_to_notify:
         try:
             if media_file_id and media_type:
                 caption = f"{header}\n\n{text}" if text else header
