@@ -3702,14 +3702,25 @@ def _build_web_orders_log_page(orders: list[dict], page: int) -> tuple[str, Inli
         "failed": "⚠️ ошибка выдачи",
         "demo": "🎁 демо",
     }
-    page_size = 1
+    page_size = 5
     total_pages = max(1, (len(orders) + page_size - 1) // page_size)
     current_page = ((page - 1) % total_pages) + 1
     start = (current_page - 1) * page_size
     page_orders = orders[start:start + page_size]
 
+    def _res_prov(o: dict) -> str:
+        pr = str(o.get("provider") or "").lower()
+        if pr in ("adapt", "marzban", "vhq"):
+            return pr.upper()
+        sub = str(o.get("subscription_url") or o.get("raw_subscription_url") or "").lower()
+        if "adapt" in sub:
+            return "ADAPT"
+        if "vhq" in sub or "proxy-subscription" in sub:
+            return "VHQ"
+        return "MARZBAN"
+
     blocks: list[str] = []
-    for o in page_orders:
+    for idx, o in enumerate(page_orders, start=start + 1):
         order_id = str(o.get("order_id") or "—")
         status = str(o.get("status") or "unknown")
         contact = o.get("contact") or o.get("email") or "контакт не указан"
@@ -3722,25 +3733,26 @@ def _build_web_orders_log_page(orders: list[dict], page: int) -> tuple[str, Inli
         tariff = o.get("tariff_label") or o.get("tariff_key") or "тариф не указан"
         if o.get("days"):
             tariff = f"{tariff}, {o.get('days')} дн."
-        provider = o.get("provider") or "provider не указан"
+        prov = _res_prov(o)
+        created_msk = _fmt_dt_str_msk(o.get("created_at"))
 
         lines = [
-            f"{html.escape(status_labels.get(status, status))} | {html.escape(str(o.get('created_at') or 'дата неизвестна'))}",
-            f"Заказ: {html.escape(order_id)}",
-            f"Клиент: {html.escape(str(contact))}",
-            f"Профиль: {html.escape(profile_short or '—')}",
+            f"<b>#{idx}</b> | {html.escape(status_labels.get(status, status))} | {html.escape(created_msk)}",
+            f"Заказ: <code>{html.escape(order_id)}</code>",
+            f"Клиент: <code>{html.escape(str(contact))}</code>",
+            f"Профиль: <code>{html.escape(profile_short or '—')}</code>",
             f"Тариф: {html.escape(str(tariff))}",
             f"Сумма: {html.escape(str(price))}",
-            f"Провайдер: {html.escape(str(provider))}",
+            f"Провайдер: <b>{prov}</b>",
         ]
         if o.get("paid_at"):
-            lines.append(f"Оплачен: {html.escape(str(o.get('paid_at')))}")
+            lines.append(f"Оплачен: {html.escape(_fmt_dt_str_msk(o.get('paid_at')))}")
         if o.get("delivered_at"):
-            lines.append(f"Выдан: {html.escape(str(o.get('delivered_at')))}")
+            lines.append(f"Выдан: {html.escape(_fmt_dt_str_msk(o.get('delivered_at')))}")
         if o.get("access_expires_at"):
-            lines.append(f"Доступ до: {html.escape(str(o.get('access_expires_at')))}")
+            lines.append(f"Доступ до: {html.escape(_fmt_dt_str_msk(o.get('access_expires_at')))}")
         if o.get("yookassa_payment_id"):
-            lines.append(f"Платёж: {html.escape(str(o.get('yookassa_payment_id')))}")
+            lines.append(f"Платёж: <code>{html.escape(str(o.get('yookassa_payment_id')))}</code>")
         if o.get("subscription_url"):
             url = str(o.get("subscription_url"))
             lines.append(_format_vhq_mirror_key_block(url))
@@ -3748,16 +3760,17 @@ def _build_web_orders_log_page(orders: list[dict], page: int) -> tuple[str, Inli
             lines.append(f"Ошибка: {html.escape(str(o.get('failure_message')))}")
         blocks.append("\n".join(lines))
 
-    text = f"📋 Заказы сайта\nСтраница {current_page}/{total_pages}\n\n" + "\n\n".join(blocks)
+    divider = "\n━━━━━━━━━━━━━━━━━━━━\n"
+    text = f"📋 <b>Логи заказов сайта</b> ({len(orders)} всего)\nСтраница <b>{current_page}/{total_pages}</b>\n\n" + divider.join(blocks)
     kb = InlineKeyboardBuilder()
     prev_page = total_pages if current_page == 1 else current_page - 1
     next_page = 1 if current_page == total_pages else current_page + 1
     kb.row(
-        InlineKeyboardButton(text="пред", callback_data=f"adm_web_orders_log_{prev_page}"),
-        InlineKeyboardButton(text=f"{current_page}/{total_pages}", callback_data="ignore"),
-        InlineKeyboardButton(text="след", callback_data=f"adm_web_orders_log_{next_page}"),
+        InlineKeyboardButton(text="◀️ Назад", callback_data=f"adm_web_orders_log_{prev_page}"),
+        InlineKeyboardButton(text=f"Стр. {current_page}/{total_pages}", callback_data="ignore"),
+        InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"adm_web_orders_log_{next_page}"),
     )
-    kb.row(InlineKeyboardButton(text="◀️ Назад", callback_data="adm_stats_web"))
+    kb.row(InlineKeyboardButton(text="◀️ К статистике", callback_data="adm_stats_web"))
     return text, kb
 
 
