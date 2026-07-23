@@ -3836,7 +3836,7 @@ async def admin_web_clients_list(callback: CallbackQuery) -> None:
             f"├ Баланс: <b>{bal:.2f} ₽</b> | Оплат: <b>{paid_sum} ₽</b> ({paid_count} шт.)\n"
             f"└ Профиль: <code>{token}</code>"
         )
-        kb.row(InlineKeyboardButton(text=f"🔍 Карточка #{idx}: {contact[:20]}", callback_data=f"adm_wb_prof_q:{token}"))
+        kb.row(InlineKeyboardButton(text=f"🔍 Карточка #{idx}: {contact[:20]}", callback_data=f"adm_wb_prof_q:{token}:{current_page}"))
 
     divider = "\n━━━━━━━━━━━━━━━━━━━━\n"
     text = (
@@ -3866,7 +3866,11 @@ async def admin_web_clients_list(callback: CallbackQuery) -> None:
 async def admin_web_client_quick_lookup(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         return
-    query = callback.data.split(":", 1)[1].strip()
+    raw = callback.data.split(":", 1)[1].strip()
+    if ":" in raw:
+        query, from_page = raw.split(":", 1)
+    else:
+        query, from_page = raw, "1"
 
     import aiohttp as _aiohttp
     url = f"{settings.webstore_api_base_url.rstrip('/')}/api/store/internal/admin-client-lookup?q={query}"
@@ -4018,7 +4022,7 @@ async def admin_web_client_quick_lookup(callback: CallbackQuery) -> None:
         lines.append("\n<i>Заказов и ключей нет</i>")
 
     back_kb = InlineKeyboardBuilder()
-    back_kb.row(InlineKeyboardButton(text="👥 К списку клиентов", callback_data="adm_web_clients_list"))
+    back_kb.row(InlineKeyboardButton(text="👥 К списку клиентов", callback_data=f"adm_web_clients_list_{from_page}"))
     back_kb.row(InlineKeyboardButton(text="◀️ Меню сайта", callback_data="adm_stats_web"))
 
     text = "\n".join(lines)
