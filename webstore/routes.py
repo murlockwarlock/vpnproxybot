@@ -3058,12 +3058,40 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
                         if earliest_dt is None or o.created_at < earliest_dt:
                             earliest_dt = o.created_at
 
+            referrer_tg_id = None
+            traffic_source = None
+            for o in orders:
+                if not referrer_tg_id and o.referrer_telegram_id:
+                    referrer_tg_id = o.referrer_telegram_id
+                if not traffic_source:
+                    ref = str(o.entry_referrer or o.ref_source or "").strip()
+                    url = str(o.entry_url or "").strip()
+                    if "vk.ru" in ref or "vk.com" in ref or "vk" in url:
+                        traffic_source = "ВКонтакте (VK)"
+                    elif ref:
+                        traffic_source = ref
+                    elif url:
+                        traffic_source = url
+
+            ref_code = _make_web_ref_code(token)
+            ref_orders_count = await session.scalar(
+                select(func.count(WebOrder.id)).where(
+                    or_(
+                        WebOrder.referrer_telegram_id == (link.telegram_id if link else -1),
+                        WebOrder.ref_source == ref_code,
+                    )
+                )
+            ) or 0
+
             profiles.append({
                 "profile_token": token,
                 "contact": contact,
                 "created_at": (earliest_dt.isoformat() + "Z") if earliest_dt else None,
                 "has_password": bool(account),
                 "balance_rub": float(balance.balance_rub or 0) if balance else 0.0,
+                "referrer_telegram_id": referrer_tg_id,
+                "traffic_source": traffic_source or "—",
+                "referrals_count": ref_orders_count,
                 "telegram": (
                     {
                         "id": str(link.telegram_id),

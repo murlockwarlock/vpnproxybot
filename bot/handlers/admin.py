@@ -3895,12 +3895,34 @@ async def admin_web_client_query(message: Message, state: FSMContext) -> None:
 
         total_paid_rub = sum(o.get("amount_rub") or 0 for o in orders if o.get("status") in ("delivered", "paid"))
 
+        ref_id = p.get("referrer_telegram_id")
+        referrer_str = "Нет (прямой заход)"
+        if ref_id:
+            try:
+                async with async_session() as bot_sess:
+                    partner = await bot_sess.scalar(select(Partner).where(Partner.telegram_id == int(ref_id)))
+                    if partner:
+                        referrer_str = f"{html.escape(partner.name)} [{ref_id}]"
+                    else:
+                        inviter = await bot_sess.scalar(select(User).where(User.telegram_id == int(ref_id)))
+                        if inviter:
+                            u_name = f"@{inviter.username}" if inviter.username else (inviter.first_name or "Пользователь")
+                            referrer_str = f"{html.escape(u_name)} [{ref_id}]"
+                        else:
+                            referrer_str = f"ID: {ref_id}"
+            except Exception:
+                referrer_str = f"ID: {ref_id}"
+
+        refs_count = p.get("referrals_count") or 0
+
         lines = [
             "🌐 <b>Клиент сайта</b>",
             f"Контакт: <code>{html.escape(str(p.get('contact') or '—'))}</code>",
             f"Профиль: <code>{html.escape(str(p.get('profile_token') or '—'))}</code>",
             f"Регистрация: <b>{created_str}</b>",
             f"Источник: <b>{source_str}</b>",
+            f"Приглашён кем: <b>{referrer_str}</b>",
+            f"Рефералов приведено: <b>{refs_count} чел.</b>",
             f"Пароль задан: {'да' if p.get('has_password') else 'нет'}",
             f"Баланс сайта: <b>{float(p.get('balance_rub') or 0):.2f} ₽</b>",
             f"Оплачено всего: <b>{total_paid_rub} ₽</b>",
