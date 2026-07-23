@@ -138,8 +138,21 @@ def _format_dt_msk(dt: datetime | None, include_time: bool = True) -> str:
     msk = timezone(timedelta(hours=3))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    fmt = "%d.%m.%Y %H:%M" if include_time else "%d.%m.%Y"
+    fmt = "%d-%m-%Y %H:%M МСК" if include_time else "%d-%m-%Y"
     return dt.astimezone(msk).strftime(fmt)
+
+
+def _fmt_dt_str_msk(raw: Any) -> str:
+    if not raw or str(raw) in ("—", "None", ""):
+        return "—"
+    if isinstance(raw, datetime):
+        return _format_dt_msk(raw)
+    raw_str = str(raw).rstrip("Z")
+    try:
+        dt = datetime.fromisoformat(raw_str)
+        return _format_dt_msk(dt)
+    except Exception:
+        return str(raw)[:16]
 
 
 def _code(value: object) -> str:
@@ -3846,14 +3859,7 @@ async def admin_web_client_query(message: Message, state: FSMContext) -> None:
 
     chunks = []
     for p in profiles[:3]:
-        created_str = "—"
-        if p.get("created_at"):
-            try:
-                raw_c = str(p["created_at"]).rstrip("Z")
-                dt = datetime.fromisoformat(raw_c)
-                created_str = _format_dt_msk(dt)
-            except Exception:
-                created_str = str(p["created_at"])[:16]
+        created_str = _fmt_dt_str_msk(p.get("created_at"))
 
         lines = [
             "🌐 <b>Клиент сайта</b>",
@@ -3878,18 +3884,29 @@ async def admin_web_client_query(message: Message, state: FSMContext) -> None:
         pending_orders = [o for o in orders if o.get("status") == "pending"]
         failed_orders = [o for o in orders if o.get("status") == "failed"]
 
+        def _resolve_prov_name(o: dict) -> str:
+            pr = str(o.get("provider") or "").lower()
+            if pr in ("adapt", "marzban", "vhq"):
+                return pr.upper()
+            sub = str(o.get("subscription_url") or o.get("raw_subscription_url") or "").lower()
+            if "adapt" in sub:
+                return "ADAPT"
+            if "vhq" in sub or "proxy-subscription" in sub:
+                return "VHQ"
+            return "MARZBAN"
+
         if delivered_orders:
             lines.append("\n🟢 <b>Оплаченные подписки и ключи</b>")
             for o in delivered_orders:
                 sub = o.get("subscription_url") or o.get("raw_subscription_url")
-                prov = str(o.get("provider") or "vpn").upper()
-                exp = str(o.get("access_expires_at") or "—")
+                prov = _resolve_prov_name(o)
+                exp = _fmt_dt_str_msk(o.get("access_expires_at"))
                 lines.append(
                     f"✅ <code>{html.escape(str(o.get('order_id') or ''))}</code> | "
                     f"{html.escape(str(o.get('tariff_label') or ''))} | {o.get('amount_rub') or 0} ₽ | <b>{prov}</b>"
                 )
-                if exp and exp != "—":
-                    lines.append(f"└ Доступ до: <code>{html.escape(exp[:16])}</code>")
+                if exp != "—":
+                    lines.append(f"└ Доступ до: <code>{html.escape(exp)}</code>")
                 if sub:
                     lines.append(await _format_external_key_block(str(sub), label=f"Ссылка ({prov})"))
 
@@ -3897,15 +3914,15 @@ async def admin_web_client_query(message: Message, state: FSMContext) -> None:
             lines.append("\n🎁 <b>Выданные демо-ключи</b>")
             for o in demo_orders:
                 sub = o.get("subscription_url") or o.get("raw_subscription_url")
-                prov = str(o.get("provider") or "vpn").upper()
-                created = str(o.get("created_at") or "—")
-                exp = str(o.get("access_expires_at") or "—")
+                prov = _resolve_prov_name(o)
+                created = _fmt_dt_str_msk(o.get("created_at"))
+                exp = _fmt_dt_str_msk(o.get("access_expires_at"))
                 lines.append(
                     f"🎁 <code>{html.escape(str(o.get('order_id') or ''))}</code> | "
-                    f"Провайдер: <b>{prov}</b> | Создан: {html.escape(created[:16])}"
+                    f"Провайдер: <b>{prov}</b> | Создан: {html.escape(created)}"
                 )
-                if exp and exp != "—":
-                    lines.append(f"└ Срок до: <code>{html.escape(exp[:16])}</code>")
+                if exp != "—":
+                    lines.append(f"└ Срок до: <code>{html.escape(exp)}</code>")
                 if sub:
                     lines.append(await _format_external_key_block(str(sub), label=f"Ссылка демо ({prov})"))
 
@@ -3919,9 +3936,9 @@ async def admin_web_client_query(message: Message, state: FSMContext) -> None:
         if pending_orders:
             lines.append(f"\n⏳ <b>Неоплаченные попытки:</b> {len(pending_orders)} шт. (счета созданы, карта не введена)")
             for o in pending_orders[:3]:
-                created = str(o.get("created_at") or "—")
+                created = _fmt_dt_str_msk(o.get("created_at"))
                 lines.append(
-                    f"• <code>{html.escape(str(o.get('order_id') or ''))}</code> | {html.escape(str(o.get('tariff_label') or ''))} ({o.get('amount_rub')} ₽) | {html.escape(created[:16])}"
+                    f"• <code>{html.escape(str(o.get('order_id') or ''))}</code> | {html.escape(str(o.get('tariff_label') or ''))} ({o.get('amount_rub')} ₽) | {html.escape(created)}"
                 )
             if len(pending_orders) > 3:
                 lines.append(f"<i>...и ещё {len(pending_orders) - 3} неоплаченных попыток</i>")

@@ -3034,15 +3034,22 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
                 or (link.telegram_username if link else None)
                 or "—"
             )
-            created_dt = (
-                (account.created_at if account and account.created_at else None)
-                or (balance.created_at if balance and balance.created_at else None)
-                or (orders[-1].created_at if orders and orders[-1].created_at else None)
-            )
+            earliest_dt = None
+            if account and account.created_at:
+                earliest_dt = account.created_at
+            if balance and balance.created_at:
+                if earliest_dt is None or balance.created_at < earliest_dt:
+                    earliest_dt = balance.created_at
+            if orders:
+                for o in orders:
+                    if o.created_at:
+                        if earliest_dt is None or o.created_at < earliest_dt:
+                            earliest_dt = o.created_at
+
             profiles.append({
                 "profile_token": token,
                 "contact": contact,
-                "created_at": (created_dt.isoformat() + "Z") if created_dt else None,
+                "created_at": (earliest_dt.isoformat() + "Z") if earliest_dt else None,
                 "has_password": bool(account),
                 "balance_rub": float(balance.balance_rub or 0) if balance else 0.0,
                 "telegram": (
