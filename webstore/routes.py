@@ -2900,7 +2900,7 @@ async def handle_internal_admin_stats(request: web.Request) -> web.Response:
 
         from sqlalchemy import desc as _desc
         orders_result = await session.execute(
-            select(WebOrder).order_by(_desc(WebOrder.created_at)).limit(20)
+            select(WebOrder).order_by(_desc(WebOrder.created_at)).limit(200)
         )
         recent_orders = [
             {
