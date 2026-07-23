@@ -3107,6 +3107,89 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
     return web.json_response({"profiles": profiles})
 
 
+async def handle_internal_admin_clients_list(request: web.Request) -> web.Response:
+    if not _verify_internal_secret(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    try:
+        page = max(1, int(request.query.get("page", "1")))
+    except ValueError:
+        page = 1
+    limit = 10
+    offset = (page - 1) * limit
+
+    async with async_session() as session:
+        total_accounts = await session.scalar(select(func.count(WebAccount.id))) or 0
+        if total_accounts == 0:
+            total_accounts = await session.scalar(select(func.count(WebBalanceAccount.profile_token))) or 0
+
+        accounts_res = await session.execute(
+            select(WebAccount).order_by(WebAccount.created_at.desc()).offset(offset).limit(limit)
+        )
+        accounts = accounts_res.scalars().all()
+
+        client_list = []
+        for acc in accounts:
+            token = acc.profile_token
+            orders, link, items = await _get_profile_bundle(session, token)
+            bal = await session.get(WebBalanceAccount, token)
+            paid_sum = sum(o.amount_rub for o in orders if o.status in ("delivered", "paid"))
+            paid_count = sum(1 for o in orders if o.status in ("delivered", "paid"))
+            pending_count = sum(1 for o in orders if o.status == "pending")
+            demo_count = sum(1 for o in orders if o.status == "demo" or o.tariff_key == "demo")
+
+            referrer_tg_id = None
+            traffic_source = None
+            for o in orders:
+                if not referrer_tg_id and o.referrer_telegram_id:
+                    referrer_tg_id = o.referrer_telegram_id
+                if not traffic_source:
+                    ref = str(o.entry_referrer or o.ref_source or "").strip()
+                    url = str(o.entry_url or "").strip()
+                    if "vk.ru" in ref or "vk.com" in ref or "vk" in url:
+                        traffic_source = "ВКонтакте (VK)"
+                    elif ref:
+                        traffic_source = ref
+                    elif url:
+                        traffic_source = url
+
+            earliest_dt = acc.created_at
+            if orders:
+                order_dts = [o.created_at for o in orders if o.created_at]
+                if order_dts:
+                    min_o = min(order_dts)
+                    if earliest_dt is None or min_o < earliest_dt:
+                        earliest_dt = min_o
+
+            client_list.append({
+                "profile_token": token,
+                "contact": acc.contact or "—",
+                "created_at": (earliest_dt.isoformat() + "Z") if earliest_dt else None,
+                "balance_rub": float(bal.balance_rub or 0) if bal else 0.0,
+                "paid_sum": paid_sum,
+                "paid_count": paid_count,
+                "pending_count": pending_count,
+                "demo_count": demo_count,
+                "traffic_source": traffic_source or "—",
+                "referrer_telegram_id": referrer_tg_id,
+                "telegram": (
+                    {
+                        "id": str(link.telegram_id),
+                        "username": link.telegram_username,
+                        "full_name": link.telegram_full_name,
+                    }
+                    if link else None
+                ),
+            })
+
+    return web.json_response({
+        "page": page,
+        "limit": limit,
+        "total": total_accounts,
+        "clients": client_list,
+    })
+
+
 async def handle_internal_admin_balance_adjust(request: web.Request) -> web.Response:
     if not _verify_internal_secret(request):
         return web.json_response({"error": "Forbidden"}, status=403)
@@ -3711,6 +3794,7 @@ def setup_routes(app: web.Application) -> None:
     app.router.add_get("/api/store/internal/web-profile", handle_internal_web_profile)
     app.router.add_get("/api/store/internal/admin-stats", handle_internal_admin_stats)
     app.router.add_get("/api/store/internal/admin-client-lookup", handle_internal_admin_client_lookup)
+    app.router.add_get("/api/store/internal/admin-clients-list", handle_internal_admin_clients_list)
     app.router.add_get("/api/store/internal/admin-balance-lookup", handle_internal_admin_balance_lookup)
     app.router.add_post("/api/store/internal/admin-balance-adjust", handle_internal_admin_balance_adjust)
 

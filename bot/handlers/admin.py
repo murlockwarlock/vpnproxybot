@@ -3681,7 +3681,8 @@ async def admin_stats_web(callback: CallbackQuery) -> None:
     )
 
     back_kb = InlineKeyboardBuilder()
-    back_kb.row(InlineKeyboardButton(text="🔎 Клиент сайта", callback_data="adm_web_client_search"))
+    back_kb.row(InlineKeyboardButton(text="👥 Список клиентов сайта", callback_data="adm_web_clients_list"))
+    back_kb.row(InlineKeyboardButton(text="🔎 Найти клиента", callback_data="adm_web_client_search"))
     back_kb.row(InlineKeyboardButton(text="📋 Логи заказов", callback_data="adm_web_orders_log"))
     back_kb.row(InlineKeyboardButton(text="💳 Балансы", callback_data="adm_web_balance_search"))
     back_kb.row(InlineKeyboardButton(text="◀️ К статистике", callback_data="adm_stats"))
@@ -3772,6 +3773,260 @@ def _build_web_orders_log_page(orders: list[dict], page: int) -> tuple[str, Inli
     )
     kb.row(InlineKeyboardButton(text="◀️ К статистике", callback_data="adm_stats_web"))
     return text, kb
+
+
+@router.callback_query(F.data.regexp(r"^adm_web_clients_list(?:_\d+)?$"))
+async def admin_web_clients_list(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    if not settings.webstore_public_enabled:
+        await callback.answer("Вебстор не подключён", show_alert=True)
+        return
+
+    page = 1
+    parts = callback.data.rsplit("_", 1)
+    if len(parts) == 2 and parts[-1].isdigit():
+        page = max(1, int(parts[-1]))
+
+    import aiohttp as _aiohttp
+    url = f"{settings.webstore_api_base_url.rstrip('/')}/api/store/internal/admin-clients-list?page={page}"
+    headers = {"X-Internal-Secret": settings.webstore_bridge_secret}
+    try:
+        async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=10)) as sess:
+            async with sess.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    await callback.answer(f"Ошибка: {resp.status}", show_alert=True)
+                    return
+                d = await resp.json()
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+
+    clients = d.get("clients", [])
+    total = d.get("total", 0)
+    limit = d.get("limit", 10)
+    total_pages = max(1, (total + limit - 1) // limit)
+    current_page = max(1, min(page, total_pages))
+
+    if not clients:
+        await callback.answer("Клиентов нет", show_alert=True)
+        return
+
+    start_idx = (current_page - 1) * limit + 1
+    blocks = []
+    kb = InlineKeyboardBuilder()
+
+    for idx, c in enumerate(clients, start=start_idx):
+        contact = html.escape(str(c.get("contact") or "—"))
+        token = str(c.get("profile_token") or "")
+        short_token = token[:10]
+        created = _fmt_dt_str_msk(c.get("created_at"))
+        source = html.escape(str(c.get("traffic_source") or "—"))
+        paid_sum = c.get("paid_sum") or 0
+        paid_count = c.get("paid_count") or 0
+        bal = c.get("balance_rub") or 0.0
+
+        tg = c.get("telegram")
+        tg_info = f" | TG: @{html.escape(str(tg.get('username')))}" if (tg and tg.get("username")) else ""
+
+        blocks.append(
+            f"<b>#{idx}. 👤 {contact}</b>{tg_info}\n"
+            f"├ Регистрация: {created}\n"
+            f"├ Источник: {source}\n"
+            f"├ Баланс: <b>{bal:.2f} ₽</b> | Оплат: <b>{paid_sum} ₽</b> ({paid_count} шт.)\n"
+            f"└ Профиль: <code>{token}</code>"
+        )
+        kb.row(InlineKeyboardButton(text=f"🔍 Карточка #{idx}: {contact[:20]}", callback_data=f"adm_wb_prof_q:{short_token}"))
+
+    divider = "\n━━━━━━━━━━━━━━━━━━━━\n"
+    text = (
+        f"👥 <b>Список клиентов сайта</b> ({total} всего)\n"
+        f"Страница <b>{current_page}/{total_pages}</b>\n\n"
+        + divider.join(blocks)
+    )
+
+    prev_page = total_pages if current_page == 1 else current_page - 1
+    next_page = 1 if current_page == total_pages else current_page + 1
+
+    kb.row(
+        InlineKeyboardButton(text="◀️ Назад", callback_data=f"adm_web_clients_list_{prev_page}"),
+        InlineKeyboardButton(text=f"Стр. {current_page}/{total_pages}", callback_data="ignore"),
+        InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"adm_web_clients_list_{next_page}"),
+    )
+    kb.row(InlineKeyboardButton(text="◀️ К статистике", callback_data="adm_stats_web"))
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_wb_prof_q:"))
+async def admin_web_client_quick_lookup(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    query = callback.data.split(":", 1)[1].strip()
+
+    import aiohttp as _aiohttp
+    url = f"{settings.webstore_api_base_url.rstrip('/')}/api/store/internal/admin-client-lookup?q={query}"
+    headers = {"X-Internal-Secret": settings.webstore_bridge_secret}
+    try:
+        async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=10)) as sess:
+            async with sess.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    await callback.answer(f"Ошибка: {resp.status}", show_alert=True)
+                    return
+                d = await resp.json()
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+
+    profiles = d.get("profiles") or []
+    if not profiles:
+        await callback.answer("Клиент не найден", show_alert=True)
+        return
+
+    p = profiles[0]
+    orders = p.get("orders") or []
+    items = p.get("telegram_items") or []
+
+    created_str = _fmt_dt_str_msk(p.get("created_at"))
+    if created_str == "—" and orders:
+        order_dts = [o.get("created_at") for o in orders if o.get("created_at")]
+        if order_dts:
+            created_str = _fmt_dt_str_msk(min(order_dts))
+
+    source_str = "—"
+    for o in orders:
+        ref = o.get("entry_referrer") or o.get("ref_source") or ""
+        url_s = o.get("entry_url") or ""
+        if "vk.ru" in ref or "vk.com" in ref or "vk" in url_s:
+            source_str = "ВКонтакте (VK)"
+            break
+        elif ref or url_s:
+            source_str = html.escape(ref or url_s)[:35]
+            break
+
+    total_paid_rub = sum(o.get("amount_rub") or 0 for o in orders if o.get("status") in ("delivered", "paid"))
+
+    ref_id = p.get("referrer_telegram_id")
+    referrer_str = "Нет (прямой заход)"
+    if ref_id:
+        try:
+            async with async_session() as bot_sess:
+                partner = await bot_sess.scalar(select(Partner).where(Partner.telegram_id == int(ref_id)))
+                if partner:
+                    referrer_str = f"{html.escape(partner.name)} [{ref_id}]"
+                else:
+                    inviter = await bot_sess.scalar(select(User).where(User.telegram_id == int(ref_id)))
+                    if inviter:
+                        u_name = f"@{inviter.username}" if inviter.username else (inviter.first_name or "Пользователь")
+                        referrer_str = f"{html.escape(u_name)} [{ref_id}]"
+                    else:
+                        referrer_str = f"ID: {ref_id}"
+        except Exception:
+            referrer_str = f"ID: {ref_id}"
+
+    refs_count = p.get("referrals_count") or 0
+
+    lines = [
+        "🌐 <b>Клиент сайта</b>",
+        f"Контакт: <code>{html.escape(str(p.get('contact') or '—'))}</code>",
+        f"Профиль: <code>{html.escape(str(p.get('profile_token') or '—'))}</code>",
+        f"Регистрация: <b>{created_str}</b>",
+        f"Источник: <b>{source_str}</b>",
+        f"Приглашён кем: <b>{referrer_str}</b>",
+        f"Рефералов приведено: <b>{refs_count} чел.</b>",
+        f"Пароль задан: {'да' if p.get('has_password') else 'нет'}",
+        f"Баланс сайта: <b>{float(p.get('balance_rub') or 0):.2f} ₽</b>",
+        f"Оплачено всего: <b>{total_paid_rub} ₽</b>",
+    ]
+    tg = p.get("telegram")
+    if tg:
+        lines.append(
+            "Telegram: "
+            f"<code>{html.escape(str(tg.get('id') or ''))}</code> "
+            f"@{html.escape(str(tg.get('username') or ''))}"
+        )
+
+    delivered_orders = [o for o in orders if o.get("status") in ("delivered", "paid")]
+    demo_orders = [o for o in orders if o.get("status") == "demo" or o.get("tariff_key") == "demo"]
+    pending_orders = [o for o in orders if o.get("status") == "pending"]
+    failed_orders = [o for o in orders if o.get("status") == "failed"]
+
+    def _resolve_prov_name(o: dict) -> str:
+        pr = str(o.get("provider") or "").lower()
+        if pr in ("adapt", "marzban", "vhq"):
+            return pr.upper()
+        sub = str(o.get("subscription_url") or o.get("raw_subscription_url") or "").lower()
+        if "adapt" in sub:
+            return "ADAPT"
+        if "vhq" in sub or "proxy-subscription" in sub:
+            return "VHQ"
+        return "MARZBAN"
+
+    if delivered_orders:
+        lines.append("\n🟢 <b>Оплаченные подписки и ключи</b>")
+        for o in delivered_orders:
+            sub = o.get("subscription_url") or o.get("raw_subscription_url")
+            prov = _resolve_prov_name(o)
+            exp = _fmt_dt_str_msk(o.get("access_expires_at"))
+            lines.append(
+                f"✅ <code>{html.escape(str(o.get('order_id') or ''))}</code> | "
+                f"{html.escape(str(o.get('tariff_label') or ''))} | {o.get('amount_rub') or 0} ₽ | <b>{prov}</b>"
+            )
+            if exp != "—":
+                lines.append(f"└ Доступ до: <code>{html.escape(exp)}</code>")
+            if sub:
+                lines.append(await _format_external_key_block(str(sub), label=f"Ссылка ({prov})"))
+
+    if demo_orders:
+        lines.append("\n🎁 <b>Выданные демо-ключи</b>")
+        for o in demo_orders:
+            sub = o.get("subscription_url") or o.get("raw_subscription_url")
+            prov = _resolve_prov_name(o)
+            created = _fmt_dt_str_msk(o.get("created_at"))
+            exp = _fmt_dt_str_msk(o.get("access_expires_at"))
+            lines.append(
+                f"🎁 <code>{html.escape(str(o.get('order_id') or ''))}</code> | "
+                f"Провайдер: <b>{prov}</b> | Создан: {html.escape(created)}"
+            )
+            if exp != "—":
+                lines.append(f"└ Срок до: <code>{html.escape(exp)}</code>")
+            if sub:
+                lines.append(await _format_external_key_block(str(sub), label=f"Ссылка демо ({prov})"))
+
+    if failed_orders:
+        lines.append("\n⚠️ <b>Ошибки выдачи</b>")
+        for o in failed_orders[:3]:
+            lines.append(
+                f"⚠️ <code>{html.escape(str(o.get('order_id') or ''))}</code> | {html.escape(str(o.get('failure_message') or 'Ошибка'))}"
+            )
+
+    if pending_orders:
+        lines.append(f"\n⏳ <b>Неоплаченные попытки:</b> {len(pending_orders)} шт. (счета созданы, карта не введена)")
+        for o in pending_orders[:3]:
+            created = _fmt_dt_str_msk(o.get("created_at"))
+            lines.append(
+                f"• <code>{html.escape(str(o.get('order_id') or ''))}</code> | {html.escape(str(o.get('tariff_label') or ''))} ({o.get('amount_rub')} ₽) | {html.escape(created)}"
+            )
+        if len(pending_orders) > 3:
+            lines.append(f"<i>...и ещё {len(pending_orders) - 3} неоплаченных попыток</i>")
+
+    if not orders and not items:
+        lines.append("\n<i>Заказов и ключей нет</i>")
+
+    back_kb = InlineKeyboardBuilder()
+    back_kb.row(InlineKeyboardButton(text="👥 К списку клиентов", callback_data="adm_web_clients_list"))
+    back_kb.row(InlineKeyboardButton(text="◀️ Меню сайта", callback_data="adm_stats_web"))
+
+    text = "\n".join(lines)
+    try:
+        await callback.message.edit_text(text, reply_markup=back_kb.as_markup(), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=back_kb.as_markup(), parse_mode="HTML")
+    await callback.answer()
 
 
 @router.callback_query(F.data.regexp(r"^adm_web_orders_log(?:_\d+)?$"))
