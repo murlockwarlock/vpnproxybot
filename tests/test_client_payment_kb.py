@@ -1,6 +1,7 @@
+from datetime import datetime
 from types import SimpleNamespace
 
-from bot.keyboards.client import payment_kb, tariffs_kb
+from bot.keyboards.client import payment_kb, purchase_target_kb, tariffs_kb
 
 
 def _button_texts(markup) -> list[str]:
@@ -60,3 +61,18 @@ def test_tariffs_kb_groups_by_family_and_sorts_by_price():
         "Базовый (90 дней) - 659₽",
         "◀️ Назад",
     ]
+
+
+def test_subscription_target_button_is_short_and_keeps_term_visible():
+    sub = SimpleNamespace(
+        id=243,
+        tariff=SimpleNamespace(label="Базовый • 90 дн • 5📱• 136 Гб⚡️", days=90),
+        tariff_days=90,
+        device_slots=5,
+        expires_at=datetime(2026, 10, 11),
+    )
+
+    texts = _button_texts(purchase_target_kb([sub], "renew"))
+
+    assert texts[0] == "90 дн · 5 устр. · до 11.10.2026"
+    assert "Базовый" not in texts[0]

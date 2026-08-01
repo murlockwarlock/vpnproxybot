@@ -1569,10 +1569,11 @@ async def admin_partner_edit_field_save(message: Message, state: FSMContext) -> 
 # ── Admin: Link Management ───────────────────────────
 
 @router.callback_query(F.data.startswith("adm_pt_links_"))
-async def admin_partner_links(callback: CallbackQuery) -> None:
+async def admin_partner_links(callback: CallbackQuery, *, partner_id: int | None = None) -> None:
     if not _is_admin(callback.from_user.id):
         return
-    partner_id = int(callback.data.removeprefix("adm_pt_links_"))
+    if partner_id is None:
+        partner_id = int(callback.data.removeprefix("adm_pt_links_"))
 
     async with async_session() as session:
         partner = await session.get(Partner, partner_id)
@@ -1722,8 +1723,7 @@ async def admin_partner_link_toggle(callback: CallbackQuery) -> None:
             await callback.answer("Не найдена", show_alert=True)
             return
     # Refresh links page
-    callback.data = f"adm_pt_links_{partner_id}"
-    await admin_partner_links(callback)
+    await admin_partner_links(callback, partner_id=partner_id)
 
 
 # ── Admin: Free Access for Partner ───────────────────

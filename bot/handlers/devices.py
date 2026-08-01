@@ -41,7 +41,12 @@ def _format_dt_msk(dt) -> str:
 
 
 @router.callback_query((F.data == "my_devices") | F.data.startswith("manage_devices_"))
-async def show_my_devices(callback: CallbackQuery, *, acknowledge: bool = True) -> None:
+async def show_my_devices(
+    callback: CallbackQuery,
+    *,
+    acknowledge: bool = True,
+    subscription_id: int | None = None,
+) -> None:
     """Show the user's current devices and allow buying more slots."""
     if acknowledge:
         await callback.answer("Загружаем устройства…")
@@ -60,7 +65,7 @@ async def show_my_devices(callback: CallbackQuery, *, acknowledge: bool = True) 
         )
         subscriptions = result.scalars().all()
 
-        if callback.data == "my_devices" and len(subscriptions) > 1:
+        if subscription_id is None and callback.data == "my_devices" and len(subscriptions) > 1:
             await callback.message.edit_text(
                 "📱 <b>Выберите подписку</b>\n\nУстройства управляются отдельно для каждой ссылки.",
                 reply_markup=device_subscriptions_kb(subscriptions),
@@ -68,8 +73,8 @@ async def show_my_devices(callback: CallbackQuery, *, acknowledge: bool = True) 
             )
             return
 
-        selected_id = None
-        if callback.data.startswith("manage_devices_"):
+        selected_id = subscription_id
+        if selected_id is None and callback.data.startswith("manage_devices_"):
             try:
                 selected_id = int(callback.data.removeprefix("manage_devices_"))
             except ValueError:
@@ -304,8 +309,7 @@ async def delete_adapt_device(callback: CallbackQuery) -> None:
         await callback.message.answer("Не удалось удалить устройство. Попробуйте позже или напишите в поддержку.")
 
     # Refresh the device list
-    callback.data = f"manage_devices_{sub_id}"
-    await show_my_devices(callback, acknowledge=False)
+    await show_my_devices(callback, acknowledge=False, subscription_id=sub_id)
 
 
 @router.callback_query(F.data.startswith("buy_device_"))

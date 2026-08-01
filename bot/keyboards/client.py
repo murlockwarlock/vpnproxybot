@@ -134,19 +134,29 @@ def tariffs_kb(tariffs: list[Tariff], stars_enabled: bool = True, has_product_ty
     return builder.as_markup()
 
 
-def purchase_action_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def purchase_action_kb(*, show_upgrade: bool = True) -> InlineKeyboardMarkup:
+    rows = [
         [InlineKeyboardButton(text="↻ Продлить подписку", callback_data="purchase_action_renew")],
-        [InlineKeyboardButton(text="↑ Улучшить подписку", callback_data="purchase_action_upgrade")],
+    ]
+    if show_upgrade:
+        rows.append([InlineKeyboardButton(text="↑ Улучшить подписку", callback_data="purchase_action_upgrade")])
+    rows.extend([
         [InlineKeyboardButton(text="➕ Создать новую", callback_data="buy_new")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="profile")],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def purchase_target_kb(subscriptions, action: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for sub in subscriptions:
         label = sub.tariff.label if sub.tariff else f"Подписка #{sub.id}"
+        if "базов" in label.lower() and sub.tariff:
+            days = int(getattr(sub.tariff, "days", 0) or getattr(sub, "tariff_days", 0) or 0)
+            devices = int(getattr(sub, "device_slots", 0) or 0)
+            label = f"{days} дн" if days else f"Подписка #{sub.id}"
+            if devices:
+                label += f" · {devices} устр."
         expires = sub.expires_at.strftime("%d.%m.%Y") if sub.expires_at else "—"
         builder.row(InlineKeyboardButton(
             text=f"{label} · до {expires}",

@@ -581,8 +581,10 @@
       </div>
       <div class="profile-cta">
         <h2>Как продлить подписку без Telegram</h2>
+        <p id="subscriptionChoiceHint">
+          Найдите ниже нужную подписку и нажмите «Продлить» — повторно подключать устройства не придётся.
+        </p>
         <p>
-          Найдите ниже нужную ссылку и нажмите «Продлить» — срок добавится к ней, повторно подключать устройства не придётся.
           «Улучшить» меняет её на более дорогой тариф с зачётом остатка. «Создать новую» выдаёт отдельную ссылку.
         </p>
       </div>
@@ -877,12 +879,15 @@
         if (item.provider === "adapt" && item.adapt_plan_uuid) {
           const target = encodeURIComponent(item.target_order_id);
           const plan = encodeURIComponent(item.adapt_plan_uuid);
-          actionHtml = `
-            <div class="subscription-actions">
-              <a class="ghost-btn" href="/buy?action=renew&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↻ Продлить</a>
-              ${isActive ? `<a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↑ Улучшить</a>` : ""}
-            </div>
-          `;
+          const renewAction = item.is_trial ? "upgrade" : "renew";
+          actionHtml = item.is_trial && !isActive
+            ? `<div class="subscription-actions"><a class="ghost-btn" href="{{SUPPORT_URL}}">Написать в поддержку</a></div>`
+            : `
+              <div class="subscription-actions">
+                <a class="ghost-btn" href="/buy?action=${renewAction}&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↻ Продлить</a>
+                ${isActive && !item.is_trial && item.can_upgrade ? `<a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↑ Улучшить</a>` : ""}
+              </div>
+            `;
         }
         card.innerHTML = `
           <div class="telegram-item-title">${item.title}</div>
@@ -939,6 +944,26 @@
       const visibleOrders = (data.orders || []).filter(o =>
         ["delivered", "demo", "paid"].includes(o.status)
       );
+      const manageableSubscriptions = new Set();
+      (data.telegram_items || []).forEach(item => {
+        if (item.provider === "adapt" && item.adapt_plan_uuid) {
+          manageableSubscriptions.add((item.target_order_id || item.key_value).replace(/^tg:/, ""));
+        }
+      });
+      visibleOrders.forEach(o => {
+        if (o.provider === "adapt" && o.adapt_plan_uuid) {
+          manageableSubscriptions.add(o.adapt_uuid || o.subscription_url || o.order_id);
+        }
+      });
+      const subscriptionCount = manageableSubscriptions.size;
+      const hint = document.getElementById("subscriptionChoiceHint");
+      if (hint && subscriptionCount > 1) {
+        const noun = subscriptionCount % 10 === 1 && subscriptionCount % 100 !== 11
+          ? "подписка"
+          : ([2, 3, 4].includes(subscriptionCount % 10) && ![12, 13, 14].includes(subscriptionCount % 100)
+              ? "подписки" : "подписок");
+        hint.textContent = `У вас найдено ${subscriptionCount} ${noun}. Выберите, какую хотите продлить.`;
+      }
       const list = document.getElementById("ordersList");
       list.innerHTML = "";
       if (!visibleOrders.length) {
@@ -992,15 +1017,18 @@
         }
 
         let actionHtml = "";
-        if (o.status === "delivered" && o.provider === "adapt" && o.tariff_key !== "demo" && latestAdaptByUrl.get(o.subscription_url) === o.order_id) {
+        if (["delivered", "demo"].includes(o.status) && o.provider === "adapt" && o.adapt_plan_uuid && latestAdaptByUrl.get(o.subscription_url) === o.order_id) {
           const target = encodeURIComponent(o.order_id);
           const plan = encodeURIComponent(o.adapt_plan_uuid || "");
-          actionHtml = `
-            <div class="subscription-actions">
-              <a class="ghost-btn" href="/buy?action=renew&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↻ Продлить</a>
-              ${!isExpired ? `<a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↑ Улучшить</a>` : ""}
-            </div>
-          `;
+          const renewAction = o.is_trial ? "upgrade" : "renew";
+          actionHtml = o.is_trial && isExpired
+            ? `<div class="subscription-actions"><a class="ghost-btn" href="{{SUPPORT_URL}}">Написать в поддержку</a></div>`
+            : `
+              <div class="subscription-actions">
+                <a class="ghost-btn" href="/buy?action=${renewAction}&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↻ Продлить</a>
+                ${!isExpired && !o.is_trial && o.can_upgrade ? `<a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↑ Улучшить</a>` : ""}
+              </div>
+            `;
         }
 
         card.innerHTML = `

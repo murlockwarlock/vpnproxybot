@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import timezone, timedelta
+from datetime import datetime, timezone, timedelta
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -72,6 +72,20 @@ def _fmt_iso_msk(iso_str: str | None) -> str:
 
 def _is_mtproto_placeholder(vpn_key: str | None) -> bool:
     return not vpn_key or vpn_key == "mtproto_only"
+
+
+def _profile_vpn_subscriptions(subscriptions: list[Subscription]) -> list[Subscription]:
+    """Use the same renewable active/expired set in the key list."""
+    return sorted(
+        (
+            sub for sub in subscriptions
+            if sub.status.value in {"active", "expired"}
+            and not is_demo_subscription_row(sub)
+            and not _is_mtproto_placeholder(sub.vpn_key)
+        ),
+        key=lambda item: item.expires_at or datetime.min,
+        reverse=True,
+    )
 
 
 def _subscription_product_label(sub: Subscription, mtproto_accounts: list[MTProtoAccount]) -> str:
@@ -408,7 +422,6 @@ async def balance_toggle(callback: CallbackQuery) -> None:
         await session.commit()
 
     await callback.answer(alert_text, show_alert=True)
-    callback.data = "profile"
     await show_profile(callback)
 
 
@@ -510,7 +523,6 @@ async def set_daily_tariff(callback: CallbackQuery) -> None:
         await session.commit()
 
     await callback.answer(f"✅ Тариф «{tariff.label}» выбран для ежедневных списаний", show_alert=True)
-    callback.data = "profile"
     await show_profile(callback)
 
 
@@ -575,15 +587,20 @@ async def _build_keys_page(
     included_slots = locals().get("included_slots", 3)
 
     key_items: list[tuple[str, object]] = []
-    for sub in user.subscriptions:
-        if sub.status.value == "active" and not _is_mtproto_placeholder(sub.vpn_key):
-            key_items.append(("vpn", sub))
+    seen_subscription_urls: set[str] = set()
+    for sub in _profile_vpn_subscriptions(user.subscriptions):
+        display_key = get_subscription_display_key(sub) or sub.vpn_key
+        key_items.append(("vpn", sub))
+        if display_key:
+            seen_subscription_urls.add(str(display_key).strip())
     for acc in mtproto_accounts:
         key_items.append(("mtproto", acc))
     if web_profile:
         for order in web_profile.get("orders", []):
-            if order.get("subscription_url"):
+            order_url = str(order.get("subscription_url") or "").strip()
+            if order_url and order_url not in seen_subscription_urls:
                 key_items.append(("web", order))
+                seen_subscription_urls.add(order_url)
 
     if not key_items:
         return "У вас пока нет активных ключей.\nНажмите «🛒 Купить доступ» в главном меню.", None
@@ -599,6 +616,11 @@ async def _build_keys_page(
         location = sub.server.location if sub.server else "N/A"
         emoji = sub.server.country_emoji if sub.server else "🌍"
         expires = _fmt_msk(sub.expires_at)
+        status_line = (
+            "✅ Статус: активна\n"
+            if sub.status.value == "active"
+            else "⌛ Статус: срок закончился\n"
+        )
         provider_label = _provider_label(sub)
         tariff_line = ""
         if getattr(sub, "billing_mode", None) == "demo":
@@ -615,6 +637,7 @@ async def _build_keys_page(
         text = (
             f"{header}\n"
             f"{tariff_line}"
+            f"{status_line}"
             f"📅 До: {expires}\n"
             f"🖥 Устройств: {_subscription_device_slots(sub, included_slots)}\n\n"
             f"<code>{get_subscription_display_key(sub) or sub.vpn_key}</code>\n"
@@ -953,9 +976,8 @@ async def adapt_buy_traffic(callback: CallbackQuery) -> None:
 async def adapt_upgrade_menu(callback: CallbackQuery) -> None:
     """Route legacy upgrade buttons into the paid upgrade flow."""
     sub_id = int(callback.data.split(":")[1])
-    from bot.handlers.buy import choose_upgrade_target
-    callback.data = f"purchase_upgrade_{sub_id}"
-    await choose_upgrade_target(callback)
+    from bot.handlers.buy import _open_upgrade_target
+    await _open_upgrade_target(callback, sub_id)
 
 
 @router.callback_query(F.data.startswith("adapt_do_upgrade:"))

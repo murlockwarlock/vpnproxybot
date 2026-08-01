@@ -31,7 +31,11 @@ from bot.services.provisioning_issues import (
     build_vhq_access_error,
 )
 from bot.services.proxy_manager import MarzbanAPI, get_subscription_link
-from bot.services.subscription_semantics import demo_access_clause, paid_access_clause
+from bot.services.subscription_semantics import (
+    demo_access_clause,
+    is_adapt_trial_tariff,
+    paid_access_clause,
+)
 from bot.services.vhq_partner_api import VHQPartnerAPI, VHQPartnerAPIError
 from bot.services.vhq_routing import VHQ_CLIENT_PREFIX, get_vhq_spec_for_tariff
 from bot.services.vhq_subscription_proxy import build_vhq_subscription_ref_url
@@ -921,6 +925,18 @@ async def _create_adapt_paid_subscription(
     current_plan_uuid = str(adapt_record.adapt_plan_uuid).strip()
     same_plan = current_plan_uuid == plan_uuid
     now = datetime.utcnow()
+
+    if action == "renew" and same_plan and is_adapt_trial_tariff(tariff):
+        issue = build_internal_access_error(
+            provider="adapt",
+            code="adapt_trial_requires_upgrade",
+            admin_message=(
+                "Refusing Adapt renew for introductory plan "
+                f"subscription_id={existing.id} current_plan={current_plan_uuid}"
+            ),
+            client_message="Для продления тестовой подписки выберите платный тариф.",
+        )
+        raise issue
 
     if action in {"auto", "renew"} and not same_plan:
         issue = build_internal_access_error(

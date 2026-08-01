@@ -1147,7 +1147,7 @@ async def admin_add_server_start(callback: CallbackQuery, state: FSMContext) -> 
         "Отправьте данные в формате:\n"
         "<code>Имя | Хост (IP) | API URL | API User | API Pass | Локация | Эмодзи | Макс.клиентов</code>\n\n"
         "Пример:\n"
-        "<code>NL-1 | 192.0.2.10 | http://192.0.2.10:8000 | admin | secret | Amsterdam | 🇳🇱 | 50</code>",
+        "<code>NL-1 | 185.100.50.1 | http://185.100.50.1:8000 | admin | secret | Amsterdam | 🇳🇱 | 50</code>",
         reply_markup=admin_back_kb(),
         parse_mode="HTML",
     )
@@ -1735,20 +1735,28 @@ async def admin_user_subs(callback: CallbackQuery) -> None:
 # ── Admin User Devices ────────────────────────────────
 
 @router.callback_query(F.data.startswith("adm_usr_devices_"))
-async def admin_user_devices(callback: CallbackQuery, *, acknowledge: bool = True) -> None:
+async def admin_user_devices(
+    callback: CallbackQuery,
+    *,
+    acknowledge: bool = True,
+    telegram_id: int | None = None,
+    subscription_id: int | None = None,
+) -> None:
     if not _is_admin(callback.from_user.id):
         return
 
     if acknowledge:
         await callback.answer("Загружаем устройства…")
 
-    target_parts = callback.data.removeprefix("adm_usr_devices_").split("_", 1)
-    try:
-        telegram_id = int(target_parts[0])
-        selected_subscription_id = int(target_parts[1]) if len(target_parts) > 1 else None
-    except ValueError:
-        await callback.message.answer("Не удалось определить клиента или подписку.")
-        return
+    selected_subscription_id = subscription_id
+    if telegram_id is None:
+        target_parts = callback.data.removeprefix("adm_usr_devices_").split("_", 1)
+        try:
+            telegram_id = int(target_parts[0])
+            selected_subscription_id = int(target_parts[1]) if len(target_parts) > 1 else None
+        except ValueError:
+            await callback.message.answer("Не удалось определить клиента или подписку.")
+            return
 
     async with async_session() as session:
         result = await session.execute(
@@ -1949,8 +1957,12 @@ async def admin_delete_device(callback: CallbackQuery) -> None:
         await callback.answer("Не удалось удалить устройство. Попробуйте позже.", show_alert=True)
 
     # Refresh the device list page for admin!
-    callback.data = f"adm_usr_devices_{telegram_id}_{sub_id}"
-    await admin_user_devices(callback, acknowledge=False)
+    await admin_user_devices(
+        callback,
+        acknowledge=False,
+        telegram_id=telegram_id,
+        subscription_id=sub_id,
+    )
 
 
 # ── User Payments List ────────────────────────────────

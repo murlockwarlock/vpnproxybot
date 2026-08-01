@@ -383,6 +383,39 @@ def _is_intro_basic_store_tariff(tariff_key: str) -> bool:
     return tariff_key == "basic_1"
 
 
+def _is_adapt_trial_store_tariff(tariff: dict | None) -> bool:
+    return bool(
+        tariff
+        and str(tariff.get("adapt_plan_uuid") or "").strip()
+        and 0 < int(tariff.get("days") or 0) <= 7
+    )
+
+
+def _has_adapt_upgrade_option(tariff: dict | None) -> bool:
+    if not tariff or not str(tariff.get("adapt_plan_uuid") or "").strip():
+        return False
+    current_price = int(tariff.get("price_rub") or 0)
+    return any(
+        str(candidate.get("adapt_plan_uuid") or "").strip()
+        and int(candidate.get("price_rub") or 0) > current_price
+        for candidate in get_store_tariffs()
+    )
+
+
+def _effective_adapt_purchase_action(
+    action: str,
+    old_tariff: dict | None,
+    new_plan_uuid: str,
+) -> str:
+    """A trial is shown as renewal, but Adapt must replace it via upgrade."""
+    if action != "renew" or not _is_adapt_trial_store_tariff(old_tariff):
+        return action
+    old_plan_uuid = str((old_tariff or {}).get("adapt_plan_uuid") or "").strip()
+    if not old_plan_uuid or old_plan_uuid == str(new_plan_uuid or "").strip():
+        raise ValueError("Для продления тестовой подписки выберите платный тариф")
+    return "upgrade"
+
+
 def _next_charge_datetime(now: datetime | None = None) -> datetime:
     current = now or datetime.utcnow().replace(tzinfo=timezone.utc)
     if current.tzinfo is None:
@@ -395,6 +428,7 @@ def _next_charge_datetime(now: datetime | None = None) -> datetime:
 
 
 def _serialize_orders(orders: list[WebOrder]) -> list[dict[str, str | int | None]]:
+    tariffs_by_key = get_store_tariffs_by_key()
     return [
         {
             "order_id": o.order_id,
@@ -408,7 +442,9 @@ def _serialize_orders(orders: list[WebOrder]) -> list[dict[str, str | int | None
             "target_order_id": o.target_order_id,
             "status": o.status,
             "provider": _get_order_provider(o),
-            "adapt_plan_uuid": str((get_store_tariffs_by_key().get(o.tariff_key) or {}).get("adapt_plan_uuid") or ""),
+            "is_trial": _is_adapt_trial_store_tariff(tariffs_by_key.get(o.tariff_key)),
+            "can_upgrade": _has_adapt_upgrade_option(tariffs_by_key.get(o.tariff_key)),
+            "adapt_plan_uuid": str((tariffs_by_key.get(o.tariff_key) or {}).get("adapt_plan_uuid") or ""),
             "adapt_uuid": _extract_adapt_uuid_from_web_order(o),
             "subscription_url": _display_order_subscription_url(o),
             "raw_subscription_url": o.subscription_url or "",
@@ -426,7 +462,12 @@ def _serialize_orders(orders: list[WebOrder]) -> list[dict[str, str | int | None
     ]
 
 
-def _serialize_telegram_items(items: list[WebTelegramItem]) -> list[dict[str, str | int | None]]:
+def _serialize_telegram_items(items: list[WebTelegramItem]) -> list[dict[str, str | int | bool | None]]:
+    tariffs_by_plan = {
+        str(tariff.get("adapt_plan_uuid") or "").strip(): tariff
+        for tariff in get_store_tariffs()
+        if str(tariff.get("adapt_plan_uuid") or "").strip()
+    }
     return [
         {
             "item_type": item.item_type,
@@ -435,6 +476,12 @@ def _serialize_telegram_items(items: list[WebTelegramItem]) -> list[dict[str, st
             "key_value": item.key_value,
             "provider": item.provider or _get_access_provider(item.key_value, item.external_id),
             "adapt_plan_uuid": item.adapt_plan_uuid or "",
+            "is_trial": _is_adapt_trial_store_tariff(
+                tariffs_by_plan.get(str(item.adapt_plan_uuid or "").strip())
+            ),
+            "can_upgrade": _has_adapt_upgrade_option(
+                tariffs_by_plan.get(str(item.adapt_plan_uuid or "").strip())
+            ),
             "target_order_id": (
                 f"tg:{_extract_adapt_uuid(item.key_value, item.external_id)}"
                 if _extract_adapt_uuid(item.key_value, item.external_id)
@@ -1593,6 +1640,12 @@ async def handle_create_order(request: web.Request) -> web.Response:
                     {"error": "Для этой подписки продление и улучшение через сайт сейчас недоступны"},
                     status=400,
                 )
+            try:
+                purchase_action = _effective_adapt_purchase_action(
+                    purchase_action, old_tariff, new_plan_uuid
+                )
+            except ValueError as exc:
+                return web.json_response({"error": str(exc)}, status=400)
             if purchase_action == "renew" and old_plan_uuid != new_plan_uuid:
                 return web.json_response(
                     {"error": "Для продления выберите тот же тариф. Для более дорогого используйте «Улучшить»."},
@@ -2362,6 +2415,26 @@ async def _fulfill_adapt_order(session, order: WebOrder, adapt_plan_uuid: str) -
                 if target_telegram_item
                 else str((get_store_tariffs_by_key().get(primary.tariff_key) or {}).get("adapt_plan_uuid") or "")
             )
+        old_tariff = next(
+            (
+                candidate for candidate in get_store_tariffs()
+                if str(candidate.get("adapt_plan_uuid") or "").strip()
+                == str(order.target_snapshot_plan_uuid or "").strip()
+            ),
+            None,
+        )
+        try:
+            action = _effective_adapt_purchase_action(action, old_tariff, adapt_plan_uuid)
+            order.purchase_action = action
+        except ValueError as exc:
+            issue = build_internal_access_error(
+                provider="adapt",
+                code="adapt_trial_requires_upgrade",
+                admin_message=f"Invalid trial renewal for paid order {order.order_id}: {exc}",
+                client_message="Не удалось перевести тестовую подписку на платный тариф. Мы уже получили уведомление.",
+            )
+            await _mark_order_failed(order, issue)
+            return
         try:
             api = AdaptAPI()
             already_applied = False
