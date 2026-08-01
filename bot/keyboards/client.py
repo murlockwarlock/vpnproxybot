@@ -147,6 +147,39 @@ def purchase_action_kb(*, show_upgrade: bool = True) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def purchase_intro_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Продолжить", callback_data="purchase_browse_0")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="profile")],
+    ])
+
+
+def purchase_subscription_kb(
+    subscription_id: int,
+    *,
+    position: int,
+    total: int,
+    show_upgrade: bool,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="↻ Продлить", callback_data=f"purchase_renew_{subscription_id}")],
+    ]
+    if show_upgrade:
+        rows.append([
+            InlineKeyboardButton(text="↑ Улучшить", callback_data=f"purchase_upgrade_{subscription_id}")
+        ])
+    rows.append([InlineKeyboardButton(text="➕ Создать новую", callback_data="buy_new")])
+    if total > 1:
+        rows.append([
+            InlineKeyboardButton(
+                text="Следующая",
+                callback_data=f"purchase_browse_{(position + 1) % total}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="buy")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def purchase_target_kb(subscriptions, action: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for sub in subscriptions:

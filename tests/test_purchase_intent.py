@@ -1,9 +1,14 @@
 from datetime import datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 from bot.services.purchase_intent import (
     calculate_upgrade_price_rub,
     decode_intent,
     encode_intent,
+    get_purchase_price_rub,
 )
 
 
@@ -24,3 +29,28 @@ def test_upgrade_quote_uses_current_adapt_replacement_formula():
         expires_at=now + timedelta(days=10),
         now=now,
     ) == 400
+
+
+@pytest.mark.asyncio
+async def test_expired_adapt_trial_upgrade_costs_full_paid_tariff_price():
+    current = SimpleNamespace(
+        id=1, days=7, price_rub=45, adapt_plan_uuid="trial-plan"
+    )
+    target = SimpleNamespace(
+        id=199, user_id=10, tariff_id=1, expires_at=datetime.utcnow() - timedelta(days=1),
+        client_name="adapt_trial",
+    )
+    paid = SimpleNamespace(
+        id=2, days=14, price_rub=75, adapt_plan_uuid="paid-plan"
+    )
+    session = SimpleNamespace(get=AsyncMock(side_effect=[target, current]))
+
+    price = await get_purchase_price_rub(
+        session,
+        user=SimpleNamespace(id=10),
+        tariff=paid,
+        action="upgrade",
+        target_subscription_id=199,
+    )
+
+    assert price == 75

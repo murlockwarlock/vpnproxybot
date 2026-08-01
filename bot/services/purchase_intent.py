@@ -54,6 +54,8 @@ def calculate_upgrade_price_rub(
 async def get_purchase_price_rub(session, *, user, tariff, action: str, target_subscription_id: int | None) -> int:
     """Return and validate the customer-facing price for a purchase intent."""
     from bot.models import Subscription, Tariff
+    from bot.services.adapt_routing import is_adapt_subscription
+    from bot.services.subscription_semantics import is_adapt_trial_tariff
 
     if action == "new" or action == "auto":
         return int(tariff.price_rub)
@@ -63,11 +65,19 @@ async def get_purchase_price_rub(session, *, user, tariff, action: str, target_s
     current_tariff = await session.get(Tariff, target.tariff_id) if target and target.tariff_id else None
     if not target or target.user_id != user.id or not current_tariff:
         raise ValueError("Выбранная подписка не найдена")
+    if (
+        not is_adapt_subscription(target)
+        or not current_tariff.adapt_plan_uuid
+        or not tariff.adapt_plan_uuid
+    ):
+        raise ValueError(
+            "Для этой подписки продление или улучшение недоступно. Создайте новую подписку."
+        )
     if action == "renew":
         if current_tariff.id != tariff.id:
             raise ValueError("Для продления выберите текущий тариф")
         return int(tariff.price_rub)
-    if target.expires_at <= datetime.utcnow():
+    if target.expires_at <= datetime.utcnow() and not is_adapt_trial_tariff(current_tariff):
         raise ValueError("Улучшить можно только активную подписку")
     if not current_tariff.adapt_plan_uuid or not tariff.adapt_plan_uuid:
         raise ValueError("Для этой подписки улучшение сейчас недоступно")

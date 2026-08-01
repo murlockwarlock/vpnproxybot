@@ -31,3 +31,5 @@ def test_web_profile_uses_same_trial_wording_and_internal_upgrade():
     assert "У вас найдено ${subscriptionCount} ${noun}. Выберите, какую хотите продлить." in html
     assert 'const renewAction = item.is_trial ? "upgrade" : "renew";' in html
     assert 'const renewAction = o.is_trial ? "upgrade" : "renew";' in html
+    assert "item.is_trial && !isActive" not in html
+    assert "o.is_trial && isExpired" not in html

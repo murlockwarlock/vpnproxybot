@@ -1,7 +1,13 @@
 from datetime import datetime
 from types import SimpleNamespace
 
-from bot.keyboards.client import payment_kb, purchase_target_kb, tariffs_kb
+from bot.keyboards.client import (
+    payment_kb,
+    purchase_intro_kb,
+    purchase_subscription_kb,
+    purchase_target_kb,
+    tariffs_kb,
+)
 
 
 def _button_texts(markup) -> list[str]:
@@ -76,3 +82,20 @@ def test_subscription_target_button_is_short_and_keeps_term_visible():
 
     assert texts[0] == "90 дн · 5 устр. · до 11.10.2026"
     assert "Базовый" not in texts[0]
+
+
+def test_purchase_carousel_keyboard_has_expected_actions():
+    assert _button_texts(purchase_intro_kb())[0] == "Продолжить"
+
+    texts = _button_texts(
+        purchase_subscription_kb(243, position=0, total=2, show_upgrade=True)
+    )
+    assert texts[:4] == ["↻ Продлить", "↑ Улучшить", "➕ Создать новую", "Следующая"]
+
+
+def test_trial_carousel_omits_upgrade_action():
+    texts = _button_texts(
+        purchase_subscription_kb(199, position=0, total=1, show_upgrade=False)
+    )
+    assert "↻ Продлить" in texts
+    assert "↑ Улучшить" not in texts

@@ -187,6 +187,61 @@ async def test_upgrade_menu_hides_admin_only_tariffs(db_session_factory):
     assert all(str(hidden_id) not in value for value in callbacks)
 
 
+async def test_purchase_carousel_contains_only_public_adapt_subscriptions(db_session_factory):
+    from bot.handlers import buy as buy_handler
+
+    async with db_session_factory() as session:
+        user = User(telegram_id=100500, full_name="User")
+        server = Server(name="test", host="127.0.0.1", location="Test")
+        adapt = Tariff(
+            days=30, label="Adapt", price_rub=100, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True, is_admin_only=False,
+            adapt_plan_uuid="adapt-plan",
+        )
+        marzban = Tariff(
+            days=30, label="Marzban", price_rub=100, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True, is_admin_only=False,
+        )
+        hidden = Tariff(
+            days=30, label="Hidden", price_rub=100, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True, is_admin_only=True,
+            adapt_plan_uuid="hidden-plan",
+        )
+        session.add_all([user, server, adapt, marzban, hidden])
+        await session.flush()
+        rows = [
+            Subscription(
+                user_id=user.id, server_id=server.id, tariff_id=adapt.id,
+                tariff_months=1, tariff_days=30, status=SubStatus.ACTIVE,
+                vpn_key="https://example.test/adapt", client_name="adapt_public",
+                platform=Platform.ANDROID, expires_at=datetime.utcnow() + timedelta(days=10),
+            ),
+            Subscription(
+                user_id=user.id, server_id=server.id, tariff_id=marzban.id,
+                tariff_months=1, tariff_days=30, status=SubStatus.ACTIVE,
+                vpn_key="https://example.test/marzban", client_name="local_key",
+                platform=Platform.ANDROID, expires_at=datetime.utcnow() + timedelta(days=10),
+            ),
+            Subscription(
+                user_id=user.id, server_id=server.id, tariff_id=hidden.id,
+                tariff_months=1, tariff_days=30, status=SubStatus.ACTIVE,
+                vpn_key="https://example.test/hidden", client_name="adapt_hidden",
+                platform=Platform.ANDROID, expires_at=datetime.utcnow() + timedelta(days=10),
+            ),
+        ]
+        session.add_all(rows)
+        await session.commit()
+        public_id = rows[0].id
+
+    with (
+        patch("bot.handlers.buy.async_session", db_session_factory),
+        patch("bot.handlers.buy.settings.is_admin", return_value=False),
+    ):
+        targets = await buy_handler._purchase_targets(100500)
+
+    assert [target.id for target in targets] == [public_id]
+
+
 async def test_renew_target_does_not_mutate_frozen_callback(db_session_factory):
     """The exact production failure must not recur with aiogram's frozen model."""
     from bot.handlers import buy as buy_handler
@@ -223,6 +278,79 @@ async def test_renew_target_does_not_mutate_frozen_callback(db_session_factory):
     assert callback.data == f"purchase_renew_{sub_id}"
 
 
+async def test_purchase_carousel_shows_url_and_does_not_mutate_callback():
+    from bot.handlers import buy as buy_handler
+
+    sub = SimpleNamespace(
+        id=243,
+        status=SimpleNamespace(value="active"),
+        tariff=SimpleNamespace(days=90, device_count=5),
+        tariff_days=90,
+        device_slots=5,
+        expires_at=datetime(2026, 10, 11),
+        vpn_key="https://example.test/sub?a=1&b=2",
+        client_name="adapt_test",
+    )
+    callback = _FrozenCallback("purchase_browse_0")
+    with patch(
+        "bot.handlers.buy._purchase_targets",
+        new_callable=AsyncMock,
+        side_effect=[[sub], []],
+    ):
+        await buy_handler.browse_purchase_subscriptions(callback)
+
+    edit = callback.message.edit_text.await_args
+    assert "Подписка 1/1" in edit.args[0]
+    assert "https://example.test/sub?a=1&amp;b=2" in edit.args[0]
+    assert callback.data == "purchase_browse_0"
+    assert "↑ Улучшить" not in [
+        button.text for row in edit.kwargs["reply_markup"].inline_keyboard for button in row
+    ]
+
+
+async def test_single_unpaid_trial_opens_paid_tariffs_immediately():
+    from bot.handlers import buy as buy_handler
+
+    trial = SimpleNamespace(
+        id=199,
+        billing_mode="tariff",
+        tariff=SimpleNamespace(days=7, adapt_plan_uuid="trial-plan"),
+    )
+    callback = _FrozenCallback("buy")
+    open_trial = AsyncMock()
+    with (
+        patch("bot.handlers.buy._has_non_vpn_tariffs", new_callable=AsyncMock, return_value=False),
+        patch("bot.handlers.buy._purchase_targets", new_callable=AsyncMock, return_value=[trial]),
+        patch("bot.handlers.buy._has_completed_payment", new_callable=AsyncMock, return_value=False),
+        patch("bot.handlers.buy._open_renew_target", open_trial),
+    ):
+        await buy_handler.start_purchase(callback)
+
+    open_trial.assert_awaited_once_with(callback, 199)
+    callback.message.edit_text.assert_not_awaited()
+
+
+async def test_paid_trial_user_sees_purchase_intro_before_carousel():
+    from bot.handlers import buy as buy_handler
+
+    trial = SimpleNamespace(
+        id=199,
+        billing_mode="tariff",
+        tariff=SimpleNamespace(days=7, adapt_plan_uuid="trial-plan"),
+    )
+    callback = _FrozenCallback("buy")
+    with (
+        patch("bot.handlers.buy._has_non_vpn_tariffs", new_callable=AsyncMock, return_value=False),
+        patch("bot.handlers.buy._purchase_targets", new_callable=AsyncMock, return_value=[trial]),
+        patch("bot.handlers.buy._has_completed_payment", new_callable=AsyncMock, return_value=True),
+    ):
+        await buy_handler.start_purchase(callback)
+
+    edit = callback.message.edit_text.await_args
+    assert "Оплата подписки" in edit.args[0]
+    assert edit.kwargs["reply_markup"].inline_keyboard[0][0].text == "Продолжить"
+
+
 async def test_trial_renewal_shows_public_paid_plans_with_upgrade_intent(db_session_factory):
     from bot.handlers import buy as buy_handler
 
@@ -248,7 +376,7 @@ async def test_trial_renewal_shows_public_paid_plans_with_upgrade_intent(db_sess
             user_id=user.id, server_id=server.id, tariff_id=trial.id,
             tariff_months=0, tariff_days=7, status=SubStatus.ACTIVE,
             vpn_key="https://example.test/sub", client_name="adapt_trial",
-            platform=Platform.ANDROID, expires_at=datetime.utcnow() + timedelta(days=5),
+            platform=Platform.ANDROID, expires_at=datetime.utcnow() - timedelta(days=1),
         )
         session.add(subscription)
         await session.commit()

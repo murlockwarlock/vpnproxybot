@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import datetime
+from html import escape
 from urllib.parse import urlparse
 
 from aiogram import F, Router
@@ -20,10 +21,21 @@ from bot.keyboards.client import (
     platform_kb,
     product_type_kb,
     tariffs_kb,
-    purchase_action_kb,
+    purchase_intro_kb,
+    purchase_subscription_kb,
     purchase_target_kb,
 )
-from bot.models import BotSettings, Partner, Server, Subscription, Tariff, TariffType, User
+from bot.models import (
+    BotSettings,
+    Partner,
+    Payment,
+    PaymentStatus,
+    Server,
+    Subscription,
+    Tariff,
+    TariffType,
+    User,
+)
 from bot.services.balance_service import get_user_balance
 from bot.services.legal_docs import build_legal_notice, get_all_legal_doc_urls
 from bot.services.purchase_intent import decode_intent, encode_intent, get_purchase_price_rub
@@ -41,6 +53,7 @@ from bot.services.tariff_rules import (
     is_intro_basic_tariff,
     supports_extra_devices,
 )
+from bot.services.vhq_subscription_proxy import get_subscription_display_key
 from bot.utils.texts import (
     NO_TARIFFS,
     SELECT_PAYMENT,
@@ -145,17 +158,19 @@ async def start_purchase(callback: CallbackQuery) -> None:
     purchase_targets = await _purchase_targets(callback.from_user.id)
 
     if purchase_targets:
-        show_upgrade = bool(await _purchase_targets(callback.from_user.id, adapt_only=True))
-        upgrade_help = (
-            "\n<b>Улучшить</b> — перейти на более дорогой тариф."
-            if show_upgrade else ""
-        )
+        if (
+            len(purchase_targets) == 1
+            and is_adapt_trial_subscription(purchase_targets[0])
+            and not await _has_completed_payment(callback.from_user.id)
+        ):
+            await _open_renew_target(callback, purchase_targets[0].id)
+            return
         await callback.message.edit_text(
-            "Что вы хотите сделать?\n\n"
-            "<b>Продлить</b> — добавить срок к текущему тарифу.\n"
-            f"{upgrade_help}\n"
-            "<b>Создать новую</b> — получить отдельную ссылку.",
-            reply_markup=purchase_action_kb(show_upgrade=show_upgrade),
+            "<b>Оплата подписки</b>\n\n"
+            "<b>Продлить</b> — добавить срок к выбранной подписке и сохранить её ссылку.\n\n"
+            "<b>Улучшить</b> — перейти на более дорогой тариф, если он доступен.\n\n"
+            "На следующем экране вы увидите каждую подписку отдельно вместе с её ссылкой.",
+            reply_markup=purchase_intro_kb(),
             parse_mode="HTML",
         )
         await callback.answer()
@@ -178,6 +193,63 @@ async def start_purchase(callback: CallbackQuery) -> None:
     await _show_tariffs(callback, TariffType.VPN, has_product_types=False, intent_suffix="~n~0")
 
 
+async def _has_completed_payment(telegram_id: int) -> bool:
+    async with async_session() as session:
+        payment_id = await session.scalar(
+            select(Payment.id)
+            .join(User, User.id == Payment.user_id)
+            .where(User.telegram_id == telegram_id)
+            .where(Payment.status == PaymentStatus.COMPLETED)
+            .limit(1)
+        )
+    return payment_id is not None
+
+
+def _purchase_subscription_text(sub: Subscription, position: int, total: int) -> str:
+    status = "активна" if sub.status.value == "active" else "срок закончился"
+    expires = sub.expires_at.strftime("%d.%m.%Y") if sub.expires_at else "—"
+    days = int(getattr(sub.tariff, "days", 0) or sub.tariff_days or 0)
+    devices = int(sub.device_slots or getattr(sub.tariff, "device_count", 0) or 1)
+    url = get_subscription_display_key(sub) or sub.vpn_key or "Ссылка недоступна"
+    return (
+        f"<b>Подписка {position + 1}/{total}</b>\n\n"
+        f"Статус: <b>{status}</b>\n"
+        f"Срок тарифа: <b>{days} дн.</b>\n"
+        f"Устройств: <b>{devices}</b>\n"
+        f"Действует до: <b>{expires}</b>\n\n"
+        f"Ссылка подписки:\n<code>{escape(str(url))}</code>"
+    )
+
+
+@router.callback_query(F.data.startswith("purchase_browse_"))
+async def browse_purchase_subscriptions(callback: CallbackQuery) -> None:
+    try:
+        requested_position = int(callback.data.removeprefix("purchase_browse_"))
+    except ValueError:
+        requested_position = 0
+    targets = await _purchase_targets(callback.from_user.id)
+    if not targets:
+        await callback.answer("Подходящих подписок не найдено. Можно создать новую.", show_alert=True)
+        return
+    position = requested_position % len(targets)
+    sub = targets[position]
+    upgrade_ids = {
+        item.id for item in await _purchase_targets(callback.from_user.id, upgrade_only=True)
+    }
+    await callback.message.edit_text(
+        _purchase_subscription_text(sub, position, len(targets)),
+        reply_markup=purchase_subscription_kb(
+            sub.id,
+            position=position,
+            total=len(targets),
+            show_upgrade=sub.id in upgrade_ids,
+        ),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "buy_new")
 async def start_new_purchase(callback: CallbackQuery) -> None:
     async with async_session() as session:
@@ -193,7 +265,7 @@ async def start_new_purchase(callback: CallbackQuery) -> None:
     await _show_tariffs(callback, TariffType.VPN, has_product_types=False, intent_suffix="~n~0")
 
 
-async def _purchase_targets(telegram_id: int, *, adapt_only: bool = False) -> list[Subscription]:
+async def _purchase_targets(telegram_id: int, *, upgrade_only: bool = False) -> list[Subscription]:
     async with async_session() as session:
         result = await session.execute(
             select(Subscription)
@@ -204,7 +276,7 @@ async def _purchase_targets(telegram_id: int, *, adapt_only: bool = False) -> li
         )
         items = result.scalars().all()
         upgrade_prices: list[float] = []
-        if adapt_only:
+        if upgrade_only:
             tariff_query = (
                 select(Tariff.price_rub)
                 .where(Tariff.is_active == True)  # noqa: E712
@@ -213,9 +285,18 @@ async def _purchase_targets(telegram_id: int, *, adapt_only: bool = False) -> li
             if not settings.is_admin(telegram_id):
                 tariff_query = tariff_query.where(Tariff.is_admin_only == False)  # noqa: E712
             upgrade_prices = [float(value) for value in (await session.scalars(tariff_query)).all()]
+    items = [
+        sub
+        for sub in items
+        if sub.status.value in {"active", "expired"}
+        and bool(sub.vpn_key)
+        and is_adapt_subscription(sub)
+        and sub.tariff is not None
+        and sub.tariff.is_active
+    ]
     if not settings.is_admin(telegram_id):
-        items = [sub for sub in items if not sub.tariff or not sub.tariff.is_admin_only]
-    if not adapt_only:
+        items = [sub for sub in items if not sub.tariff.is_admin_only]
+    if not upgrade_only:
         return items
     now = datetime.utcnow()
     return [
@@ -242,7 +323,7 @@ def _subscription_count_text(count: int, action: str) -> str:
 @router.callback_query(F.data.in_({"purchase_action_renew", "purchase_action_upgrade"}))
 async def choose_purchase_target(callback: CallbackQuery) -> None:
     action = callback.data.removeprefix("purchase_action_")
-    targets = await _purchase_targets(callback.from_user.id, adapt_only=action == "upgrade")
+    targets = await _purchase_targets(callback.from_user.id, upgrade_only=action == "upgrade")
     if not targets:
         await callback.answer("Подходящих подписок не найдено", show_alert=True)
         return
@@ -270,19 +351,20 @@ async def _open_renew_target(callback: CallbackQuery, sub_id: int) -> None:
         sub = await session.get(Subscription, sub_id)
         tariff = await session.get(Tariff, sub.tariff_id) if sub and sub.tariff_id else None
         owner_ok = bool(sub and await session.scalar(select(User.id).where(User.id == sub.user_id, User.telegram_id == callback.from_user.id)))
-    if not owner_ok or not tariff or not tariff.is_active:
+    if (
+        not owner_ok
+        or not sub
+        or not is_adapt_subscription(sub)
+        or not tariff
+        or not tariff.adapt_plan_uuid
+        or not tariff.is_active
+    ):
         await callback.answer("Тариф этой подписки больше недоступен", show_alert=True)
         return
     if tariff.is_admin_only and not settings.is_admin(callback.from_user.id):
         await callback.answer("Тариф этой подписки больше недоступен", show_alert=True)
         return
     if is_adapt_trial_tariff(tariff):
-        if sub.expires_at <= datetime.utcnow():
-            await callback.answer(
-                "Срок тестовой подписки уже закончился. Напишите в поддержку — поможем сохранить ссылку.",
-                show_alert=True,
-            )
-            return
         async with async_session() as session:
             query = (
                 select(Tariff)
@@ -320,6 +402,7 @@ async def _open_upgrade_target(callback: CallbackQuery, sub_id: int) -> None:
         owner_ok = bool(sub and await session.scalar(select(User.id).where(User.id == sub.user_id, User.telegram_id == callback.from_user.id)))
         if (
             not owner_ok
+            or not is_adapt_subscription(sub)
             or not current
             or not current.adapt_plan_uuid
             or (current.is_admin_only and not settings.is_admin(callback.from_user.id))
