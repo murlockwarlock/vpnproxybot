@@ -46,6 +46,9 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📣 Рекламные ссылки",    callback_data="adm_ads"),
     )
     builder.row(
+        InlineKeyboardButton(text="📜 Журнал действий", callback_data="adm_audit_1"),
+    )
+    builder.row(
         InlineKeyboardButton(text="🔌 Adapt планы",          callback_data="adm_adapt_plans"),
     )
     return builder.as_markup()
@@ -191,9 +194,7 @@ def user_search_kb(users: list = None, page: int = 1, total_pages: int = 1) -> I
     nav.append(InlineKeyboardButton(text="След. ▶️", callback_data=f"adm_users_{next_page}"))
     builder.row(*nav)
     
-    builder.row(InlineKeyboardButton(text="🔍 По Telegram ID", callback_data="adm_user_by_id"))
-    builder.row(InlineKeyboardButton(text="🔍 По Username", callback_data="adm_user_by_username"))
-    builder.row(InlineKeyboardButton(text="🔍 По ссылке / Ключу", callback_data="adm_user_by_link"))
+    builder.row(InlineKeyboardButton(text="🔎 Поиск", callback_data="adm_user_search"))
     builder.row(InlineKeyboardButton(text="◀️ Назад",          callback_data="adm_back"))
     return builder.as_markup()
 

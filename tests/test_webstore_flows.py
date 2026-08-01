@@ -540,3 +540,146 @@ async def test_web_profile_enriches_legacy_telegram_adapt_item(monkeypatch):
     assert item.adapt_plan_uuid == plan_uuid
     assert item.device_slots == 5
     session.flush.assert_awaited_once()
+
+
+async def test_admin_client_search_finds_telegram_username_and_subscription_key(patched_webstore):
+    async with patched_webstore() as session:
+        session.add(WebProfileLink(
+            profile_token="profile-search",
+            contact="89150000000",
+            telegram_id=123456789,
+            telegram_username="search_user",
+            telegram_full_name="Search User",
+        ))
+        session.add(WebTelegramItem(
+            profile_token="profile-search",
+            telegram_id=123456789,
+            item_type="vpn",
+            external_id="adapt-search-uuid",
+            title="VPN",
+            key_value="https://example.test/subscription/search-key",
+        ))
+        await session.commit()
+
+    headers = {"X-Internal-Secret": "bridge-secret"}
+    username_response = await webstore_routes.handle_internal_admin_client_lookup(
+        _Request(query={"q": "@search_user"}, headers=headers)
+    )
+    key_response = await webstore_routes.handle_internal_admin_client_lookup(
+        _Request(query={"q": "search-key"}, headers=headers)
+    )
+
+    assert username_response.status == 200
+    assert json.loads(username_response.text)["profiles"][0]["profile_token"] == "profile-search"
+    assert key_response.status == 200
+    assert json.loads(key_response.text)["profiles"][0]["telegram"]["id"] == "123456789"
+
+
+async def test_admin_order_actions_enforce_payment_state(monkeypatch, patched_webstore):
+    notify_admins = AsyncMock()
+    notify_customer = AsyncMock(return_value=True)
+    sync_referral = AsyncMock()
+    monkeypatch.setattr(webstore_routes, "_notify_admins_webstore", notify_admins)
+    monkeypatch.setattr(webstore_routes, "_notify_linked_webstore_user", notify_customer)
+    monkeypatch.setattr(webstore_routes, "_sync_referral_credit_for_order", sync_referral)
+    async with patched_webstore() as session:
+        unpaid = WebOrder(
+            order_id="admin-unpaid",
+            contact="unpaid@example.com",
+            tariff_key="vpn_30",
+            tariff_label="30 дней",
+            days=30,
+            amount_rub=100,
+            status="pending",
+        )
+        paid = WebOrder(
+            order_id="admin-paid",
+            contact="paid@example.com",
+            tariff_key="vpn_30",
+            tariff_label="30 дней",
+            days=30,
+            amount_rub=100,
+            status="paid",
+            paid_at=datetime.utcnow(),
+        )
+        session.add_all([unpaid, paid])
+        await session.commit()
+
+    headers = {"X-Internal-Secret": "bridge-secret"}
+    forbidden_retry = await webstore_routes.handle_internal_admin_order_action(
+        _Request(_json_body={"order_id": "admin-unpaid", "action": "retry"}, headers=headers)
+    )
+    assert forbidden_retry.status == 409
+
+    async def _deliver(_session, order):
+        order.fulfillment_attempts += 1
+        order.status = "delivered"
+        order.delivered_at = datetime.utcnow()
+
+    monkeypatch.setattr(webstore_routes, "attempt_fulfill_order", _deliver)
+    retry_response = await webstore_routes.handle_internal_admin_order_action(
+        _Request(_json_body={"order_id": "admin-paid", "action": "retry"}, headers=headers)
+    )
+    retry_payload = json.loads(retry_response.text)
+    assert retry_response.status == 200
+    assert retry_payload["before"]["status"] == "paid"
+    assert retry_payload["order"]["status"] == "delivered"
+    notify_admins.assert_awaited_once()
+    notify_customer.assert_awaited_once()
+    sync_referral.assert_awaited_once_with("admin-paid")
+
+    cancel_paid = await webstore_routes.handle_internal_admin_order_action(
+        _Request(_json_body={"order_id": "admin-paid", "action": "cancel"}, headers=headers)
+    )
+    assert cancel_paid.status == 409
+
+    cancel_unpaid = await webstore_routes.handle_internal_admin_order_action(
+        _Request(_json_body={"order_id": "admin-unpaid", "action": "cancel"}, headers=headers)
+    )
+    assert cancel_unpaid.status == 200
+    assert json.loads(cancel_unpaid.text)["order"]["status"] == "canceled"
+
+
+async def test_admin_retry_keeps_delivered_access_when_notification_fails(monkeypatch, patched_webstore):
+    async with patched_webstore() as session:
+        session.add(WebOrder(
+            order_id="admin-notify-failure",
+            contact="client@example.com",
+            tariff_key="vpn_30",
+            tariff_label="30 дней",
+            days=30,
+            amount_rub=100,
+            status="paid",
+            paid_at=datetime.utcnow(),
+        ))
+        await session.commit()
+
+    async def _deliver(_session, order):
+        order.fulfillment_attempts += 1
+        order.status = "delivered"
+        order.subscription_url = "https://example.test/sub/client"
+        order.delivered_at = datetime.utcnow()
+
+    monkeypatch.setattr(webstore_routes, "attempt_fulfill_order", _deliver)
+    monkeypatch.setattr(
+        webstore_routes, "_notify_admins_webstore",
+        AsyncMock(side_effect=RuntimeError("telegram unavailable")),
+    )
+    monkeypatch.setattr(webstore_routes, "_notify_linked_webstore_user", AsyncMock(return_value=True))
+    monkeypatch.setattr(webstore_routes, "_sync_referral_credit_for_order", AsyncMock())
+
+    response = await webstore_routes.handle_internal_admin_order_action(
+        _Request(
+            _json_body={"order_id": "admin-notify-failure", "action": "retry"},
+            headers={"X-Internal-Secret": "bridge-secret"},
+        )
+    )
+    payload = json.loads(response.text)
+
+    assert response.status == 200
+    assert payload["order"]["status"] == "delivered"
+    assert payload["warnings"]
+    async with patched_webstore() as session:
+        stored = await session.scalar(select(WebOrder).where(WebOrder.order_id == "admin-notify-failure"))
+        assert stored.status == "delivered"
+        assert stored.subscription_url == "https://example.test/sub/client"

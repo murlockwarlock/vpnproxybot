@@ -14,7 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import func, select, delete, text
+from sqlalchemy import func, select, delete, text, or_
 from sqlalchemy.orm import selectinload
 
 from bot.config import settings
@@ -57,7 +57,9 @@ from bot.models import (
     TariffType,
     User,
     AdaptSubscription,
+    AdminActionLog,
 )
+from bot.services.admin_audit import write_admin_audit
 from bot.services.client_names import build_client_name
 from bot.services.device_slots import get_included_device_slots
 from bot.services.legal_docs import LEGAL_DOCS, get_all_legal_doc_urls
@@ -389,6 +391,7 @@ ESCAPE_COMMANDS = {"/start", "/help", "/admin", "/policy", "/agree", "/oferta"}
 # ── FSM States ────────────────────────────────────────
 
 class AdminStates(StatesGroup):
+    waiting_user_search           = State()
     waiting_user_id               = State()
     waiting_user_username         = State()
     waiting_user_link             = State()
@@ -1089,6 +1092,13 @@ async def admin_toggle_server(callback: CallbackQuery) -> None:
             server.is_active = not server.is_active
             await session.commit()
             status = "🟢 включён" if server.is_active else "🔴 выключен"
+            await write_admin_audit(
+                actor_telegram_id=callback.from_user.id,
+                action="server_status_changed",
+                entity_type="server",
+                entity_id=str(server_id),
+                summary=f"Сервер «{server.name}» {status.replace('🟢 ', '').replace('🔴 ', '')}",
+            )
             await callback.answer(
                 SERVER_TOGGLED.format(name=server.name, status=status), show_alert=True,
             )
@@ -1177,6 +1187,14 @@ async def admin_add_server_process(message: Message, state: FSMContext) -> None:
             reply_markup=admin_menu_kb(),
             parse_mode="HTML",
         )
+        await write_admin_audit(
+            actor_telegram_id=message.from_user.id,
+            action="server_created",
+            entity_type="server",
+            entity_id=name,
+            summary=f"Сервер «{name}» добавлен",
+            details=f"Локация: {location}; лимит клиентов: {int(max_clients)}",
+        )
         await state.clear()
     except Exception as exc:
         logger.error(f"Server add error: {exc}")
@@ -1190,9 +1208,10 @@ async def admin_add_server_process(message: Message, state: FSMContext) -> None:
 # ── Users ─────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("adm_users"))
-async def admin_users(callback: CallbackQuery) -> None:
+async def admin_users(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         return
+    await state.clear()
 
     parts = callback.data.split("_")
     page = 1
@@ -1239,8 +1258,78 @@ async def admin_users(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data.regexp(r"^adm_audit_\d+$"))
+async def admin_audit_journal(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    page = max(1, int(callback.data.removeprefix("adm_audit_")))
+    page_size = 8
+    async with async_session() as session:
+        total = await session.scalar(select(func.count(AdminActionLog.id))) or 0
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages)
+        rows = (await session.execute(
+            select(AdminActionLog)
+            .order_by(AdminActionLog.created_at.desc(), AdminActionLog.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )).scalars().all()
+
+    action_labels = {
+        "unified_user_search": "🔎 Поиск клиентов",
+        "web_order_retry": "🔄 Повтор выдачи",
+        "web_order_resend": "📨 Повтор уведомления",
+        "web_order_cancel": "❌ Отмена заказа",
+        "user_block_toggle": "👤 Доступ пользователя",
+        "user_account_reset": "☠️ Сброс аккаунта",
+        "partner_created": "🤝 Создание партнёра",
+        "adapt_device_deleted": "📱 Удаление устройства",
+        "server_status_changed": "🖥 Статус сервера",
+        "server_created": "➕ Добавление сервера",
+        "server_deleted": "🗑 Удаление сервера",
+        "tariff_status_changed": "📋 Статус тарифа",
+        "tariff_visibility_changed": "👁 Видимость тарифа",
+        "tariff_deleted": "🗑 Удаление тарифа",
+        "web_balance_adjusted": "💳 Изменение баланса сайта",
+    }
+    status_labels = {"success": "✅", "partial": "⚠️", "error": "❌"}
+    blocks: list[str] = []
+    for row in rows:
+        target = ""
+        if row.entity_id:
+            target = f"\nОбъект: <code>{html.escape(row.entity_id)}</code>"
+        if row.target_telegram_id:
+            target += f"\nКлиент TG: <code>{row.target_telegram_id}</code>"
+        details = f"\nДетали: {html.escape(row.details[:350])}" if row.details else ""
+        blocks.append(
+            f"{status_labels.get(row.status, '•')} <b>{html.escape(action_labels.get(row.action, row.action))}</b>\n"
+            f"Администратор: <code>{row.actor_telegram_id}</code>\n"
+            f"Время: <b>{html.escape(_format_dt_msk(row.created_at))}</b>{target}\n"
+            f"Результат: {html.escape(row.summary)}{details}"
+        )
+    divider = "\n━━━━━━━━━━━━━━━━━━━━\n"
+    text_value = (
+        f"📜 <b>Журнал действий администраторов</b>\n"
+        f"Записей: <b>{total}</b> · Страница <b>{page}/{total_pages}</b>\n\n"
+        + (divider.join(blocks) if blocks else "<i>Записей пока нет.</i>")
+    )
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="◀️", callback_data=f"adm_audit_{max(1, page - 1)}"),
+        InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="ignore"),
+        InlineKeyboardButton(text="▶️", callback_data=f"adm_audit_{min(total_pages, page + 1)}"),
+    )
+    kb.row(InlineKeyboardButton(text="🔄 Обновить", callback_data=f"adm_audit_{page}"))
+    kb.row(InlineKeyboardButton(text="◀️ В админку", callback_data="adm_back"))
+    try:
+        await callback.message.edit_text(text_value, reply_markup=kb.as_markup(), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text_value, reply_markup=kb.as_markup(), parse_mode="HTML")
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("adm_usr_info_"))
-async def admin_user_info(callback: CallbackQuery) -> None:
+async def admin_user_info(callback: CallbackQuery, state: FSMContext) -> None:
     """Show user card from list."""
     if not _is_admin(callback.from_user.id):
         return
@@ -1257,7 +1346,224 @@ async def admin_user_info(callback: CallbackQuery) -> None:
         return
         
     await _show_user_info(callback.message, user)
+    await state.clear()
     await callback.answer()
+
+
+async def _fetch_webstore_search_profiles(query: str) -> list[dict]:
+    if not settings.webstore_public_enabled:
+        return []
+    import aiohttp as _aiohttp
+    url = f"{settings.webstore_api_base_url.rstrip('/')}/api/store/internal/admin-client-lookup"
+    headers = {"X-Internal-Secret": settings.webstore_bridge_secret}
+    async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=10)) as sess:
+        async with sess.get(url, headers=headers, params={"q": query}) as resp:
+            if resp.status == 404:
+                return []
+            data = await resp.json()
+            if resp.status != 200:
+                raise RuntimeError(str(data.get("error") or f"HTTP {resp.status}"))
+            return list(data.get("profiles") or [])
+
+
+async def _run_unified_user_search(query: str) -> tuple[list[dict], str | None]:
+    clean = query.strip()
+    username = clean.removeprefix("@")
+    numeric = int(clean) if clean.isdigit() else -1
+    like = f"%{clean}%"
+    username_like = f"%{username}%"
+
+    sub_user_ids = select(Subscription.user_id).outerjoin(
+        AdaptSubscription, AdaptSubscription.subscription_id == Subscription.id
+    ).where(or_(
+        Subscription.vpn_key.contains(clean),
+        Subscription.client_name.ilike(like),
+        AdaptSubscription.adapt_uuid.ilike(like),
+    ))
+    proxy_user_ids = select(ProxyAccount.user_id).where(or_(
+        ProxyAccount.sub_url.contains(clean),
+        ProxyAccount.marzban_username.ilike(like),
+    ))
+    async with async_session() as session:
+        result = await session.execute(
+            select(User).where(or_(
+                User.telegram_id == numeric,
+                User.username.ilike(username_like),
+                User.full_name.ilike(like),
+                User.id.in_(sub_user_ids),
+                User.id.in_(proxy_user_ids),
+            )).order_by(User.created_at.desc()).limit(100)
+        )
+        bot_users = result.scalars().all()
+
+    web_error = None
+    try:
+        web_profiles = await _fetch_webstore_search_profiles(clean)
+    except Exception as exc:
+        logger.warning("Unified admin search: webstore unavailable: %s", exc)
+        web_profiles = []
+        web_error = "Вебстор временно не ответил; показаны результаты Telegram-бота."
+
+    results: list[dict] = []
+    bot_tg_ids = {int(user.telegram_id) for user in bot_users}
+    web_by_tg: dict[int, dict] = {}
+    for profile in web_profiles:
+        tg = profile.get("telegram") or {}
+        tg_raw = tg.get("id")
+        if str(tg_raw or "").isdigit():
+            web_by_tg[int(tg_raw)] = profile
+
+    for user in bot_users:
+        profile = web_by_tg.get(int(user.telegram_id))
+        results.append({
+            "kind": "bot",
+            "telegram_id": int(user.telegram_id),
+            "username": user.username or "",
+            "name": user.full_name or user.username or str(user.telegram_id),
+            "blocked": bool(user.is_blocked),
+            "has_web": bool(profile),
+            "contact": str((profile or {}).get("contact") or ""),
+        })
+    for profile in web_profiles:
+        tg = profile.get("telegram") or {}
+        tg_raw = tg.get("id")
+        if str(tg_raw or "").isdigit() and int(tg_raw) in bot_tg_ids:
+            continue
+        results.append({
+            "kind": "web",
+            "profile_token": str(profile.get("profile_token") or ""),
+            "contact": str(profile.get("contact") or "—"),
+            "telegram_id": int(tg_raw) if str(tg_raw or "").isdigit() else None,
+            "username": str(tg.get("username") or ""),
+            "name": str(tg.get("full_name") or profile.get("contact") or "Клиент сайта"),
+        })
+    return results, web_error
+
+
+def _build_unified_search_page(results: list[dict], query: str, page: int, warning: str | None = None):
+    page_size = 8
+    total_pages = max(1, (len(results) + page_size - 1) // page_size)
+    current = min(max(1, page), total_pages)
+    start = (current - 1) * page_size
+    shown = results[start:start + page_size]
+    blocks: list[str] = []
+    kb = InlineKeyboardBuilder()
+    for absolute_idx, item in enumerate(shown, start=start):
+        if item["kind"] == "bot":
+            source = "Telegram + сайт" if item.get("has_web") else "Telegram"
+            identifier = f"ID {item['telegram_id']}"
+            if item.get("username"):
+                identifier += f" · @{item['username']}"
+            callback_data = f"adm_usr_info_{item['telegram_id']}"
+        else:
+            source = "Только сайт"
+            identifier = item.get("contact") or "профиль сайта"
+            callback_data = f"adm_usearch_web_{absolute_idx}"
+        blocks.append(
+            f"<b>{absolute_idx + 1}. {html.escape(str(item.get('name') or 'Клиент'))}</b>\n"
+            f"├ {html.escape(identifier)}\n"
+            f"└ Источник: <b>{source}</b>"
+        )
+        kb.row(InlineKeyboardButton(
+            text=f"Открыть #{absolute_idx + 1} · {str(item.get('name') or 'Клиент')[:28]}",
+            callback_data=callback_data,
+        ))
+    divider = "\n━━━━━━━━━━━━━━━━━━━━\n"
+    text_value = (
+        "🔎 <b>Поиск клиентов</b>\n"
+        f"Запрос: <code>{html.escape(query)}</code>\n"
+        f"Найдено: <b>{len(results)}</b> · Страница <b>{current}/{total_pages}</b>\n"
+    )
+    if warning:
+        text_value += f"\n⚠️ {html.escape(warning)}\n"
+    text_value += "\n" + (divider.join(blocks) if blocks else "<i>Совпадений нет.</i>")
+    if total_pages > 1:
+        kb.row(
+            InlineKeyboardButton(text="◀️", callback_data=f"adm_usearch_page_{max(1, current - 1)}"),
+            InlineKeyboardButton(text=f"{current}/{total_pages}", callback_data="ignore"),
+            InlineKeyboardButton(text="▶️", callback_data=f"adm_usearch_page_{min(total_pages, current + 1)}"),
+        )
+    kb.row(InlineKeyboardButton(text="🔎 Поиск", callback_data="adm_user_search"))
+    kb.row(InlineKeyboardButton(text="◀️ К клиентам", callback_data="adm_users"))
+    return text_value, kb.as_markup()
+
+
+@router.callback_query(F.data == "adm_user_search")
+async def admin_unified_search_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_user_search)
+    await callback.message.edit_text(
+        "🔎 <b>Поиск клиентов</b>\n\n"
+        "Введите Telegram ID, @username, имя, телефон, email, номер заказа, "
+        "ссылку подписки, ключ, UUID Adapt или имя клиента на сервере:",
+        reply_markup=admin_back_kb(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_user_search, F.text)
+async def admin_unified_search_process(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    query = message.text.strip()
+    if len(query) < 2:
+        await message.answer("Введите минимум 2 символа.")
+        return
+    results, warning = await _run_unified_user_search(query)
+    await state.update_data(unified_results=results, unified_query=query, unified_warning=warning)
+    text_value, markup = _build_unified_search_page(results, query, 1, warning)
+    await message.answer(text_value, reply_markup=markup, parse_mode="HTML")
+    await write_admin_audit(
+        actor_telegram_id=message.from_user.id,
+        action="unified_user_search",
+        entity_type="user_search",
+        status="partial" if warning else "success",
+        summary=f"Поиск клиентов: найдено {len(results)}",
+        details=(
+            "Запрос: ссылка/ключ скрыт"
+            if query.lower().startswith(("http://", "https://")) or len(query) > 64
+            else f"Запрос: {query[:120]}"
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("adm_usearch_page_"))
+async def admin_unified_search_page(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    data = await state.get_data()
+    results = data.get("unified_results") or []
+    if not results and "unified_query" not in data:
+        await callback.answer("Поиск устарел. Запустите его заново.", show_alert=True)
+        return
+    page = int(callback.data.removeprefix("adm_usearch_page_"))
+    text_value, markup = _build_unified_search_page(
+        results, data.get("unified_query") or "", page, data.get("unified_warning")
+    )
+    await callback.message.edit_text(text_value, reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_usearch_web_"))
+async def admin_unified_search_web_open(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    data = await state.get_data()
+    results = data.get("unified_results") or []
+    idx = int(callback.data.removeprefix("adm_usearch_web_"))
+    if idx < 0 or idx >= len(results) or results[idx].get("kind") != "web":
+        await callback.answer("Результат устарел. Запустите поиск заново.", show_alert=True)
+        return
+    token_prefix = str(results[idx].get("profile_token") or "")[:16]
+    if not token_prefix:
+        await callback.answer("У профиля нет идентификатора", show_alert=True)
+        return
+    # Reuse the full web profile card using a callback safely below Telegram's 64-byte limit.
+    synthetic = callback.model_copy(update={"data": f"adm_wb_prof_q:{token_prefix}:1"})
+    await admin_web_client_quick_lookup(synthetic)
+    await state.clear()
 
 
 @router.callback_query(F.data == "adm_user_by_id")
@@ -1396,6 +1702,14 @@ async def admin_toggle_block(callback: CallbackQuery) -> None:
             user.is_blocked = not user.is_blocked
             await session.commit()
             status = "заблокирован 🚫" if user.is_blocked else "разблокирован ✅"
+            await write_admin_audit(
+                actor_telegram_id=callback.from_user.id,
+                action="user_block_toggle",
+                entity_type="telegram_user",
+                entity_id=str(telegram_id),
+                target_telegram_id=telegram_id,
+                summary=f"Пользователь {status.replace(' 🚫', '').replace(' ✅', '')}",
+            )
             await callback.answer(f"Пользователь {status}", show_alert=True)
             # Refresh card
             await _show_user_info(callback.message, user)
@@ -1479,6 +1793,15 @@ async def admin_user_reset_do(callback: CallbackQuery) -> None:
         await session.execute(text("PRAGMA foreign_keys = ON"))
     
     await callback.answer("Аккаунт успешно обнулён!", show_alert=True)
+    await write_admin_audit(
+        actor_telegram_id=callback.from_user.id,
+        action="user_account_reset",
+        entity_type="telegram_user",
+        entity_id=str(telegram_id),
+        target_telegram_id=telegram_id,
+        summary="Аккаунт обнулён",
+        details=f"Удалено подписок: {len(sub_ids)}; очищены оплаты, ключи и баланс",
+    )
     # Refresh to show empty profile
     await admin_refresh_user(callback)
 
@@ -1537,6 +1860,15 @@ async def admin_user_make_partner(callback: CallbackQuery) -> None:
     from bot.handlers.partner import _show_partner_detail
 
     await _show_partner_detail(callback.message, partner_id)
+    if created:
+        await write_admin_audit(
+            actor_telegram_id=callback.from_user.id,
+            action="partner_created",
+            entity_type="telegram_user",
+            entity_id=str(partner_id),
+            target_telegram_id=telegram_id,
+            summary="Партнёр создан",
+        )
     await callback.answer("Партнёр создан" if created else "Партнёр уже существует")
 
 
@@ -1591,6 +1923,13 @@ async def admin_delete_server(callback: CallbackQuery) -> None:
         await session.delete(server)
         await session.commit()
     await callback.answer(f"Сервер «{name}» удалён", show_alert=True)
+    await write_admin_audit(
+        actor_telegram_id=callback.from_user.id,
+        action="server_deleted",
+        entity_type="server",
+        entity_id=str(server_id),
+        summary=f"Сервер «{name}» удалён",
+    )
     await admin_servers(callback)
 
 
@@ -1949,6 +2288,15 @@ async def admin_delete_device(callback: CallbackQuery) -> None:
         from bot.services.adapt_api import AdaptAPI
         success = await AdaptAPI().delete_device(adapt_uuid, int(device_id))
         if success:
+            await write_admin_audit(
+                actor_telegram_id=callback.from_user.id,
+                action="adapt_device_deleted",
+                entity_type="subscription",
+                entity_id=str(sub_id),
+                target_telegram_id=telegram_id,
+                summary="Устройство удалено",
+                details=f"ID устройства: {device_id}",
+            )
             await callback.answer("Устройство удалено!", show_alert=True)
         else:
             await callback.answer("Не удалось удалить устройство (API вернул false).", show_alert=True)
@@ -2655,6 +3003,13 @@ async def admin_tariff_toggle(callback: CallbackQuery) -> None:
             tariff.is_active = not tariff.is_active
             await session.commit()
             status = "активен 🟢" if tariff.is_active else "деактивирован 🔴"
+            await write_admin_audit(
+                actor_telegram_id=callback.from_user.id,
+                action="tariff_status_changed",
+                entity_type="tariff",
+                entity_id=str(tariff_id),
+                summary=f"Тариф «{tariff.label}»: {status}",
+            )
             await callback.answer(
                 ADMIN_TARIFF_TOGGLED.format(label=tariff.label, status=status),
                 show_alert=True,
@@ -2675,6 +3030,13 @@ async def admin_tariff_toggle_admin_only(callback: CallbackQuery) -> None:
         tariff.is_admin_only = not getattr(tariff, "is_admin_only", False)
         await session.commit()
         visibility = "только для админов 🔒" if tariff.is_admin_only else "виден пользователям 👁"
+        await write_admin_audit(
+            actor_telegram_id=callback.from_user.id,
+            action="tariff_visibility_changed",
+            entity_type="tariff",
+            entity_id=str(tariff_id),
+            summary=f"Тариф «{tariff.label}»: {visibility}",
+        )
         await callback.answer(f"Тариф «{tariff.label}» теперь {visibility}", show_alert=True)
         await admin_tariff_detail(callback)
 
@@ -2690,9 +3052,17 @@ async def admin_tariff_delete(callback: CallbackQuery) -> None:
             await callback.answer("Тариф не найден", show_alert=True)
             return
         tid = tariff.id
+        tariff_label = tariff.label
         await session.delete(tariff)
         await session.commit()
     await callback.answer(ADMIN_TARIFF_DELETED.format(id=tid), show_alert=True)
+    await write_admin_audit(
+        actor_telegram_id=callback.from_user.id,
+        action="tariff_deleted",
+        entity_type="tariff",
+        entity_id=str(tid),
+        summary=f"Тариф «{tariff_label}» удалён",
+    )
     await admin_tariffs(callback)
 
 
@@ -3839,8 +4209,8 @@ async def admin_stats_web(callback: CallbackQuery) -> None:
 
     back_kb = InlineKeyboardBuilder()
     back_kb.row(InlineKeyboardButton(text="👥 Список клиентов сайта", callback_data="adm_web_clients_list"))
-    back_kb.row(InlineKeyboardButton(text="🔎 Найти клиента", callback_data="adm_web_client_search"))
-    back_kb.row(InlineKeyboardButton(text="📋 Логи заказов", callback_data="adm_web_orders_log"))
+    back_kb.row(InlineKeyboardButton(text="🔎 Поиск", callback_data="adm_user_search"))
+    back_kb.row(InlineKeyboardButton(text="📋 Логи заказов", callback_data="adm_web_orders:all:1"))
     back_kb.row(InlineKeyboardButton(text="💳 Балансы", callback_data="adm_web_balance_search"))
     back_kb.row(InlineKeyboardButton(text="◀️ К статистике", callback_data="adm_stats"))
 
@@ -3993,7 +4363,7 @@ async def admin_web_clients_list(callback: CallbackQuery) -> None:
             f"├ Баланс: <b>{bal:.2f} ₽</b> | Оплат: <b>{paid_sum} ₽</b> ({paid_count} шт.)\n"
             f"└ Профиль: <code>{token}</code>"
         )
-        kb.row(InlineKeyboardButton(text=f"🔍 Карточка #{idx}: {contact[:20]}", callback_data=f"adm_wb_prof_q:{token}:{current_page}"))
+        kb.row(InlineKeyboardButton(text=f"🔍 Карточка #{idx}: {contact[:20]}", callback_data=f"adm_wb_prof_q:{token[:16]}:{current_page}"))
 
     divider = "\n━━━━━━━━━━━━━━━━━━━━\n"
     text = (
@@ -4194,40 +4564,258 @@ async def admin_web_client_quick_lookup(callback: CallbackQuery) -> None:
 async def admin_web_orders_log(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         return
-    if not settings.webstore_public_enabled:
-        await callback.answer("Вебстор не подключён", show_alert=True)
-        return
-
-    import aiohttp as _aiohttp
-    url = f"{settings.webstore_api_base_url.rstrip('/')}/api/store/internal/admin-stats"
-    headers = {"X-Internal-Secret": settings.webstore_bridge_secret}
-    try:
-        async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=10)) as sess:
-            async with sess.get(url, headers=headers) as resp:
-                if resp.status != 200:
-                    await callback.answer(f"Ошибка: {resp.status}", show_alert=True)
-                    return
-                d = await resp.json()
-    except Exception as e:
-        await callback.answer(f"Ошибка: {e}", show_alert=True)
-        return
-
-    orders = d.get("recent_orders", [])
-    if not orders:
-        await callback.answer("Заказов нет", show_alert=True)
-        return
-
     page = 1
     parts = callback.data.rsplit("_", 1)
     if len(parts) == 2 and parts[-1].isdigit():
         page = max(1, int(parts[-1]))
+    synthetic = callback.model_copy(update={"data": f"adm_web_orders:all:{page}"})
+    await admin_web_orders(synthetic)
 
-    text, back_kb = _build_web_orders_log_page(orders, page)
-    try:
-        await callback.message.edit_text(text, reply_markup=back_kb.as_markup(), parse_mode="HTML")
-    except Exception:
-        await callback.message.answer(text, reply_markup=back_kb.as_markup(), parse_mode="HTML")
+
+async def _webstore_admin_request(method: str, path: str, *, params=None, json_body=None, timeout=15) -> dict:
+    import aiohttp as _aiohttp
+    url = f"{settings.webstore_api_base_url.rstrip('/')}{path}"
+    headers = {"X-Internal-Secret": settings.webstore_bridge_secret}
+    async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=timeout)) as sess:
+        async with sess.request(method, url, headers=headers, params=params, json=json_body) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise RuntimeError(str(data.get("error") or f"HTTP {resp.status}"))
+            return data
+
+
+def _web_order_status_label(status: str) -> str:
+    return {
+        "pending": "⏳ Ожидает оплаты",
+        "paid": "💳 Оплачен, выдаётся",
+        "delivered": "✅ Выдан",
+        "failed": "⚠️ Ошибка выдачи",
+        "canceled": "❌ Отменён",
+        "demo": "🎁 Демо",
+    }.get(status, status)
+
+
+@router.callback_query(F.data.regexp(r"^adm_web_orders:[a-z]+:\d+$"))
+async def admin_web_orders(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    if not settings.webstore_public_enabled:
+        await callback.answer("Вебстор не подключён", show_alert=True)
+        return
+    _, status_filter, page_raw = callback.data.split(":")
     await callback.answer()
+    try:
+        data = await _webstore_admin_request(
+            "GET", "/api/store/internal/admin-orders",
+            params={"status": status_filter, "page": int(page_raw)},
+        )
+    except Exception as exc:
+        await callback.message.answer(
+            f"❌ Не удалось получить заказы сайта: {html.escape(str(exc))}\n"
+            "Повторите позже или напишите в поддержку.",
+            reply_markup=admin_back_kb(),
+            parse_mode="HTML",
+        )
+        return
+
+    orders = data.get("orders") or []
+    page = int(data.get("page") or 1)
+    total_pages = int(data.get("total_pages") or 1)
+    blocks: list[str] = []
+    kb = InlineKeyboardBuilder()
+    for idx, order in enumerate(orders, start=(page - 1) * int(data.get("limit") or 5) + 1):
+        status = str(order.get("status") or "")
+        action_label = {"new": "Создание", "renew": "Продление", "upgrade": "Улучшение"}.get(
+            str(order.get("purchase_action") or "new"), str(order.get("purchase_action") or "new")
+        )
+        block = [
+            f"<b>#{idx} · {_web_order_status_label(status)}</b>",
+            f"Заказ: <code>{html.escape(str(order.get('order_id') or '—'))}</code>",
+            f"Клиент: <code>{html.escape(str(order.get('contact') or '—'))}</code>",
+            f"Тариф: {html.escape(str(order.get('tariff_label') or '—'))}, {order.get('days') or 0} дн.",
+            f"Сумма: <b>{order.get('amount_rub') or 0} ₽</b> · Операция: {html.escape(action_label)}",
+            f"Провайдер: <b>{html.escape(str(order.get('provider') or '—').upper())}</b>",
+            f"Создан: {_fmt_dt_str_msk(order.get('created_at'))}",
+        ]
+        if order.get("failure_message"):
+            block.append(f"Ошибка: {html.escape(str(order.get('failure_message')))[:300]}")
+        blocks.append("\n".join(block))
+        kb.row(InlineKeyboardButton(
+            text=f"Открыть #{idx} · {_web_order_status_label(status)}",
+            callback_data=f"adm_worder:{order.get('id')}:{status_filter}:{page}",
+        ))
+
+    filters = [
+        ("Все", "all"), ("⚠️ Требуют внимания", "attention"),
+        ("⏳ Ожидают", "pending"), ("✅ Выданы", "delivered"),
+    ]
+    for label, value in filters:
+        prefix = "• " if value == status_filter else ""
+        kb.row(InlineKeyboardButton(text=prefix + label, callback_data=f"adm_web_orders:{value}:1"))
+    kb.row(
+        InlineKeyboardButton(text="◀️", callback_data=f"adm_web_orders:{status_filter}:{max(1, page - 1)}"),
+        InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="ignore"),
+        InlineKeyboardButton(text="▶️", callback_data=f"adm_web_orders:{status_filter}:{min(total_pages, page + 1)}"),
+    )
+    kb.row(InlineKeyboardButton(text="🔎 Поиск", callback_data="adm_user_search"))
+    kb.row(InlineKeyboardButton(text="◀️ Меню сайта", callback_data="adm_stats_web"))
+    divider = "\n━━━━━━━━━━━━━━━━━━━━\n"
+    text_value = (
+        f"📋 <b>Логи заказов сайта</b>\n"
+        f"Найдено: <b>{data.get('total') or 0}</b> · Страница <b>{page}/{total_pages}</b>\n\n"
+        + (divider.join(blocks) if blocks else "<i>Заказов в этом разделе нет.</i>")
+    )
+    try:
+        await callback.message.edit_text(text_value, reply_markup=kb.as_markup(), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text_value, reply_markup=kb.as_markup(), parse_mode="HTML")
+
+
+async def _render_web_order_detail(callback: CallbackQuery, db_id: int, status_filter: str, page: int) -> None:
+    try:
+        data = await _webstore_admin_request(
+            "GET", "/api/store/internal/admin-order", params={"id": db_id}
+        )
+    except Exception as exc:
+        await callback.message.answer(
+            f"❌ Не удалось открыть заказ: {html.escape(str(exc))}\n"
+            "Повторите позже или напишите в поддержку.",
+            parse_mode="HTML",
+        )
+        return
+    order = data["order"]
+    action_label = {"new": "Создание подписки", "renew": "Продление", "upgrade": "Улучшение"}.get(
+        str(order.get("purchase_action") or "new"), str(order.get("purchase_action") or "new")
+    )
+    lines = [
+        "📦 <b>Заказ сайта</b>",
+        f"Статус: <b>{_web_order_status_label(str(order.get('status') or ''))}</b>",
+        f"Номер: <code>{html.escape(str(order.get('order_id') or '—'))}</code>",
+        f"Клиент: <code>{html.escape(str(order.get('contact') or '—'))}</code>",
+        f"Тариф: <b>{html.escape(str(order.get('tariff_label') or '—'))}</b>, {order.get('days') or 0} дн.",
+        f"Сумма: <b>{order.get('amount_rub') or 0} ₽</b>",
+        f"Операция: {html.escape(action_label)}",
+        f"Провайдер: <b>{html.escape(str(order.get('provider') or '—').upper())}</b>",
+        f"Создан: {_fmt_dt_str_msk(order.get('created_at'))}",
+        f"Оплачен: {_fmt_dt_str_msk(order.get('paid_at'))}",
+        f"Выдан: {_fmt_dt_str_msk(order.get('delivered_at'))}",
+        f"Доступ до: {_fmt_dt_str_msk(order.get('access_expires_at'))}",
+        f"Попыток выдачи: <b>{order.get('fulfillment_attempts') or 0}</b>",
+        f"Последняя попытка: {_fmt_dt_str_msk(order.get('last_fulfillment_attempt_at'))}",
+        f"Следующая попытка: {_fmt_dt_str_msk(order.get('next_fulfillment_retry_at'))}",
+    ]
+    if order.get("target_order_id"):
+        lines.append(f"Исходная подписка: <code>{html.escape(str(order.get('target_order_id')))}</code>")
+    if order.get("yookassa_payment_id"):
+        lines.append(f"Платёж: <code>{html.escape(str(order.get('yookassa_payment_id')))}</code>")
+    if order.get("failure_code") or order.get("failure_message"):
+        lines.append("\n⚠️ <b>Ошибка выдачи</b>")
+        if order.get("failure_code"):
+            lines.append(f"Код: <code>{html.escape(str(order.get('failure_code')))}</code>")
+        if order.get("failure_message"):
+            lines.append(f"Для клиента: {html.escape(str(order.get('failure_message')))[:500]}")
+        if order.get("failure_reason"):
+            lines.append(f"Технически: {html.escape(str(order.get('failure_reason')))[:700]}")
+    subscription_url = order.get("subscription_url") or order.get("raw_subscription_url")
+    if subscription_url:
+        lines.append("\n" + await _format_external_key_block(str(subscription_url), label="Ссылка подписки"))
+
+    kb = InlineKeyboardBuilder()
+    if order.get("can_retry"):
+        lines.append("\n<i>Можно повторить выдачу: оплата подтверждена, доступ ещё не выдан.</i>")
+        kb.row(InlineKeyboardButton(text="🔄 Повторить выдачу", callback_data=f"adm_woact:retry:{db_id}:{status_filter}:{page}"))
+    if order.get("can_resend"):
+        lines.append("<i>Можно повторно отправить клиенту уведомление о готовом доступе.</i>")
+        kb.row(InlineKeyboardButton(text="📨 Повторить уведомление", callback_data=f"adm_woact:resend:{db_id}:{status_filter}:{page}"))
+    if order.get("can_cancel"):
+        lines.append(
+            "<i>Можно отменить запись неоплаченного заказа. Если платёж подтвердится позже, "
+            "система обработает его штатно.</i>"
+        )
+        kb.row(InlineKeyboardButton(text="❌ Отменить неоплаченный", callback_data=f"adm_woact:cancel:{db_id}:{status_filter}:{page}"))
+    if not any(order.get(key) for key in ("can_retry", "can_resend", "can_cancel")):
+        lines.append("\n<i>Для текущего состояния заказа действий нет.</i>")
+    kb.row(InlineKeyboardButton(text="🔄 Обновить", callback_data=f"adm_worder:{db_id}:{status_filter}:{page}"))
+    kb.row(InlineKeyboardButton(text="◀️ К заказам", callback_data=f"adm_web_orders:{status_filter}:{page}"))
+    try:
+        await callback.message.edit_text("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="HTML")
+
+
+@router.callback_query(F.data.regexp(r"^adm_worder:\d+:[a-z]+:\d+$"))
+async def admin_web_order_detail(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    _, db_id, status_filter, page = callback.data.split(":")
+    await callback.answer()
+    await _render_web_order_detail(callback, int(db_id), status_filter, int(page))
+
+
+@router.callback_query(F.data.regexp(r"^adm_woact:(retry|resend|cancel):\d+:[a-z]+:\d+$"))
+async def admin_web_order_action(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    _, action, db_id, status_filter, page = callback.data.split(":")
+    action_labels = {"retry": "Повтор выдачи", "resend": "Повтор уведомления", "cancel": "Отмена заказа"}
+    await callback.answer("Выполняю…")
+    try:
+        current = await _webstore_admin_request(
+            "GET", "/api/store/internal/admin-order", params={"id": int(db_id)}
+        )
+        order_id = str(current["order"]["order_id"])
+        await callback.message.edit_text(
+            f"⏳ <b>{action_labels[action]}</b>\n\nЗаказ: <code>{html.escape(order_id)}</code>\nОжидайте результат…",
+            parse_mode="HTML",
+        )
+        result = await _webstore_admin_request(
+            "POST", "/api/store/internal/admin-order-action",
+            json_body={"order_id": order_id, "action": action}, timeout=45,
+        )
+        after = result.get("order") or {}
+        action_warnings = result.get("warnings") or []
+        await write_admin_audit(
+            actor_telegram_id=callback.from_user.id,
+            action=f"web_order_{action}",
+            entity_type="web_order",
+            entity_id=order_id,
+            status="partial" if action_warnings else "success",
+            summary=(
+                f"{action_labels[action]} выполнен с предупреждением"
+                if action_warnings else f"{action_labels[action]} выполнен"
+            ),
+            details=(
+                f"Статус: {(result.get('before') or {}).get('status')} → {after.get('status')}; "
+                f"попыток: {after.get('fulfillment_attempts', 0)}"
+                + (f"; предупреждения: {'; '.join(map(str, action_warnings))}" if action_warnings else "")
+            ),
+        )
+        if action_warnings:
+            await callback.message.answer(
+                "⚠️ Доступ сохранён в профиле, но часть завершающих действий требует внимания:\n"
+                + "\n".join(f"• {html.escape(str(item))}" for item in action_warnings),
+                parse_mode="HTML",
+            )
+    except Exception as exc:
+        await write_admin_audit(
+            actor_telegram_id=callback.from_user.id,
+            action=f"web_order_{action}",
+            entity_type="web_order",
+            entity_id=locals().get("order_id") or str(db_id),
+            status="error",
+            summary=f"{action_labels[action]} не выполнен",
+            details=str(exc)[:1000],
+        )
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text="🔄 Вернуться к заказу", callback_data=f"adm_worder:{db_id}:{status_filter}:{page}"))
+        kb.row(InlineKeyboardButton(text="🆘 Поддержка", url=settings.support_url)) if settings.support_url else None
+        await callback.message.edit_text(
+            f"❌ <b>Действие не выполнено</b>\n\n{html.escape(str(exc))}\n\n"
+            "Состояние заказа не скрыто и не потеряно. Повторите попытку или напишите в поддержку.",
+            reply_markup=kb.as_markup(), parse_mode="HTML",
+        )
+        return
+    await _render_web_order_detail(callback, int(db_id), status_filter, int(page))
 
 
 # ── Web Balance Admin ──────────────────────────────────
@@ -4578,6 +5166,16 @@ async def _apply_web_balance_adjustment(event, profile_token: str, amount: int) 
 
     sign = "+" if amount > 0 else ""
     new_balance = data.get("new_balance_rub", 0)
+    actor = getattr(getattr(event, "from_user", None), "id", None)
+    if actor:
+        await write_admin_audit(
+            actor_telegram_id=actor,
+            action="web_balance_adjusted",
+            entity_type="web_profile",
+            entity_id=f"{profile_token[:12]}…",
+            summary=f"Баланс изменён на {sign}{amount} ₽",
+            details=f"Новый баланс: {float(new_balance):.2f} ₽",
+        )
     text = f"✅ Баланс скорректирован: {sign}{amount} ₽\nНовый баланс: <b>{new_balance:.2f} ₽</b>"
     back_kb = InlineKeyboardBuilder()
     back_kb.row(InlineKeyboardButton(text="◀️ К статистике", callback_data="adm_stats_web"))

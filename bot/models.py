@@ -707,3 +707,20 @@ class AdaptSubscription(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     subscription: Mapped["Subscription"] = relationship()
+
+
+class AdminActionLog(Base):
+    """Persistent, non-secret audit trail for actions made from the admin bot."""
+
+    __tablename__ = "admin_action_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    actor_telegram_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    entity_type: Mapped[str] = mapped_column(String(32), nullable=False, default="system")
+    entity_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    target_telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="success", index=True)
+    summary: Mapped[str] = mapped_column(String(255), nullable=False)
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)

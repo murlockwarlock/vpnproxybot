@@ -166,14 +166,19 @@ async def _notify_admins_webstore(
     )
 
 
-async def _notify_linked_webstore_user(order: WebOrder, event: str) -> None:
+async def _notify_linked_webstore_user(
+    order: WebOrder,
+    event: str,
+    *,
+    dedupe_suffix: str = "",
+) -> bool:
     """Keep a linked Telegram customer informed even when provisioning fails."""
     if not order.profile_token:
-        return
+        return False
     async with async_session() as session:
         link = await session.get(WebProfileLink, order.profile_token)
     if not link:
-        return
+        return False
 
     support = settings.support_url or f"{settings.subscription_base_url.rstrip('/')}/support"
     if event == "delayed":
@@ -197,13 +202,14 @@ async def _notify_linked_webstore_user(order: WebOrder, event: str) -> None:
             f"Напишите в поддержку: {html.escape(support)}"
         )
     else:
-        return
+        return False
     await enqueue_notifications(
         event=f"customer_{event}",
-        dedupe_prefix=f"web-order:{order.order_id}:customer:{event}",
+        dedupe_prefix=f"web-order:{order.order_id}:customer:{event}{dedupe_suffix}",
         recipient_ids=[link.telegram_id],
         text=text,
     )
+    return True
 
 
 async def _mark_order_failed(order: WebOrder, issue: AccessProvisionError) -> None:
@@ -3526,6 +3532,10 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
     query = _normalize_contact(request.query.get("q") or "")
     if not query:
         return web.json_response({"error": "Missing q"}, status=400)
+    username_query = query.removeprefix("@")
+    numeric_query = int(query) if query.isdigit() else -1
+    like_query = f"%{query}%"
+    username_like = f"%{username_query}%"
 
     async with async_session() as session:
         tokens: set[str] = set()
@@ -3533,10 +3543,13 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
             select(WebOrder).where(
                 or_(
                     WebOrder.order_id == query,
-                    WebOrder.contact == query,
-                    WebOrder.email == query,
+                    WebOrder.contact.ilike(like_query),
+                    WebOrder.email.ilike(like_query),
                     WebOrder.profile_token == query,
                     WebOrder.profile_token.like(f"{query}%"),
+                    WebOrder.subscription_url.contains(query),
+                    WebOrder.marzban_username.ilike(like_query),
+                    WebOrder.yookassa_payment_id == query,
                 )
             )
         )
@@ -3546,7 +3559,7 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
         accounts_result = await session.execute(
             select(WebAccount).where(
                 or_(
-                    WebAccount.contact == query,
+                    WebAccount.contact.ilike(like_query),
                     WebAccount.profile_token == query,
                     WebAccount.profile_token.like(f"{query}%"),
                 )
@@ -3558,7 +3571,7 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
         balances_result = await session.execute(
             select(WebBalanceAccount).where(
                 or_(
-                    WebBalanceAccount.contact == query,
+                    WebBalanceAccount.contact.ilike(like_query),
                     WebBalanceAccount.profile_token == query,
                     WebBalanceAccount.profile_token.like(f"{query}%"),
                 )
@@ -3566,6 +3579,31 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
         )
         balances = balances_result.scalars().all()
         tokens.update(a.profile_token for a in balances)
+
+        links_result = await session.execute(
+            select(WebProfileLink).where(
+                or_(
+                    WebProfileLink.telegram_id == numeric_query,
+                    WebProfileLink.telegram_username.ilike(username_like),
+                    WebProfileLink.telegram_full_name.ilike(like_query),
+                    WebProfileLink.contact.ilike(like_query),
+                    WebProfileLink.profile_token.like(f"{query}%"),
+                )
+            )
+        )
+        tokens.update(link.profile_token for link in links_result.scalars().all())
+
+        items_result = await session.execute(
+            select(WebTelegramItem).where(
+                or_(
+                    WebTelegramItem.telegram_id == numeric_query,
+                    WebTelegramItem.external_id.ilike(like_query),
+                    WebTelegramItem.key_value.contains(query),
+                    WebTelegramItem.title.ilike(like_query),
+                )
+            )
+        )
+        tokens.update(item.profile_token for item in items_result.scalars().all())
 
         if not tokens:
             return web.json_response({"error": "Not found"}, status=404)
@@ -3732,6 +3770,196 @@ async def handle_internal_admin_clients_list(request: web.Request) -> web.Respon
         "limit": limit,
         "total": total_accounts,
         "clients": client_list,
+    })
+
+
+def _serialize_admin_order(order: WebOrder) -> dict[str, object]:
+    retry_due = not order.next_fulfillment_retry_at or order.next_fulfillment_retry_at <= datetime.utcnow()
+    return {
+        "id": order.id,
+        "order_id": order.order_id,
+        "status": order.status,
+        "contact": order.contact or order.email or "—",
+        "email": order.email or "",
+        "tariff_key": order.tariff_key,
+        "tariff_label": order.tariff_label,
+        "days": order.days,
+        "amount_rub": order.amount_rub,
+        "original_amount_rub": order.original_amount_rub or order.amount_rub,
+        "bonus_applied_rub": order.bonus_applied_rub or 0,
+        "provider": _get_order_provider(order),
+        "profile_token": order.profile_token or "",
+        "purchase_action": order.purchase_action or "new",
+        "target_order_id": order.target_order_id or "",
+        "subscription_url": _display_order_subscription_url(order),
+        "raw_subscription_url": order.subscription_url or "",
+        "marzban_username": order.marzban_username or "",
+        "yookassa_payment_id": order.yookassa_payment_id or "",
+        "failure_message": order.failure_message or "",
+        "failure_code": order.failure_code or "",
+        "failure_reason": order.failure_reason or "",
+        "fulfillment_attempts": order.fulfillment_attempts or 0,
+        "created_at": (order.created_at.isoformat() + "Z") if order.created_at else None,
+        "paid_at": (order.paid_at.isoformat() + "Z") if order.paid_at else None,
+        "delivered_at": (order.delivered_at.isoformat() + "Z") if order.delivered_at else None,
+        "access_expires_at": (order.access_expires_at.isoformat() + "Z") if order.access_expires_at else None,
+        "last_fulfillment_attempt_at": (
+            order.last_fulfillment_attempt_at.isoformat() + "Z"
+            if order.last_fulfillment_attempt_at else None
+        ),
+        "next_fulfillment_retry_at": (
+            order.next_fulfillment_retry_at.isoformat() + "Z"
+            if order.next_fulfillment_retry_at else None
+        ),
+        "can_retry": bool(
+            order.paid_at
+            and order.status in {"paid", "failed"}
+            and not order.delivered_at
+            and retry_due
+        ),
+        "can_resend": bool(order.status == "delivered" and order.subscription_url),
+        "can_cancel": bool(order.status == "pending" and not order.paid_at),
+    }
+
+
+async def handle_internal_admin_orders(request: web.Request) -> web.Response:
+    if not _verify_internal_secret(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    try:
+        page = max(1, int(request.query.get("page", "1")))
+    except ValueError:
+        page = 1
+    status_filter = (request.query.get("status") or "all").strip().lower()
+    query = (request.query.get("q") or "").strip()
+    conditions = []
+    if status_filter == "attention":
+        conditions.append(WebOrder.status.in_(("paid", "failed")))
+    elif status_filter in {"pending", "paid", "delivered", "failed", "canceled", "demo"}:
+        conditions.append(WebOrder.status == status_filter)
+    if query:
+        like = f"%{query}%"
+        conditions.append(or_(
+            WebOrder.order_id.ilike(like),
+            WebOrder.contact.ilike(like),
+            WebOrder.email.ilike(like),
+            WebOrder.profile_token.ilike(like),
+            WebOrder.yookassa_payment_id.ilike(like),
+        ))
+    page_size = 5
+    async with async_session() as session:
+        count_stmt = select(func.count(WebOrder.id))
+        list_stmt = select(WebOrder)
+        if conditions:
+            count_stmt = count_stmt.where(*conditions)
+            list_stmt = list_stmt.where(*conditions)
+        total = await session.scalar(count_stmt) or 0
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages)
+        result = await session.execute(
+            list_stmt.order_by(WebOrder.created_at.desc(), WebOrder.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        orders = result.scalars().all()
+    return web.json_response({
+        "page": page,
+        "limit": page_size,
+        "total": total,
+        "total_pages": total_pages,
+        "status": status_filter,
+        "orders": [_serialize_admin_order(order) for order in orders],
+    })
+
+
+async def handle_internal_admin_order(request: web.Request) -> web.Response:
+    if not _verify_internal_secret(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    order_id = (request.query.get("order_id") or "").strip()
+    db_id_raw = (request.query.get("id") or "").strip()
+    if not order_id and not db_id_raw.isdigit():
+        return web.json_response({"error": "order_id or id required"}, status=400)
+    async with async_session() as session:
+        condition = WebOrder.id == int(db_id_raw) if db_id_raw.isdigit() else WebOrder.order_id == order_id
+        order = await session.scalar(select(WebOrder).where(condition))
+        if not order:
+            return web.json_response({"error": "Заказ не найден"}, status=404)
+        return web.json_response({"order": _serialize_admin_order(order)})
+
+
+async def handle_internal_admin_order_action(request: web.Request) -> web.Response:
+    if not _verify_internal_secret(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    order_id = str(body.get("order_id") or "").strip()
+    action = str(body.get("action") or "").strip().lower()
+    if not order_id or action not in {"retry", "resend", "cancel"}:
+        return web.json_response({"error": "order_id/action invalid"}, status=400)
+
+    warnings: list[str] = []
+    async with async_session() as session:
+        order = await session.scalar(select(WebOrder).where(WebOrder.order_id == order_id))
+        if not order:
+            return web.json_response({"error": "Заказ не найден"}, status=404)
+        before = _serialize_admin_order(order)
+        if action == "retry":
+            if not before["can_retry"]:
+                return web.json_response({"error": "Повтор недоступен: заказ не оплачен, уже выдан или попытка уже выполняется"}, status=409)
+            # Claim the order before the provider call so the automatic worker
+            # and another administrator do not start a simultaneous attempt.
+            order.next_fulfillment_retry_at = datetime.utcnow() + timedelta(minutes=15)
+            await session.commit()
+            await attempt_fulfill_order(session, order)
+            # Persist the access result before optional accounting and
+            # notification work. A notification outage must not hide a
+            # successfully issued subscription from the customer profile.
+            await session.commit()
+            if order.status == "delivered":
+                try:
+                    await _disable_web_balance_autodebit_after_tariff_purchase(session, order)
+                    await _apply_order_bonus_spend(session, order)
+                    await session.commit()
+                except Exception as exc:
+                    await session.rollback()
+                    await session.refresh(order)
+                    logger.exception("Admin fulfillment accounting follow-up failed order_id=%s", order.order_id)
+                    warnings.append(f"Не завершена обработка баланса: {exc}")
+            if order.status == "delivered":
+                for label, operation in (
+                    ("уведомления сотрудникам", _notify_admins_webstore(order, "delivered")),
+                    ("уведомления клиенту", _notify_linked_webstore_user(order, "delivered")),
+                    ("реферальной обработки", _sync_referral_credit_for_order(order.order_id)),
+                ):
+                    try:
+                        await operation
+                    except Exception as exc:
+                        logger.exception("Admin fulfillment %s failed order_id=%s", label, order.order_id)
+                        warnings.append(f"Ошибка {label}: {exc}")
+        elif action == "resend":
+            if not before["can_resend"]:
+                return web.json_response({"error": "Повтор уведомления доступен только для выданного заказа"}, status=409)
+            queued = await _notify_linked_webstore_user(
+                order,
+                "delivered",
+                dedupe_suffix=f":admin:{uuid.uuid4().hex[:12]}",
+            )
+            if not queued:
+                return web.json_response({"error": "К заказу не привязан Telegram-профиль"}, status=409)
+        else:
+            if not before["can_cancel"]:
+                return web.json_response({"error": "Отменить можно только неоплаченный ожидающий заказ"}, status=409)
+            order.status = "canceled"
+            await session.commit()
+        after = _serialize_admin_order(order)
+
+    return web.json_response({
+        "ok": True,
+        "action": action,
+        "before": before,
+        "order": after,
+        "warnings": warnings,
     })
 
 
@@ -4361,6 +4589,9 @@ def setup_routes(app: web.Application) -> None:
     app.router.add_get("/api/store/internal/admin-stats", handle_internal_admin_stats)
     app.router.add_get("/api/store/internal/admin-client-lookup", handle_internal_admin_client_lookup)
     app.router.add_get("/api/store/internal/admin-clients-list", handle_internal_admin_clients_list)
+    app.router.add_get("/api/store/internal/admin-orders", handle_internal_admin_orders)
+    app.router.add_get("/api/store/internal/admin-order", handle_internal_admin_order)
+    app.router.add_post("/api/store/internal/admin-order-action", handle_internal_admin_order_action)
     app.router.add_get("/api/store/internal/admin-balance-lookup", handle_internal_admin_balance_lookup)
     app.router.add_post("/api/store/internal/admin-balance-adjust", handle_internal_admin_balance_adjust)
     app.router.add_post("/api/store/internal/adapt-event", handle_internal_adapt_event)
