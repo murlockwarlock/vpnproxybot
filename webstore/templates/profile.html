@@ -278,6 +278,18 @@
       margin-bottom: 16px;
       animation: fadeUp 400ms ease-out both;
     }
+    .subscription-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 14px;
+    }
+    .subscription-actions a {
+      flex: 1;
+      min-width: 130px;
+      text-align: center;
+      text-decoration: none;
+    }
     .telegram-box {
       margin-bottom: 20px;
       text-align: left;
@@ -564,8 +576,15 @@
     <div id="ordersSection" style="display:none;">
       <div class="email-banner" id="emailBanner"></div>
       <div class="profile-actions">
-        <a href="/buy#tariffs" class="primary-btn">Приобрести ключ</a>
+        <a href="/buy?action=new#tariffs" class="primary-btn">Создать новую подписку</a>
         <button type="button" class="ghost-btn" onclick="resetProfile()">Войти в другой профиль</button>
+      </div>
+      <div class="profile-cta">
+        <h2>Как продлить подписку без Telegram</h2>
+        <p>
+          Найдите ниже нужную ссылку и нажмите «Продлить» — срок добавится к ней, повторно подключать устройства не придётся.
+          «Улучшить» меняет её на более дорогой тариф с зачётом остатка. «Создать новую» выдаёт отдельную ссылку.
+        </p>
       </div>
 
       <div class="balance-box" id="balanceBox" style="display:none;">
@@ -631,7 +650,7 @@
     const STATUS_LABELS = {
       delivered: "Выдан",
       demo: "Демо",
-      paid: "Оплачен",
+      paid: "Выдаётся автоматически",
       pending: "Ожидает оплаты",
       failed: "Ошибка",
       expired: "Истёк",
@@ -853,11 +872,24 @@
         const meta = [];
         if (item.expires_at) meta.push(`До: ${formatDate(item.expires_at)}`);
         if (item.device_slots) meta.push(`Устройств: ${item.device_slots}`);
+        const isActive = item.status === "active" && item.expires_at && new Date(item.expires_at) > new Date();
+        let actionHtml = "";
+        if (item.provider === "adapt" && item.adapt_plan_uuid) {
+          const target = encodeURIComponent(item.target_order_id);
+          const plan = encodeURIComponent(item.adapt_plan_uuid);
+          actionHtml = `
+            <div class="subscription-actions">
+              <a class="ghost-btn" href="/buy?action=renew&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↻ Продлить</a>
+              ${isActive ? `<a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↑ Улучшить</a>` : ""}
+            </div>
+          `;
+        }
         card.innerHTML = `
           <div class="telegram-item-title">${item.title}</div>
           ${item.subtitle ? `<div class="telegram-item-subtitle">${item.subtitle}</div>` : ""}
           ${meta.length ? `<div class="telegram-item-meta">${meta.map(v => `<span>${v}</span>`).join("")}</div>` : ""}
           ${item.key_value ? `<div class="telegram-item-key">${item.key_value}</div>` : ""}
+          ${actionHtml}
         `;
         itemsEl.appendChild(card);
       });
@@ -913,13 +945,20 @@
         list.innerHTML = '<div class="empty-state">Заказов пока нет</div>';
         return;
       }
+      const latestAdaptByUrl = new Map();
+      visibleOrders.forEach(o => {
+        if (o.provider === "adapt" && o.subscription_url && !latestAdaptByUrl.has(o.subscription_url)) {
+          latestAdaptByUrl.set(o.subscription_url, o.order_id);
+        }
+      });
 
-      // Show "buy extra device" button if there's an active delivered subscription (web or Telegram)
+      // Extra slots are local Marzban functionality. Adapt device limits are
+      // changed only through a provider plan upgrade.
       const now = new Date();
       const hasActiveSub = visibleOrders.some(o =>
-        o.status === "delivered" && o.tariff_key !== "device_slot" && o.tariff_key !== "demo"
+        o.status === "delivered" && o.provider === "marzban" && o.tariff_key !== "device_slot" && o.tariff_key !== "demo"
       ) || (data.telegram_items || []).some(item =>
-        item.status === "active" && item.expires_at && new Date(item.expires_at) > now
+        item.status === "active" && item.provider === "marzban" && item.expires_at && new Date(item.expires_at) > now
       );
       const deviceSection = document.getElementById("buyDeviceSection");
       if (deviceSection) deviceSection.style.display = hasActiveSub ? "block" : "none";
@@ -952,6 +991,18 @@
           cancelHtml = `<button class="cancel-order-btn" onclick="cancelOrder('${o.order_id}', this)">Отменить заказ</button>`;
         }
 
+        let actionHtml = "";
+        if (o.status === "delivered" && o.provider === "adapt" && o.tariff_key !== "demo" && latestAdaptByUrl.get(o.subscription_url) === o.order_id) {
+          const target = encodeURIComponent(o.order_id);
+          const plan = encodeURIComponent(o.adapt_plan_uuid || "");
+          actionHtml = `
+            <div class="subscription-actions">
+              <a class="ghost-btn" href="/buy?action=renew&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↻ Продлить</a>
+              ${!isExpired ? `<a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↑ Улучшить</a>` : ""}
+            </div>
+          `;
+        }
+
         card.innerHTML = `
           <div class="order-header">
             <span class="order-id">Заказ #${o.order_id}</span>
@@ -968,6 +1019,7 @@
             </div>
           </div>
           ${o.bonus_applied_rub ? `<div class="telegram-item-subtitle">С баланса сайта списано: ${o.bonus_applied_rub} ₽</div>` : ""}
+          ${o.failure_message ? `<div class="telegram-item-subtitle">${o.failure_message}</div>` : ""}
           <div class="order-dates">
             <span>Создан: ${formatDate(o.created_at)}</span>
             ${o.paid_at ? `<span>Оплачен: ${formatDate(o.paid_at)}</span>` : ""}
@@ -975,6 +1027,7 @@
             ${o.access_expires_at ? `<span><strong>Действует до: ${formatDate(o.access_expires_at)} МСК</strong></span>` : ""}
           </div>
           ${subHtml}
+          ${actionHtml}
           ${cancelHtml}
         `;
         list.appendChild(card);

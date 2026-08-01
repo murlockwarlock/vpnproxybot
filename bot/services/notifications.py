@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import asyncio
 import logging
 
 from aiogram import Bot
@@ -14,18 +15,8 @@ logger = logging.getLogger(__name__)
 
 async def _send_admin_text(bot: Bot, text: str) -> None:
     admin_ids = set(settings.admin_ids)
-    try:
-        from sqlalchemy import select
-        from bot.database import async_session
-        from bot.models import User
-        async with async_session() as db_sess:
-            res = await db_sess.execute(select(User.telegram_id).where(User.is_admin == True))
-            for db_adm_id in res.scalars().all():
-                if db_adm_id:
-                    admin_ids.add(int(db_adm_id))
-    except Exception as e:
-        logger.warning(f"Failed to fetch DB admins: {e}")
-
+    admin_ids.update(settings.owner_ids)
+    admin_ids.update(settings.support_agent_ids)
     if not admin_ids:
         logger.warning("No admin IDs configured for admin notification")
         return
@@ -33,33 +24,42 @@ async def _send_admin_text(bot: Bot, text: str) -> None:
     sent = 0
     failed = 0
     for admin_id in admin_ids:
-        try:
-            await bot.send_message(admin_id, text, parse_mode="HTML")
-            sent += 1
-        except Exception as e:
-            failed += 1
-            logger.warning(f"Failed to notify admin {admin_id}: {e}")
+        for attempt in range(1, 4):
+            try:
+                await bot.send_message(admin_id, text, parse_mode="HTML")
+                sent += 1
+                break
+            except Exception as e:
+                retry_after = float(getattr(e, "retry_after", 0) or 0)
+                logger.warning("Failed to notify admin %s attempt=%s: %s", admin_id, attempt, e)
+                if attempt == 3:
+                    failed += 1
+                    break
+                await asyncio.sleep(min(retry_after or attempt, 5.0))
     logger.info("Admin notification finished: sent=%s failed=%s", sent, failed)
+
+
+async def notify_staff_text(bot: Bot, text: str) -> None:
+    """Send a preformatted operational message to all staff with retries."""
+    await _send_admin_text(bot, text)
 
 
 async def notify_expiring(bot: Bot, user_id: int, text: str, reply_markup=None) -> bool:
     """Send an expiry warning to a user. Returns True if successful."""
-    try:
-        await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=reply_markup)
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to notify user {user_id}: {e}")
-        return False
+    for attempt in range(1, 4):
+        try:
+            await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=reply_markup)
+            return True
+        except Exception as e:
+            logger.warning("Failed to notify user %s attempt=%s: %s", user_id, attempt, e)
+            if attempt < 3:
+                await asyncio.sleep(min(float(getattr(e, "retry_after", 0) or attempt), 5.0))
+    return False
 
 
 async def notify_expired(bot: Bot, user_id: int, text: str, reply_markup=None) -> bool:
     """Send an expiry notification. Returns True if successful."""
-    try:
-        await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=reply_markup)
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to notify user {user_id}: {e}")
-        return False
+    return await notify_expiring(bot, user_id, text, reply_markup=reply_markup)
 
 
 async def notify_admins_payment(
@@ -98,7 +98,7 @@ async def notify_admins_payment(
         f"💳 Способ: {method}\n"
         f"📱 Платформа: {platform}"
     )
-    if not settings.admin_ids:
+    if not settings.notification_recipient_ids:
         logger.warning(
             "No ADMIN_IDS configured for payment notification: telegram_id=%s amount_rub=%.2f tariff=%s",
             telegram_id,
@@ -113,7 +113,7 @@ async def notify_admins_payment(
         amount_rub,
         tariff_label,
         method,
-        settings.admin_ids,
+        settings.notification_recipient_ids,
     )
     await _send_admin_text(bot, text)
 

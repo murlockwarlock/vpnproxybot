@@ -280,7 +280,7 @@ async def admin_ref_settings(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "adm_ref_toggle")
 async def admin_ref_toggle(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.fromuser.id):
+    if not _is_admin(callback.from_user.id):
         return
     async with async_session() as session:
         config = await _get_or_create_config(session)

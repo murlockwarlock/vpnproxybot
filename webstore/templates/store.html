@@ -1641,9 +1641,9 @@
         </div>
         <div class="locations-grid">
           <div class="location-card">
-            <div class="location-flag">🇪🇪</div>
-            <strong>Эстония</strong>
-            <span>Сейчас это самый стабильный вариант для подключения.</span>
+            <div class="location-flag">🇳🇱</div>
+            <strong>Нидерланды 1</strong>
+            <span>Стабильная локация с несколькими вариантами подключения.</span>
           </div>
           <div class="location-card">
             <div class="location-flag">🇩🇪</div>
@@ -1652,7 +1652,7 @@
           </div>
           <div class="location-card">
             <div class="location-flag">🇳🇱</div>
-            <strong>Нидерланды</strong>
+            <strong>Нидерланды 2</strong>
             <span>Быстрая и стабильная локация для подключения.</span>
           </div>
         </div>
@@ -1753,7 +1753,7 @@
         <h3>Попробовать бесплатно</h3>
         <p>Демо-доступ создаётся в личном кабинете. Если вы ещё не вошли, сначала откроется регистрация или вход.</p>
         <button type="button" class="demo-submit-btn" id="demoSubmitBtn">Создать демо-доступ</button>
-        <p class="demo-note">Покупка тарифа на наших серверах потом продлит этот же ключ. VHQ-тариф выдаст отдельный ключ.</p>
+        <p class="demo-note">После оплаты доступ появится в личном кабинете. Там же можно скопировать актуальную ссылку.</p>
       </div>
       <div id="demoSuccessContent" style="display:none;">
         <div class="demo-success-icon">🎁</div>
@@ -1865,7 +1865,11 @@
 
   <script>
     const tariffs = {{TARIFFS_JSON}};
-    const refSource = new URLSearchParams(window.location.search).get("ref") || "";
+    const storeParams = new URLSearchParams(window.location.search);
+    const refSource = storeParams.get("ref") || "";
+    const purchaseAction = ["new", "renew", "upgrade"].includes(storeParams.get("action")) ? storeParams.get("action") : "new";
+    const targetOrderId = storeParams.get("target_order_id") || "";
+    const currentPlanUuid = storeParams.get("current_plan_uuid") || "";
     const COOKIE_CONSENT_KEY = "webstore_cookie_consent";
     const PROFILE_COOKIE = "webstore_profile_token";
     const PROFILE_COOKIE_MAX_AGE = 60 * 60 * 24 * 30;
@@ -2012,9 +2016,21 @@
 
     function renderTariffs() {
       const container = document.getElementById("tariffCards");
-      tariffs.forEach((t, i) => {
+      const currentTariff = tariffs.find(t => t.adapt_plan_uuid === currentPlanUuid);
+      const visibleTariffs = tariffs.filter(t => {
+        if (purchaseAction === "renew" && currentPlanUuid) return t.adapt_plan_uuid === currentPlanUuid;
+        if (purchaseAction === "upgrade" && currentTariff) {
+          return !!t.adapt_plan_uuid && t.adapt_plan_uuid !== currentPlanUuid && Number(t.price_rub) > Number(currentTariff.price_rub);
+        }
+        return true;
+      });
+      if (!visibleTariffs.length) {
+        container.innerHTML = '<div class="empty-state">Для этой подписки сейчас нет подходящих тарифов.</div>';
+        return;
+      }
+      visibleTariffs.forEach((t, i) => {
         const perDay = (t.price_rub / t.days).toFixed(1);
-        const featured = i === tariffs.length - 1;
+        const featured = i === visibleTariffs.length - 1;
         const card = document.createElement("div");
         card.className = "tariff-card" + (featured ? " featured" : "");
         card.innerHTML = `
@@ -2370,6 +2386,8 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             tariff_key: key,
+            purchase_action: purchaseAction,
+            target_order_id: targetOrderId || undefined,
             contact: contact || undefined,
             ref: refSource || undefined,
             use_balance: useBalance,

@@ -9,6 +9,7 @@ Rate limit: 100 req/60s per api_key.
 from __future__ import annotations
 
 import os
+import asyncio
 from typing import Any
 
 import aiohttp
@@ -54,13 +55,13 @@ class AdaptAPI:
         
         Docs: https://docs.adaptgroup.pro/docs/api-vpn/check-balance
         """
-        return await self._post("/balance/check", {})
+        return await self._post("/balance/check", {}, retry_safe=True)
 
     # ── Plans ──────────────────────────────────────────────────────────────
 
     async def list_plans(self) -> list[dict[str, Any]]:
         """Return all plans for this integration."""
-        data = await self._post("/plans/list", {})
+        data = await self._post("/plans/list", {}, retry_safe=True)
         return data.get("plans") or []
 
     # ── Subscription lifecycle ─────────────────────────────────────────────
@@ -143,11 +144,11 @@ class AdaptAPI:
         Returns SubscriptionStatusResponse with is_active, is_frozen, end_date,
         used_traffic_bytes, traffic_limit_bytes, etc.
         """
-        return await self._post("/subs/status", {"subscription_uuid": subscription_uuid})
+        return await self._post("/subs/status", {"subscription_uuid": subscription_uuid}, retry_safe=True)
 
     async def get_devices(self, subscription_uuid: str) -> list[dict[str, Any]]:
         """Return list of registered devices for this subscription."""
-        data = await self._post("/subs/devices", {"subscription_uuid": subscription_uuid})
+        data = await self._post("/subs/devices", {"subscription_uuid": subscription_uuid}, retry_safe=True)
         return data.get("devices") or []
 
     async def delete_device(self, subscription_uuid: str, device_id: int) -> bool:
@@ -160,7 +161,13 @@ class AdaptAPI:
 
     # ── Internal ───────────────────────────────────────────────────────────
 
-    async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        retry_safe: bool = False,
+    ) -> dict[str, Any]:
         if not self.enabled:
             raise AdaptAPIError("Adapt API is not configured (missing api_id or api_key)")
 
@@ -171,24 +178,36 @@ class AdaptAPI:
         }
         url = f"{self.base_url}{path}"
 
-        async with aiohttp.ClientSession(timeout=_TIMEOUT) as http:
-            async with http.post(url, json=body, headers=headers) as resp:
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception:
-                    text = (await resp.text()).strip() or "Empty response"
-                    raise AdaptAPIError(text, status=resp.status) from None
+        attempts = 3 if retry_safe else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                async with aiohttp.ClientSession(timeout=_TIMEOUT) as http:
+                    async with http.post(url, json=body, headers=headers) as resp:
+                        try:
+                            data = await resp.json(content_type=None)
+                        except Exception:
+                            text = (await resp.text()).strip() or "Empty response"
+                            raise AdaptAPIError(text, status=resp.status) from None
 
-                if resp.status >= 400:
-                    detail = (
-                        data.get("detail")
-                        if isinstance(data, dict)
-                        else str(data)
-                    ) or f"HTTP {resp.status}"
-                    raise AdaptAPIError(detail, status=resp.status)
+                        if resp.status >= 400:
+                            detail = (
+                                data.get("detail")
+                                if isinstance(data, dict)
+                                else str(data)
+                            ) or f"HTTP {resp.status}"
+                            raise AdaptAPIError(detail, status=resp.status)
 
-                if isinstance(data, dict) and not data.get("success", True):
-                    detail = data.get("message") or "Unknown Adapt API error"
-                    raise AdaptAPIError(detail, status=resp.status)
+                        if isinstance(data, dict) and not data.get("success", True):
+                            detail = data.get("message") or "Unknown Adapt API error"
+                            raise AdaptAPIError(detail, status=resp.status)
 
-                return data
+                        return data
+            except AdaptAPIError as exc:
+                if attempt >= attempts or exc.status not in {429, 500, 502, 503, 504}:
+                    raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt >= attempts:
+                    raise AdaptAPIError(f"Adapt transport error: {exc}") from exc
+            await asyncio.sleep(float(attempt))
+
+        raise AdaptAPIError("Adapt request failed")

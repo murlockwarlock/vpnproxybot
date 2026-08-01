@@ -138,6 +138,20 @@ async def _latest_adapt_subscription(
     return row[0], row[1]
 
 
+async def _adapt_subscription_by_id(
+    session, *, user_id: int, subscription_id: int
+) -> tuple[Subscription | None, AdaptSubscription | None]:
+    result = await session.execute(
+        select(Subscription, AdaptSubscription)
+        .join(AdaptSubscription, AdaptSubscription.subscription_id == Subscription.id)
+        .where(Subscription.id == subscription_id)
+        .where(Subscription.user_id == user_id)
+        .limit(1)
+    )
+    row = result.first()
+    return (row[0], row[1]) if row else (None, None)
+
+
 def _extract_devices_from_tariff(tariff: Tariff) -> int | None:
     import re
     if not tariff or not tariff.label:
@@ -253,6 +267,8 @@ async def create_or_extend_paid_subscription(
     tariff: Tariff,
     platform: Platform,
     bonus_days: int = 0,
+    force_new: bool = False,
+    target_subscription_id: int | None = None,
 ) -> tuple[Subscription | None, str | None]:
     """Reuse the user's primary paid subscription when possible to keep the same link."""
     now = datetime.utcnow()
@@ -270,9 +286,15 @@ async def create_or_extend_paid_subscription(
         bonus_days,
     )
 
-    existing = await _latest_paid_subscription(session, user.id)
-    if not existing:
-        existing = await _latest_demo_subscription(session, user.id)
+    existing = None
+    if not force_new and target_subscription_id:
+        candidate = await session.get(Subscription, target_subscription_id)
+        if candidate and candidate.user_id == user.id:
+            existing = candidate
+    elif not force_new:
+        existing = await _latest_paid_subscription(session, user.id)
+        if not existing:
+            existing = await _latest_demo_subscription(session, user.id)
 
     if existing:
         server = await session.get(Server, existing.server_id)
@@ -421,6 +443,9 @@ async def create_or_extend_paid_access(
     tariff: Tariff,
     platform: Platform,
     bonus_days: int = 0,
+    purchase_action: str = "auto",
+    target_subscription_id: int | None = None,
+    provisioning_payment=None,
 ) -> tuple[Subscription | None, str | None]:
     if is_adapt_tariff(tariff):
         return await _create_adapt_paid_subscription(
@@ -428,6 +453,9 @@ async def create_or_extend_paid_access(
             user=user,
             tariff=tariff,
             platform=platform,
+            purchase_action=purchase_action,
+            target_subscription_id=target_subscription_id,
+            provisioning_payment=provisioning_payment,
         )
     vhq_spec = get_vhq_spec_for_tariff(tariff)
     if not vhq_spec:
@@ -437,6 +465,8 @@ async def create_or_extend_paid_access(
             tariff=tariff,
             platform=platform,
             bonus_days=bonus_days,
+            force_new=purchase_action == "new",
+            target_subscription_id=target_subscription_id,
         )
     return await _create_vhq_paid_subscription(
         session,
@@ -444,6 +474,8 @@ async def create_or_extend_paid_access(
         tariff=tariff,
         platform=platform,
         vhq_spec=vhq_spec,
+        force_new=purchase_action == "new",
+        target_subscription_id=target_subscription_id,
     )
 
 
@@ -454,6 +486,8 @@ async def _create_vhq_paid_subscription(
     tariff: Tariff,
     platform: Platform,
     vhq_spec: dict[str, int | str],
+    force_new: bool = False,
+    target_subscription_id: int | None = None,
 ) -> tuple[Subscription | None, str | None]:
     server = await get_primary_active_server(session)
     if not server:
@@ -549,14 +583,20 @@ async def _create_vhq_paid_subscription(
         raise issue
 
     # Look for an existing VHQ subscription to reuse and keep the same subscription URL
-    result = await session.execute(
-        select(Subscription)
-        .where(Subscription.user_id == user.id)
-        .where(Subscription.client_name.like(f"{VHQ_CLIENT_PREFIX}%"))
-        .order_by(Subscription.expires_at.desc(), Subscription.id.desc())
-        .limit(1)
-    )
-    existing = result.scalar_one_or_none()
+    existing = None
+    if not force_new and target_subscription_id:
+        candidate = await session.get(Subscription, target_subscription_id)
+        if candidate and candidate.user_id == user.id and candidate.client_name.startswith(VHQ_CLIENT_PREFIX):
+            existing = candidate
+    elif not force_new:
+        result = await session.execute(
+            select(Subscription)
+            .where(Subscription.user_id == user.id)
+            .where(Subscription.client_name.like(f"{VHQ_CLIENT_PREFIX}%"))
+            .order_by(Subscription.expires_at.desc(), Subscription.id.desc())
+            .limit(1)
+        )
+        existing = result.scalar_one_or_none()
 
     now = datetime.utcnow()
     if existing:
@@ -641,18 +681,43 @@ async def _adapt_create_new_subscription(
     tariff: Tariff,
     platform: Platform,
     server: Server,
+    provisioning_payment=None,
 ) -> tuple[Subscription | None, str | None]:
     """Create a brand-new Adapt subscription (new UUID + URL)."""
     plan_uuid = str(tariff.adapt_plan_uuid).strip()
+    if provisioning_payment is not None:
+        if not provisioning_payment.provisioning_operation_id:
+            provisioning_payment.provisioning_operation_id = f"tgpay_{provisioning_payment.id}"
+            await session.commit()
+        external_user_id = provisioning_payment.provisioning_operation_id
+        if (
+            provisioning_payment.provisioning_failure_code
+            and provisioning_payment.provisioning_failure_code not in {"adapt_api_402", "adapt_api_429"}
+        ):
+            raise build_internal_access_error(
+                provider="adapt",
+                code="adapt_create_awaiting_webhook",
+                admin_message=(
+                    "Waiting for Adapt subs.created webhook after ambiguous create "
+                    f"payment_id={provisioning_payment.id} external_user_id={external_user_id}"
+                ),
+                client_message="Оплата получена. Проверяем создание доступа, чтобы не выдать второй ключ.",
+            )
+    else:
+        external_user_id = str(user.telegram_id)
     try:
         order = await AdaptAPI().create_subscription(
             plan_uuid,
-            external_user_id=str(user.telegram_id),
+            external_user_id=external_user_id,
         )
     except AdaptAPIError as exc:
+        failure_code = f"adapt_api_{exc.status or 'error'}"
+        if provisioning_payment is not None:
+            provisioning_payment.provisioning_failure_code = failure_code
+            await session.commit()
         issue = build_internal_access_error(
             provider="adapt",
-            code="adapt_api_error",
+            code=failure_code,
             admin_message=(
                 f"Adapt API error during subscription creation: {exc} "
                 f"user_id={user.id} telegram_id={user.telegram_id} "
@@ -676,6 +741,9 @@ async def _adapt_create_new_subscription(
         logger.error(issue.admin_message)
         raise issue
     except Exception as exc:
+        if provisioning_payment is not None:
+            provisioning_payment.provisioning_failure_code = "adapt_runtime"
+            await session.commit()
         issue = build_internal_access_error(
             provider="adapt",
             code="adapt_runtime",
@@ -752,6 +820,8 @@ async def _adapt_create_new_subscription(
         traffic_limit_bytes=order.get("traffic_limit_bytes"),
     )
     session.add(adapt_record)
+    if provisioning_payment is not None:
+        provisioning_payment.provisioning_failure_code = None
     _disable_balance_autodebit_after_tariff_purchase(user)
 
     logger.info(
@@ -779,8 +849,16 @@ async def _create_adapt_paid_subscription(
     user: User,
     tariff: Tariff,
     platform: Platform,
+    purchase_action: str = "auto",
+    target_subscription_id: int | None = None,
+    provisioning_payment=None,
 ) -> tuple[Subscription | None, str | None]:
-    """Fulfill an Adapt tariff purchase: renew, upgrade or create fresh."""
+    """Fulfill an explicit Adapt create, renew or upgrade operation.
+
+    Adapt's current upgrade endpoint replaces the plan and starts its full term.
+    It must not be followed by renew.  Legacy/auto purchases only renew an
+    existing subscription on the exact same plan; otherwise a new UUID is made.
+    """
     server = await get_primary_active_server(session)
     if not server:
         issue = build_internal_access_error(
@@ -807,68 +885,171 @@ async def _create_adapt_paid_subscription(
         raise issue
 
     plan_uuid = str(tariff.adapt_plan_uuid).strip()
-    existing, adapt_record = await _latest_adapt_subscription(
-        session,
-        user_id=user.id,
-    )
+    action = (purchase_action or "auto").strip().lower()
+    existing = None
+    adapt_record = None
+    if target_subscription_id:
+        existing, adapt_record = await _adapt_subscription_by_id(
+            session, user_id=user.id, subscription_id=target_subscription_id
+        )
+    elif action == "auto":
+        existing, adapt_record = await _latest_adapt_subscription(session, user_id=user.id)
+        if adapt_record and str(adapt_record.adapt_plan_uuid).strip() != plan_uuid:
+            existing, adapt_record = None, None
 
-    # No previous Adapt subscription → create fresh
-    if not existing or not adapt_record:
+    if action == "new" or not existing or not adapt_record:
+        if action in {"renew", "upgrade"}:
+            issue = build_internal_access_error(
+                provider="adapt",
+                code="adapt_target_not_found",
+                admin_message=(
+                    "Adapt purchase target not found or does not belong to user "
+                    f"user_id={user.id} target_subscription_id={target_subscription_id} action={action}"
+                ),
+                client_message="Выбранная подписка не найдена. Вернитесь в профиль и выберите её заново.",
+            )
+            raise issue
         return await _adapt_create_new_subscription(
-            session, user=user, tariff=tariff, platform=platform, server=server
+            session,
+            user=user,
+            tariff=tariff,
+            platform=platform,
+            server=server,
+            provisioning_payment=provisioning_payment,
         )
 
     current_plan_uuid = str(adapt_record.adapt_plan_uuid).strip()
     same_plan = current_plan_uuid == plan_uuid
-
-    plans = None
-    new_devices = _extract_devices_from_tariff(tariff)
-    if new_devices is None or not same_plan:
-        try:
-            plans = await AdaptAPI().list_plans()
-        except Exception as exc:
-            logger.error(f"Failed to fetch Adapt plans: {exc}")
-
-    if plans:
-        # Resolve new devices count if not parsed
-        if new_devices is None:
-            for p in plans:
-                p_uuid = str(p.get("uuid") or p.get("plan_uuid") or "").strip()
-                if p_uuid == plan_uuid:
-                    new_devices = p.get("devices")
-                    break
-
-    if new_devices is None:
-        new_devices = existing.device_slots or 3
-
-    # If existing Adapt subscription exists, always reuse it to preserve the user's subscription link
     now = datetime.utcnow()
-    if not same_plan:
-        try:
-            await AdaptAPI().upgrade_subscription(adapt_record.adapt_uuid, plan_uuid)
-            adapt_record.adapt_plan_uuid = plan_uuid
-        except Exception as exc:
-            logger.error("Adapt plan upgrade failed for adapt_uuid=%s to plan=%s: %s", adapt_record.adapt_uuid, plan_uuid, exc)
 
-    # Always renew on Adapt API (works for same plan and upgraded plan)
-    renewed = await renew_adapt_subscription(
-        session,
-        adapt_record=adapt_record,
-        tariff_days=tariff.days,
-    )
-    if not renewed:
-        # Fallback to custom renew if standard renew fails
-        try:
-            resp = await AdaptAPI().renew_subscription_custom(adapt_record.adapt_uuid, tariff.days)
-            new_end_str = resp.get("end_date")
-            if new_end_str:
-                parsed = datetime.fromisoformat(str(new_end_str).replace("Z", "+00:00")).replace(tzinfo=None)
-                adapt_record.end_date = parsed
-            renewed = True
-        except Exception as exc:
-            logger.error("Adapt custom renew failed for adapt_uuid=%s: %s", adapt_record.adapt_uuid, exc)
+    if action in {"auto", "renew"} and not same_plan:
+        issue = build_internal_access_error(
+            provider="adapt",
+            code="adapt_renew_plan_mismatch",
+            admin_message=(
+                "Refusing Adapt renew with a different plan "
+                f"subscription_id={existing.id} current_plan={current_plan_uuid} requested_plan={plan_uuid}"
+            ),
+            client_message="Для продления выберите текущий тариф. Более дорогой тариф оформляется через «Улучшить».",
+        )
+        raise issue
 
-    if not renewed:
+    response: dict = {}
+    if action == "upgrade":
+        if same_plan:
+            issue = build_internal_access_error(
+                provider="adapt",
+                code="adapt_upgrade_same_plan",
+                admin_message=f"Refusing same-plan Adapt upgrade subscription_id={existing.id}",
+                client_message="Эта подписка уже использует выбранный тариф.",
+            )
+            raise issue
+        try:
+            api = AdaptAPI()
+            status_before = await api.get_status(adapt_record.adapt_uuid)
+            status_plan_uuid = str(status_before.get("plan_uuid") or "").strip()
+            status_end = _naive_utc(status_before.get("end_date")) if status_before.get("end_date") else None
+            is_retry = bool(
+                provisioning_payment is not None
+                and provisioning_payment.provisioning_baseline_plan_uuid is not None
+            )
+            if provisioning_payment is not None and not is_retry:
+                provisioning_payment.provisioning_baseline_plan_uuid = status_plan_uuid or current_plan_uuid
+                provisioning_payment.provisioning_baseline_expires_at = status_end or existing.expires_at
+                await session.commit()
+            if is_retry and status_plan_uuid == plan_uuid:
+                response = status_before
+                plog(
+                    "ВЫДАЧА_СВЕРКА",
+                    provider="Adapt",
+                    user_id=user.telegram_id,
+                    tariff=tariff.label,
+                    adapt_uuid=adapt_record.adapt_uuid,
+                    action="upgrade",
+                )
+            else:
+                response = await api.upgrade_subscription(adapt_record.adapt_uuid, plan_uuid)
+            # The live API docs state that upgrade starts a full new plan term.
+            # Read status back because older response schemas omitted end_date.
+            try:
+                status_response = await api.get_status(adapt_record.adapt_uuid)
+                response = {
+                    **response,
+                    **{key: value for key, value in status_response.items() if value is not None},
+                }
+            except Exception as status_exc:
+                logger.warning("Adapt status refresh after upgrade failed for %s: %s", adapt_record.adapt_uuid, status_exc)
+        except Exception as exc:
+            if provisioning_payment is not None:
+                provisioning_payment.provisioning_failure_code = "adapt_upgrade_failed"
+                await session.commit()
+            issue = build_internal_access_error(
+                provider="adapt",
+                code="adapt_upgrade_failed",
+                admin_message=(
+                    "Adapt upgrade failed "
+                    f"subscription_id={existing.id} adapt_uuid={adapt_record.adapt_uuid} "
+                    f"new_plan_uuid={plan_uuid}: {exc}"
+                ),
+                client_message="Оплата прошла, но улучшение подписки временно недоступно. Мы уже получили уведомление.",
+                raw_message=str(exc),
+            )
+            raise issue
+        if provisioning_payment is not None:
+            provisioning_payment.provisioning_failure_code = None
+        adapt_record.adapt_plan_uuid = plan_uuid
+    else:
+        try:
+            status_before = await AdaptAPI().get_status(adapt_record.adapt_uuid)
+        except Exception as exc:
+            issue = build_internal_access_error(
+                provider="adapt",
+                code="adapt_status_before_renew_failed",
+                admin_message=(
+                    "Cannot safely verify Adapt state before renew "
+                    f"subscription_id={existing.id} adapt_uuid={adapt_record.adapt_uuid}: {exc}"
+                ),
+                client_message="Оплата получена. Проверяем состояние подписки перед безопасным продлением.",
+                raw_message=str(exc),
+            )
+            raise issue
+        provider_end = _naive_utc(status_before.get("end_date")) if status_before.get("end_date") else None
+        is_retry = bool(
+            provisioning_payment is not None
+            and provisioning_payment.provisioning_baseline_expires_at is not None
+        )
+        if provisioning_payment is not None and not is_retry:
+            provisioning_payment.provisioning_baseline_expires_at = provider_end or existing.expires_at or adapt_record.end_date
+            provisioning_payment.provisioning_baseline_plan_uuid = str(status_before.get("plan_uuid") or current_plan_uuid)
+            await session.commit()
+        baseline_end = (
+            provisioning_payment.provisioning_baseline_expires_at
+            if provisioning_payment is not None
+            else None
+        )
+        if is_retry and provider_end and baseline_end and provider_end > baseline_end + timedelta(seconds=30):
+            response = status_before
+            adapt_record.end_date = provider_end
+            plog(
+                "ВЫДАЧА_СВЕРКА",
+                provider="Adapt",
+                user_id=user.telegram_id,
+                tariff=tariff.label,
+                adapt_uuid=adapt_record.adapt_uuid,
+                action="renew",
+            )
+        else:
+            renewed = await renew_adapt_subscription(
+                session, adapt_record=adapt_record, tariff_days=tariff.days
+            )
+            if renewed:
+                response = {"end_date": adapt_record.end_date}
+            else:
+                response = {}
+        if provisioning_payment is not None:
+            provisioning_payment.provisioning_failure_code = None
+
+    if action != "upgrade" and not response:
         issue = build_internal_access_error(
             provider="adapt",
             code="adapt_renew_failed",
@@ -894,11 +1075,10 @@ async def _create_adapt_paid_subscription(
         logger.error(issue.admin_message)
         raise issue
 
-    expires_at = (
-        _naive_utc(adapt_record.end_date)
-        if adapt_record.end_date
-        else (existing.expires_at if existing.expires_at > now else now) + timedelta(days=tariff.days)
-    )
+    raw_end_date = response.get("end_date")
+    if action != "upgrade" and not raw_end_date:
+        raw_end_date = adapt_record.end_date
+    expires_at = _naive_utc(raw_end_date) if raw_end_date else now + timedelta(days=tariff.days)
     branded_url = build_adapt_mirror_url(adapt_record.adapt_uuid)
     upstream_url = f"https://network-api.adaptgroup.app/sub/{adapt_record.adapt_uuid}"
 
@@ -912,22 +1092,38 @@ async def _create_adapt_paid_subscription(
     existing.vpn_key = branded_url or upstream_url
     existing.client_name = build_adapt_client_name(adapt_record.adapt_uuid)
     existing.tariff_id = tariff.id if tariff.id else None
-    if new_devices:
-        existing.device_slots = new_devices
+    actual_devices = response.get("devices")
+    if action == "upgrade" and actual_devices is None:
+        try:
+            plans = await api.list_plans()
+            upgraded_plan = next(
+                (
+                    item for item in plans
+                    if str(item.get("uuid") or item.get("plan_uuid") or "").strip() == plan_uuid
+                ),
+                None,
+            )
+            actual_devices = upgraded_plan.get("devices") if upgraded_plan else None
+        except Exception as plans_exc:
+            logger.warning("Adapt plan refresh after upgrade failed for %s: %s", adapt_record.adapt_uuid, plans_exc)
+    if actual_devices is not None:
+        existing.device_slots = int(actual_devices)
     adapt_record.adapt_plan_uuid = plan_uuid
     adapt_record.end_date = expires_at
     _disable_balance_autodebit_after_tariff_purchase(user)
 
     logger.info(
-        "Adapt subscription renewed: user_id=%s subscription_id=%s adapt_uuid=%s plan_uuid=%s expires_at=%s",
+        "Adapt subscription %s: user_id=%s subscription_id=%s adapt_uuid=%s plan_uuid=%s expires_at=%s devices=%s",
+        "upgraded" if action == "upgrade" else "renewed",
         user.id,
         existing.id,
         adapt_record.adapt_uuid,
         plan_uuid,
         expires_at.isoformat(),
+        existing.device_slots,
     )
     plog(
-        "ПРОДЛЕНИЕ",
+        "УЛУЧШЕНИЕ" if action == "upgrade" else "ПРОДЛЕНИЕ",
         provider="Adapt",
         user_id=user.telegram_id,
         tariff=tariff.label,
@@ -935,11 +1131,6 @@ async def _create_adapt_paid_subscription(
         subscription_id=existing.id,
     )
     return existing, branded_url or upstream_url
-
-    # Different device count or unprofitable plan change → create fresh (new URL)
-    return await _adapt_create_new_subscription(
-        session, user=user, tariff=tariff, platform=platform, server=server
-    )
 
 
 async def create_adapt_demo_subscription(

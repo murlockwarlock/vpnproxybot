@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
-from aiohttp import web
+from aiohttp import WSCloseCode, web
 from sqlalchemy import delete, func, or_, select
 
 from bot.services.payment_logger import plog
@@ -29,6 +29,7 @@ from bot.services.provisioning_issues import (
 from bot.services.vhq_partner_api import VHQPartnerAPI, VHQPartnerAPIError
 from bot.services.vhq_routing import get_vhq_spec_for_store_tariff
 from bot.services.adapt_api import AdaptAPI, AdaptAPIError
+from bot.services.purchase_intent import calculate_upgrade_price_rub
 try:
     from bot.services.adapt_subscription_proxy import build_adapt_mirror_url
 except (ImportError, Exception):
@@ -52,6 +53,11 @@ from webstore.models import (
     WebTelegramItem,
 )
 from webstore.vhq_proxy import build_vhq_mirror_url
+from webstore.telegram_notify import send_telegram_notifications
+from webstore.notification_outbox import (
+    all_staff_recipient_ids,
+    enqueue_notifications,
+)
 
 logger = logging.getLogger(__name__)
 _MSK = timezone(timedelta(hours=3))
@@ -67,6 +73,30 @@ def _support_hint_text() -> str:
     return ""
 
 
+_FULFILLMENT_RETRY_DELAYS_MINUTES = (1, 5, 20, 60)
+_FULFILLMENT_MAX_ATTEMPTS = 5
+
+
+def _is_retryable_provision_issue(issue: AccessProvisionError) -> bool:
+    permanent_codes = {
+        "adapt_target_missing",
+        "adapt_target_not_found",
+        "adapt_renew_plan_mismatch",
+        "adapt_upgrade_same_plan",
+        "device_requires_plan_upgrade",
+        "vhq_request_invalid",
+    }
+    if issue.code in permanent_codes:
+        return False
+    if issue.provider == "vhq":
+        # VHQ buy has no lookup/idempotency key: an automatic repeat after a
+        # lost response could charge twice and create a second subscription.
+        return False
+    if issue.status in {400, 401, 403, 404}:
+        return False
+    return True
+
+
 async def _notify_admins_webstore(
     order: WebOrder,
     event: str = "paid",
@@ -74,7 +104,9 @@ async def _notify_admins_webstore(
     issue: AccessProvisionError | None = None,
 ) -> None:
     """Send Telegram notification to admins about webstore payment."""
-    if not settings.admin_bot_token or not settings.admin_ids:
+    admin_ids = await _get_all_webstore_admin_ids()
+    if not admin_ids:
+        logger.warning("Webstore payment notification skipped: no administrators configured")
         return
 
     if event == "paid":
@@ -110,9 +142,10 @@ async def _notify_admins_webstore(
             f"Заказ: <code>{order.order_id}</code>\n"
             f"Marzban: <code>{order.marzban_username}</code>"
         )
-    elif event == "failed" and issue is not None:
+    elif event in {"failed", "retrying"} and issue is not None:
+        heading = "Ошибка выдачи" if event == "failed" else "Выдача задержана — будет повтор"
         text = (
-            f"🚨 <b>Ошибка выдачи (веб-магазин)</b>\n\n"
+            f"🚨 <b>{heading} (веб-магазин)</b>\n\n"
             f"Тариф: {html.escape(order.tariff_label)}\n"
             f"Сумма: {order.amount_rub}₽\n"
             f"Контакт: {html.escape(order.contact or order.email or '—')}\n"
@@ -125,26 +158,72 @@ async def _notify_admins_webstore(
     else:
         return
 
-    api_url = f"https://api.telegram.org/bot{settings.admin_bot_token}/sendMessage"
-    try:
-        async with aiohttp.ClientSession() as http:
-            for admin_id in settings.admin_ids:
-                try:
-                    await http.post(api_url, json={
-                        "chat_id": admin_id,
-                        "text": text,
-                        "parse_mode": "HTML",
-                    })
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.warning("Failed to notify admins: %s", e)
+    await enqueue_notifications(
+        event=f"order_{event}",
+        dedupe_prefix=f"web-order:{order.order_id}:{event}",
+        recipient_ids=admin_ids,
+        text=text,
+    )
+
+
+async def _notify_linked_webstore_user(order: WebOrder, event: str) -> None:
+    """Keep a linked Telegram customer informed even when provisioning fails."""
+    if not order.profile_token:
+        return
+    async with async_session() as session:
+        link = await session.get(WebProfileLink, order.profile_token)
+    if not link:
+        return
+
+    support = settings.support_url or f"{settings.subscription_base_url.rstrip('/')}/support"
+    if event == "delayed":
+        text = (
+            "⏳ <b>Оплата получена</b>\n\n"
+            f"Заказ <code>{order.order_id}</code> оплачен. Доступ пока не выдан, "
+            "система уже повторяет попытку автоматически.\n"
+            f"Если доступ нужен срочно, напишите в поддержку: {html.escape(support)}"
+        )
+    elif event == "delivered":
+        text = (
+            "✅ <b>Доступ готов</b>\n\n"
+            f"Заказ <code>{order.order_id}</code> успешно обработан. "
+            f"Ключ доступен в профиле: {html.escape(settings.subscription_base_url.rstrip('/') + '/profile')}"
+        )
+    elif event == "failed":
+        text = (
+            "🚨 <b>Оплата получена, нужна помощь с выдачей</b>\n\n"
+            f"По заказу <code>{order.order_id}</code> автоматические попытки не завершились. "
+            "Оплата не потеряна.\n"
+            f"Напишите в поддержку: {html.escape(support)}"
+        )
+    else:
+        return
+    await enqueue_notifications(
+        event=f"customer_{event}",
+        dedupe_prefix=f"web-order:{order.order_id}:customer:{event}",
+        recipient_ids=[link.telegram_id],
+        text=text,
+    )
 
 
 async def _mark_order_failed(order: WebOrder, issue: AccessProvisionError) -> None:
-    order.status = "failed"
-    order.failure_message = f"{issue.client_message}{_support_hint_text()}".strip()
+    attempts = int(order.fulfillment_attempts or 0)
+    retryable = _is_retryable_provision_issue(issue) and attempts < _FULFILLMENT_MAX_ATTEMPTS
+    if retryable:
+        delay_index = min(max(attempts - 1, 0), len(_FULFILLMENT_RETRY_DELAYS_MINUTES) - 1)
+        retry_minutes = _FULFILLMENT_RETRY_DELAYS_MINUTES[delay_index]
+        order.status = "paid"
+        order.next_fulfillment_retry_at = datetime.utcnow() + timedelta(minutes=retry_minutes)
+        order.failure_message = (
+            "Оплата получена. Автоматическая выдача задержалась, мы уже повторяем попытку."
+            f"{_support_hint_text()}"
+        ).strip()
+    else:
+        order.status = "failed"
+        order.next_fulfillment_retry_at = None
+        order.failure_message = f"{issue.client_message}{_support_hint_text()}".strip()
     order.failure_reason = issue.admin_message
+    order.failure_code = issue.code
     _web_plog(
         "WEB_ОШИБКА_ВЫДАЧИ",
         order_id=order.order_id,
@@ -153,7 +232,8 @@ async def _mark_order_failed(order: WebOrder, issue: AccessProvisionError) -> No
         code=issue.code,
         status=issue.status or "",
     )
-    await _notify_admins_webstore(order, "failed", issue=issue)
+    await _notify_admins_webstore(order, "retrying" if retryable else "failed", issue=issue)
+    await _notify_linked_webstore_user(order, "delayed" if retryable else "failed")
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
@@ -324,11 +404,15 @@ def _serialize_orders(orders: list[WebOrder]) -> list[dict[str, str | int | None
             "amount_rub": o.amount_rub,
             "original_amount_rub": o.original_amount_rub or o.amount_rub,
             "bonus_applied_rub": o.bonus_applied_rub or 0,
+            "purchase_action": o.purchase_action or "new",
+            "target_order_id": o.target_order_id,
             "status": o.status,
             "provider": _get_order_provider(o),
+            "adapt_plan_uuid": str((get_store_tariffs_by_key().get(o.tariff_key) or {}).get("adapt_plan_uuid") or ""),
+            "adapt_uuid": _extract_adapt_uuid_from_web_order(o),
             "subscription_url": _display_order_subscription_url(o),
             "raw_subscription_url": o.subscription_url or "",
-            "failure_message": o.failure_message if o.status == "failed" else None,
+            "failure_message": o.failure_message if o.status in {"failed", "paid"} else None,
             "entry_referrer": o.entry_referrer or "",
             "entry_url": o.entry_url or "",
             "ref_source": o.ref_source or "",
@@ -349,6 +433,13 @@ def _serialize_telegram_items(items: list[WebTelegramItem]) -> list[dict[str, st
             "title": item.title,
             "subtitle": item.subtitle,
             "key_value": item.key_value,
+            "provider": item.provider or _get_access_provider(item.key_value, item.external_id),
+            "adapt_plan_uuid": item.adapt_plan_uuid or "",
+            "target_order_id": (
+                f"tg:{_extract_adapt_uuid(item.key_value, item.external_id)}"
+                if _extract_adapt_uuid(item.key_value, item.external_id)
+                else None
+            ),
             "status": item.status,
             "device_slots": item.device_slots,
             "expires_at": item.expires_at.isoformat() if item.expires_at else None,
@@ -357,19 +448,38 @@ def _serialize_telegram_items(items: list[WebTelegramItem]) -> list[dict[str, st
     ]
 
 
+def _get_access_provider(subscription_url: str | None, external_id: str | None = None) -> str:
+    sub_url = str(subscription_url or "").lower()
+    identifier = str(external_id or "").lower()
+    if identifier.startswith("adapt_") or "/adapt-sub/" in sub_url or "adaptgroup" in sub_url:
+        return "adapt"
+    if "/proxy-subscription/" in sub_url or "vhq-connect" in sub_url or "/vhq-sub/" in sub_url:
+        return "vhq"
+    return "marzban" if sub_url or identifier else ""
+
+
+def _extract_adapt_uuid(subscription_url: str | None, external_id: str | None = None) -> str | None:
+    identifier = str(external_id or "").strip()
+    if identifier.startswith("adapt_"):
+        candidate = identifier.removeprefix("adapt_")
+    else:
+        raw_url = str(subscription_url or "").strip()
+        candidate = ""
+        for marker in ("/adapt-sub/", "/sub/"):
+            if marker in raw_url and (marker == "/adapt-sub/" or "adaptgroup" in raw_url.lower()):
+                candidate = raw_url.rsplit(marker, 1)[-1].split("?", 1)[0].split("#", 1)[0]
+                break
+    try:
+        return str(uuid.UUID(candidate))
+    except (ValueError, AttributeError):
+        return None
+
+
 def _get_order_provider(order: WebOrder) -> str:
     tariff = get_store_tariffs_by_key().get(order.tariff_key)
     if tariff and tariff.get("provider"):
         return str(tariff["provider"])
-    sub_url = str(order.subscription_url or "")
-    m_user = str(order.marzban_username or "")
-    if m_user.startswith("adapt_") or "/adapt-sub/" in sub_url or "adaptgroup" in sub_url:
-        return "adapt"
-    if "/proxy-subscription/" in sub_url or "vhq-connect" in sub_url or "/vhq-sub/" in sub_url:
-        return "vhq"
-    if m_user:
-        return "marzban"
-    return ""
+    return _get_access_provider(order.subscription_url, order.marzban_username)
 
 
 def _verify_internal_secret(request: web.Request) -> bool:
@@ -517,7 +627,7 @@ async def _maybe_issue_web_demo_key(session, account: WebBalanceAccount) -> str 
                 order_id=f"demo_{account.profile_token[:16]}",
                 contact=account.contact,
                 tariff_key="demo",
-                tariff_label=f"Демо-доступ {demo_days} дн. (Adapt)",
+                tariff_label=f"Демо-доступ {demo_days} дн.",
                 days=demo_days,
                 amount_rub=0,
                 original_amount_rub=0,
@@ -1103,7 +1213,43 @@ async def _get_profile_bundle(
         .order_by(WebTelegramItem.updated_at.desc(), WebTelegramItem.id.desc())
     )
     items = items_result.scalars().all()
+    await _enrich_legacy_telegram_adapt_items(session, items)
     return orders, link, items
+
+
+async def _enrich_legacy_telegram_adapt_items(session, items: list[WebTelegramItem]) -> None:
+    """Backfill provider/plan data for Telegram items saved before action support."""
+    api = AdaptAPI()
+    changed = False
+    for item in items:
+        provider = item.provider or _get_access_provider(item.key_value, item.external_id)
+        if item.provider != provider:
+            item.provider = provider or None
+            changed = True
+        if provider != "adapt" or item.adapt_plan_uuid:
+            continue
+        adapt_uuid = _extract_adapt_uuid(item.key_value, item.external_id)
+        if not adapt_uuid or not api.enabled:
+            continue
+        try:
+            status = await api.get_status(adapt_uuid)
+        except Exception as exc:
+            logger.warning("Failed to enrich legacy Telegram Adapt item %s: %s", item.id, exc)
+            continue
+        plan_uuid = str(status.get("plan_uuid") or "").strip()
+        if not plan_uuid:
+            continue
+        item.adapt_plan_uuid = plan_uuid
+        if status.get("devices") is not None:
+            item.device_slots = int(status["devices"])
+        end_date = _adapt_expires_at_from_response(status, 0) if status.get("end_date") else None
+        if end_date:
+            item.expires_at = end_date
+            item.status = "active" if end_date > datetime.utcnow() else "expired"
+        item.updated_at = datetime.utcnow()
+        changed = True
+    if changed:
+        await session.flush()
 
 
 async def _replace_telegram_items(
@@ -1127,6 +1273,8 @@ async def _replace_telegram_items(
                 title=(item.get("title") or "Telegram").strip()[:128],
                 subtitle=(item.get("subtitle") or "").strip()[:256] or None,
                 key_value=item.get("key_value"),
+                provider=(item.get("provider") or "")[:16] or None,
+                adapt_plan_uuid=(item.get("adapt_plan_uuid") or "")[:64] or None,
                 status=(item.get("status") or "active")[:16],
                 device_slots=item.get("device_slots"),
                 expires_at=datetime.fromisoformat(item["expires_at"]) if item.get("expires_at") else None,
@@ -1240,7 +1388,7 @@ def _build_tariff_explanation_html(tariffs: list[dict] | None = None) -> str:
             '</div>'
             '<div class="tariff-locations-note">'
             '<strong>🌍 Доступные локации:</strong><br>'
-            '🇪🇪 Эстония  •  🇳🇱 Нидерланды  •  🇩🇪 Германия<br>'
+            '🇳🇱 Нидерланды 1  •  🇳🇱 Нидерланды 2  •  🇩🇪 Германия<br>'
             '<span>Переключайтесь в приложении в любое время.</span>'
             '</div>'
         )
@@ -1252,7 +1400,7 @@ def _build_tariff_explanation_html(tariffs: list[dict] | None = None) -> str:
             '</div>'
             '<div class="tariff-locations-note">'
             '<strong>🌍 Доступные локации:</strong><br>'
-            '🇪🇪 Эстония  •  🇳🇱 Нидерланды  •  🇩🇪 Германия  •  и другие<br>'
+            '🇳🇱 Нидерланды 1  •  🇳🇱 Нидерланды 2  •  🇩🇪 Германия  •  и другие<br>'
             '<span>Переключайтесь в приложении в любое время.</span>'
             '</div>'
         )
@@ -1308,12 +1456,18 @@ async def handle_create_order(request: web.Request) -> web.Response:
     email = _extract_receipt_email(contact) if contact else None
     ref_source = body.get("ref", "").strip() or None
     use_balance = bool(body.get("use_balance"))
+    purchase_action = str(body.get("purchase_action") or "new").strip().lower()
+    target_order_id = str(body.get("target_order_id") or "").strip() or None
     entry_referrer = (body.get("entry_referrer") or "").strip()[:512] or None
     entry_url = (body.get("entry_url") or "").strip()[:512] or None
 
     tariff = get_store_tariffs_by_key().get(tariff_key)
     if not tariff:
         return web.json_response({"error": "Unknown tariff"}, status=400)
+    if purchase_action not in {"new", "renew", "upgrade"}:
+        return web.json_response({"error": "Неизвестное действие с подпиской"}, status=400)
+    if purchase_action != "new" and not target_order_id:
+        return web.json_response({"error": "Сначала выберите подписку в профиле"}, status=400)
 
     saved_profile_token = request.cookies.get(_AUTH_COOKIE, "").strip()
     linked_profile = None
@@ -1371,6 +1525,97 @@ async def handle_create_order(request: web.Request) -> web.Response:
             session_linked_profile = await session.get(WebProfileLink, saved_profile_token)
             if session_linked_profile:
                 profile_token = saved_profile_token
+        target_order = None
+        target_telegram_item = None
+        if purchase_action != "new":
+            if target_order_id.startswith("tg:"):
+                requested_adapt_uuid = target_order_id.removeprefix("tg:")
+                telegram_items_result = await session.execute(
+                    select(WebTelegramItem)
+                    .where(WebTelegramItem.profile_token == profile_token)
+                    .where(WebTelegramItem.item_type == "vpn")
+                )
+                target_telegram_item = next(
+                    (
+                        item for item in telegram_items_result.scalars().all()
+                        if _extract_adapt_uuid(item.key_value, item.external_id) == requested_adapt_uuid
+                    ),
+                    None,
+                )
+                target_adapt_uuid = _extract_adapt_uuid(
+                    target_telegram_item.key_value if target_telegram_item else None,
+                    target_telegram_item.external_id if target_telegram_item else None,
+                )
+            else:
+                target_order = await session.scalar(
+                    select(WebOrder)
+                    .where(WebOrder.order_id == target_order_id)
+                    .where(WebOrder.profile_token == profile_token)
+                    .where(WebOrder.status.in_(("delivered", "demo")))
+                )
+                target_adapt_uuid = _extract_adapt_uuid_from_web_order(target_order) if target_order else None
+            if not target_adapt_uuid:
+                return web.json_response(
+                    {"error": "Выбранная подписка не найдена или не поддерживает эту операцию"},
+                    status=400,
+                )
+            if target_order:
+                related_result = await session.execute(
+                    select(WebOrder)
+                    .where(WebOrder.profile_token == profile_token)
+                    .where(WebOrder.status.in_(("delivered", "demo")))
+                    .order_by(WebOrder.created_at.desc(), WebOrder.id.desc())
+                )
+                target_order = next(
+                    (
+                        candidate for candidate in related_result.scalars().all()
+                        if _extract_adapt_uuid_from_web_order(candidate) == target_adapt_uuid
+                    ),
+                    target_order,
+                )
+                target_order_id = target_order.order_id
+                old_tariff = get_store_tariffs_by_key().get(target_order.tariff_key)
+                target_expires_at = target_order.access_expires_at
+            else:
+                old_plan = str(target_telegram_item.adapt_plan_uuid or "").strip()
+                old_tariff = next(
+                    (
+                        candidate for candidate in get_store_tariffs()
+                        if str(candidate.get("adapt_plan_uuid") or "").strip() == old_plan
+                    ),
+                    None,
+                )
+                target_expires_at = target_telegram_item.expires_at
+            old_plan_uuid = str((old_tariff or {}).get("adapt_plan_uuid") or "").strip()
+            new_plan_uuid = str(tariff.get("adapt_plan_uuid") or "").strip()
+            if not old_plan_uuid or not new_plan_uuid:
+                return web.json_response(
+                    {"error": "Для этой подписки продление и улучшение через сайт сейчас недоступны"},
+                    status=400,
+                )
+            if purchase_action == "renew" and old_plan_uuid != new_plan_uuid:
+                return web.json_response(
+                    {"error": "Для продления выберите тот же тариф. Для более дорогого используйте «Улучшить»."},
+                    status=400,
+                )
+            if purchase_action == "upgrade":
+                if old_plan_uuid == new_plan_uuid:
+                    return web.json_response({"error": "Эта подписка уже на выбранном тарифе"}, status=400)
+                if int(tariff["price_rub"]) <= int(old_tariff["price_rub"]):
+                    return web.json_response({"error": "Улучшение доступно только на более дорогой тариф"}, status=400)
+                if not target_expires_at or target_expires_at <= datetime.utcnow():
+                    return web.json_response({"error": "Улучшить можно только активную подписку"}, status=400)
+                original_amount_rub = calculate_upgrade_price_rub(
+                    current_price_rub=float(old_tariff["price_rub"]),
+                    current_days=int(old_tariff["days"]),
+                    new_price_rub=float(tariff["price_rub"]),
+                    expires_at=target_expires_at,
+                )
+                if original_amount_rub <= 0:
+                    return web.json_response(
+                        {"error": "Переход на этот тариф сейчас невозможен"},
+                        status=400,
+                    )
         if _is_intro_basic_store_tariff(tariff_key):
             existing_intro_order = await session.scalar(
                 select(WebOrder.id)
@@ -1406,6 +1651,8 @@ async def handle_create_order(request: web.Request) -> web.Response:
             ref_source=ref_source,
             referral_status="ready" if ref_source else None,
             profile_token=profile_token,
+            purchase_action=purchase_action,
+            target_order_id=target_order_id,
             entry_referrer=entry_referrer,
             entry_url=entry_url,
         )
@@ -1523,6 +1770,11 @@ async def handle_create_device_order(request: web.Request) -> web.Response:
         # First check webstore orders (direct web purchase)
         primary = await _get_latest_web_access_order(session, profile_token)
         if primary and primary.access_expires_at and primary.access_expires_at > now:
+            if _get_order_provider(primary) != "marzban":
+                return web.json_response(
+                    {"error": "Для этой подписки лимит устройств меняется через «Улучшить тариф»."},
+                    status=400,
+                )
             expires_at = primary.access_expires_at
             contact = primary.contact
 
@@ -1539,6 +1791,11 @@ async def handle_create_device_order(request: web.Request) -> web.Response:
             )
             tg_item = tg_result.scalar_one_or_none()
             if tg_item:
+                if _get_access_provider(tg_item.key_value, tg_item.external_id) != "marzban":
+                    return web.json_response(
+                        {"error": "Для этой подписки лимит устройств меняется через «Улучшить тариф»."},
+                        status=400,
+                    )
                 expires_at = tg_item.expires_at
 
         if not expires_at:
@@ -1749,6 +2006,55 @@ async def handle_order_status(request: web.Request) -> web.Response:
     return web.json_response(response_data)
 
 
+async def handle_internal_adapt_event(request: web.Request) -> web.Response:
+    """Reconcile a web Adapt create from the provider webhook."""
+    if not _verify_internal_secret(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    event = str(payload.get("event") or "").strip()
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    external_user_id = str(data.get("external_user_id") or "").strip()
+    if event != "subs.created" or not external_user_id.startswith("web_"):
+        return web.json_response({"ok": True, "ignored": True})
+
+    order_id = external_user_id.removeprefix("web_")
+    adapt_uuid = str(data.get("subscription_uuid") or "").strip()
+    if not order_id or not adapt_uuid:
+        return web.json_response({"error": "Missing identifiers"}, status=400)
+
+    async with async_session() as session:
+        order = await session.scalar(select(WebOrder).where(WebOrder.order_id == order_id))
+        if not order:
+            logger.error("Adapt reconciliation order not found order_id=%s uuid=%s", order_id, adapt_uuid)
+            return web.json_response({"ok": True, "missing": True})
+        if order.status == "delivered":
+            return web.json_response({"ok": True, "already_delivered": True})
+        if not order.paid_at:
+            logger.error("Refusing Adapt reconciliation for unpaid order order_id=%s", order_id)
+            return web.json_response({"error": "Order is not paid"}, status=409)
+
+        order.marzban_username = f"adapt_{adapt_uuid}"
+        order.subscription_url = build_adapt_mirror_url(adapt_uuid)
+        order.status = "delivered"
+        order.failure_message = None
+        order.failure_reason = None
+        order.next_fulfillment_retry_at = None
+        order.delivered_at = datetime.utcnow()
+        order.access_expires_at = _adapt_expires_at_from_response(data, order.days)
+        await _disable_web_balance_autodebit_after_tariff_purchase(session, order)
+        await _apply_order_bonus_spend(session, order)
+        await session.commit()
+
+    _web_plog("WEB_ВЫДАЧА_СВЕРКА", order_id=order_id, tariff=order.tariff_label, provider="adapt")
+    await _notify_admins_webstore(order, "delivered")
+    await _notify_linked_webstore_user(order, "delivered")
+    await _sync_referral_credit_for_order(order_id)
+    return web.json_response({"ok": True, "delivered": True})
+
+
 # ── YooKassa Webhook ──
 
 
@@ -1809,6 +2115,25 @@ async def _fulfill_order(session, order: WebOrder) -> None:
 
     try:
         async with MarzbanClient() as marzban:
+            if int(order.fulfillment_attempts or 0) > 1:
+                # The username is deterministic.  If create succeeded but its
+                # response was lost, reconcile the existing account instead of
+                # issuing another create request.
+                existing_url = await marzban.get_subscription_url(username)
+                if existing_url:
+                    await marzban.update_user(username, expire=expire_ts, status="active")
+                    order.marzban_username = username
+                    order.subscription_url = existing_url
+                    order.status = "delivered"
+                    order.delivered_at = datetime.utcnow()
+                    order.access_expires_at = datetime.utcfromtimestamp(expire_ts)
+                    _web_plog(
+                        "WEB_ВЫДАЧА_СВЕРКА",
+                        order_id=order.order_id,
+                        tariff=order.tariff_label,
+                        provider="marzban",
+                    )
+                    return
             user_data = await marzban.create_user(
                 username=username,
                 expire=expire_ts,
@@ -1859,6 +2184,30 @@ async def _fulfill_order(session, order: WebOrder) -> None:
         )
         logger.error(issue.admin_message)
         await _mark_order_failed(order, issue)
+
+
+async def attempt_fulfill_order(session, order: WebOrder) -> None:
+    """Run one tracked fulfillment attempt and always leave a visible outcome."""
+    order.fulfillment_attempts = int(order.fulfillment_attempts or 0) + 1
+    order.last_fulfillment_attempt_at = datetime.utcnow()
+    order.next_fulfillment_retry_at = None
+    try:
+        await _fulfill_order(session, order)
+    except Exception as exc:
+        issue = build_internal_access_error(
+            provider="webstore",
+            code="fulfillment_runtime",
+            admin_message=f"Unexpected webstore fulfillment error order_id={order.order_id}: {exc}",
+            raw_message=str(exc),
+        )
+        logger.exception(issue.admin_message)
+        await _mark_order_failed(order, issue)
+
+    if order.status == "delivered":
+        order.next_fulfillment_retry_at = None
+        order.failure_message = None
+        order.failure_reason = None
+        order.failure_code = None
 
 
 async def _fulfill_vhq_order(order: WebOrder, vhq_spec: dict[str, int | str]) -> None:
@@ -1952,76 +2301,178 @@ def _adapt_expires_at_from_response(resp: dict, fallback_days: int) -> datetime:
 
 
 def _extract_adapt_uuid_from_web_order(order: WebOrder) -> str | None:
-    raw_username = str(order.marzban_username or "").strip()
-    if raw_username.startswith("adapt_"):
-        return raw_username.removeprefix("adapt_").strip() or None
-
-    raw_url = str(order.subscription_url or "").strip()
-    marker = "/adapt-sub/"
-    if marker in raw_url:
-        return raw_url.rsplit(marker, 1)[-1].split("?", 1)[0].split("#", 1)[0].strip() or None
-    return None
+    return _extract_adapt_uuid(order.subscription_url, order.marzban_username)
 
 
 async def _fulfill_adapt_order(session, order: WebOrder, adapt_plan_uuid: str) -> None:
-    """Renew an existing Adapt web subscription when possible, otherwise create one."""
-    if order.profile_token:
-        primary = await _get_latest_web_access_order(session, order.profile_token)
-        if primary and primary.id != order.id and primary.tariff_key == order.tariff_key:
-            adapt_uuid = _extract_adapt_uuid_from_web_order(primary)
-            if adapt_uuid:
-                try:
-                    resp = await AdaptAPI().renew_subscription(adapt_uuid)
-                except AdaptAPIError as exc:
-                    issue = build_internal_access_error(
-                        provider="adapt",
-                        code=f"adapt_renew_{exc.status or 'error'}",
-                        admin_message=(
-                            f"Adapt renew error for order {order.order_id}: {exc} "
-                            f"primary_order={primary.order_id} adapt_uuid={adapt_uuid}"
-                        ),
-                        raw_message=str(exc),
-                    )
-                    logger.error(issue.admin_message)
-                    await _mark_order_failed(order, issue)
-                    return
-                except Exception as exc:
-                    issue = build_internal_access_error(
-                        provider="adapt",
-                        code="adapt_renew_runtime",
-                        admin_message=(
-                            f"Unexpected Adapt renew error for order {order.order_id}: {exc} "
-                            f"primary_order={primary.order_id} adapt_uuid={adapt_uuid}"
-                        ),
-                        raw_message=str(exc),
-                    )
-                    logger.error(issue.admin_message)
-                    await _mark_order_failed(order, issue)
-                    return
+    """Execute the explicit web purchase operation against the selected UUID."""
+    action = str(order.purchase_action or "new").strip().lower()
+    primary = None
+    target_telegram_item = None
+    if action in {"renew", "upgrade"} and not order.target_order_id:
+        issue = build_internal_access_error(
+            provider="adapt",
+            code="adapt_target_missing",
+            admin_message=f"Adapt target is missing for order {order.order_id} action={action}",
+        )
+        await _mark_order_failed(order, issue)
+        return
+    if action in {"renew", "upgrade"} and order.target_order_id:
+        if order.target_order_id.startswith("tg:"):
+            requested_adapt_uuid = order.target_order_id.removeprefix("tg:")
+            telegram_items_result = await session.execute(
+                select(WebTelegramItem)
+                .where(WebTelegramItem.profile_token == order.profile_token)
+                .where(WebTelegramItem.item_type == "vpn")
+            )
+            target_telegram_item = next(
+                (
+                    item for item in telegram_items_result.scalars().all()
+                    if _extract_adapt_uuid(item.key_value, item.external_id) == requested_adapt_uuid
+                ),
+                None,
+            )
+            adapt_uuid = _extract_adapt_uuid(
+                target_telegram_item.key_value if target_telegram_item else None,
+                target_telegram_item.external_id if target_telegram_item else None,
+            )
+        else:
+            primary = await session.scalar(
+                select(WebOrder)
+                .where(WebOrder.order_id == order.target_order_id)
+                .where(WebOrder.profile_token == order.profile_token)
+                .where(WebOrder.status.in_(("delivered", "demo")))
+            )
+            adapt_uuid = _extract_adapt_uuid_from_web_order(primary) if primary else None
+        if not adapt_uuid:
+            issue = build_internal_access_error(
+                provider="adapt",
+                code="adapt_target_not_found",
+                admin_message=f"Adapt target not found for order {order.order_id}: {order.target_order_id}",
+            )
+            await _mark_order_failed(order, issue)
+            return
+        if order.target_snapshot_expires_at is None:
+            order.target_snapshot_expires_at = (
+                primary.access_expires_at if primary else target_telegram_item.expires_at
+            )
+        if not order.target_snapshot_plan_uuid:
+            order.target_snapshot_plan_uuid = (
+                str(target_telegram_item.adapt_plan_uuid or "")
+                if target_telegram_item
+                else str((get_store_tariffs_by_key().get(primary.tariff_key) or {}).get("adapt_plan_uuid") or "")
+            )
+        try:
+            api = AdaptAPI()
+            already_applied = False
+            status_before: dict = {}
+            if int(order.fulfillment_attempts or 0) > 1:
+                status_before = await api.get_status(adapt_uuid)
+                status_plan_uuid = str(status_before.get("plan_uuid") or "").strip()
+                status_expires_at = (
+                    _adapt_expires_at_from_response(status_before, 0)
+                    if status_before.get("end_date")
+                    else None
+                )
+                if action == "upgrade" and status_plan_uuid == adapt_plan_uuid:
+                    already_applied = True
+                elif (
+                    action == "renew"
+                    and order.target_snapshot_expires_at
+                    and status_expires_at
+                    and status_expires_at > order.target_snapshot_expires_at + timedelta(seconds=30)
+                ):
+                    already_applied = True
 
-                order.marzban_username = primary.marzban_username
-                order.subscription_url = primary.subscription_url or build_adapt_mirror_url(adapt_uuid)
-                order.status = "delivered"
-                order.failure_message = None
-                order.failure_reason = None
-                order.delivered_at = datetime.utcnow()
-                order.access_expires_at = _adapt_expires_at_from_response(resp, order.days)
+            if already_applied:
+                resp = status_before
                 _web_plog(
-                    "WEB_ПРОДЛЕНИЕ",
+                    "WEB_ВЫДАЧА_СВЕРКА",
                     order_id=order.order_id,
                     tariff=order.tariff_label,
                     provider="adapt",
-                    context=f"reused={primary.order_id} adapt_uuid={adapt_uuid}",
+                    context=f"action={action} adapt_uuid={adapt_uuid}",
                 )
-                logger.info(
-                    "Order %s renewed via Adapt: primary_order=%s uuid=%s",
-                    order.order_id,
-                    primary.order_id,
-                    adapt_uuid,
-                )
-                return
+            elif action == "renew":
+                resp = await api.renew_subscription(adapt_uuid)
+            else:
+                resp = await api.upgrade_subscription(adapt_uuid, adapt_plan_uuid)
+                try:
+                    status_resp = await api.get_status(adapt_uuid)
+                    resp = {
+                        **resp,
+                        **{key: value for key, value in status_resp.items() if value is not None},
+                    }
+                except Exception as status_exc:
+                    logger.warning("Adapt status refresh failed after web upgrade %s: %s", adapt_uuid, status_exc)
+        except AdaptAPIError as exc:
+            issue = build_internal_access_error(
+                provider="adapt",
+                code=f"adapt_{action}_{exc.status or 'error'}",
+                admin_message=(
+                    f"Adapt {action} error for order {order.order_id}: {exc} "
+                    f"target={order.target_order_id} adapt_uuid={adapt_uuid}"
+                ),
+                raw_message=str(exc),
+            )
+            logger.error(issue.admin_message)
+            await _mark_order_failed(order, issue)
+            return
+        except Exception as exc:
+            issue = build_internal_access_error(
+                provider="adapt",
+                code=f"adapt_{action}_runtime",
+                admin_message=f"Unexpected Adapt {action} error for order {order.order_id}: {exc}",
+                raw_message=str(exc),
+            )
+            logger.error(issue.admin_message)
+            await _mark_order_failed(order, issue)
+            return
 
-    # No matching previous Adapt order for this profile: issue a fresh subscription.
+        order.marzban_username = f"adapt_{adapt_uuid}"
+        source_url = primary.subscription_url if primary else target_telegram_item.key_value
+        order.subscription_url = source_url or build_adapt_mirror_url(adapt_uuid)
+        order.status = "delivered"
+        order.failure_message = None
+        order.failure_reason = None
+        order.delivered_at = datetime.utcnow()
+        order.access_expires_at = _adapt_expires_at_from_response(resp, order.days)
+        if target_telegram_item:
+            target_telegram_item.provider = "adapt"
+            target_telegram_item.adapt_plan_uuid = adapt_plan_uuid
+            target_telegram_item.device_slots = int(resp["devices"]) if resp.get("devices") is not None else target_telegram_item.device_slots
+            target_telegram_item.expires_at = order.access_expires_at
+            target_telegram_item.status = "active"
+            target_telegram_item.updated_at = datetime.utcnow()
+        _web_plog(
+            "WEB_УЛУЧШЕНИЕ" if action == "upgrade" else "WEB_ПРОДЛЕНИЕ",
+            order_id=order.order_id,
+            tariff=order.tariff_label,
+            provider="adapt",
+            context=f"target={order.target_order_id} adapt_uuid={adapt_uuid}",
+        )
+        logger.info("Order %s %sd via Adapt: target=%s uuid=%s", order.order_id, action, order.target_order_id, adapt_uuid)
+        return
+
+    # Explicit new purchase (and legacy rows without an action): issue a fresh UUID.
+    if int(order.fulfillment_attempts or 0) > 1 and order.failure_code not in {
+        "adapt_api_402",
+        "adapt_api_429",
+    }:
+        issue = build_internal_access_error(
+            provider="adapt",
+            code="adapt_create_awaiting_webhook",
+            admin_message=(
+                f"Adapt create response was ambiguous for order {order.order_id}; "
+                "waiting for subs.created webhook to avoid a duplicate subscription"
+            ),
+            client_message=(
+                "Оплата получена. Мы проверяем создание доступа, "
+                "чтобы не списать деньги и не создать ключ повторно."
+            ),
+        )
+        await _mark_order_failed(order, issue)
+        return
     try:
         api = AdaptAPI()
         resp = await api.create_subscription(
@@ -2085,6 +2536,15 @@ async def _fulfill_device_slot_order(session, order: WebOrder) -> None:
     tg_item: WebTelegramItem | None = None
 
     if primary and primary.access_expires_at and primary.access_expires_at > now and primary.subscription_url:
+        if _get_order_provider(primary) != "marzban":
+            issue = build_internal_access_error(
+                provider="adapt",
+                code="device_requires_plan_upgrade",
+                admin_message=f"Device slot order {order.order_id}: provider plan upgrade required",
+                client_message="Для этой подписки лимит устройств меняется только через улучшение тарифа.",
+            )
+            await _mark_order_failed(order, issue)
+            return
         order.marzban_username = primary.marzban_username
         order.subscription_url = primary.subscription_url
         order.access_expires_at = primary.access_expires_at
@@ -2100,6 +2560,15 @@ async def _fulfill_device_slot_order(session, order: WebOrder) -> None:
         )
         tg_item = tg_result.scalar_one_or_none()
         if tg_item and tg_item.key_value and tg_item.expires_at:
+            if _get_access_provider(tg_item.key_value, tg_item.external_id) != "marzban":
+                issue = build_internal_access_error(
+                    provider="adapt",
+                    code="device_requires_plan_upgrade",
+                    admin_message=f"Device slot order {order.order_id}: provider plan upgrade required",
+                    client_message="Для этой подписки лимит устройств меняется только через улучшение тарифа.",
+                )
+                await _mark_order_failed(order, issue)
+                return
             tg_item.device_slots = int(tg_item.device_slots or 1) + 1
             tg_item.updated_at = now
             order.marzban_username = tg_item.external_id
@@ -2234,37 +2703,30 @@ async def handle_yookassa_webhook(request: web.Request) -> web.Response:
         if order.status == "delivered":
             logger.info("Order %s already processed, skipping", order_id)
             return web.Response(text="OK")
-        if order.status == "paid":
-            logger.warning("Order %s is paid but not delivered; skipping automatic retry", order_id)
+        if order.status == "failed":
+            logger.warning("Order %s exhausted fulfillment retries", order_id)
             return web.Response(text="OK")
 
-        order.status = "paid"
-        order.paid_at = datetime.utcnow()
-        order.yookassa_payment_id = obj.get("id")
-        await session.commit()
-        _web_plog(
-            "WEB_ОПЛАТА",
-            order_id=order.order_id,
-            tariff=order.tariff_label,
-            amount=order.amount_rub,
-            method="yookassa",
-        )
-
-        # Notify admins about payment
-        await _notify_admins_webstore(order, "paid")
+        first_confirmation = order.status != "paid"
+        if first_confirmation:
+            order.status = "paid"
+            order.paid_at = datetime.utcnow()
+            order.yookassa_payment_id = obj.get("id")
+            await session.commit()
+            _web_plog(
+                "WEB_ОПЛАТА",
+                order_id=order.order_id,
+                tariff=order.tariff_label,
+                amount=order.amount_rub,
+                method="yookassa",
+            )
+            await _notify_admins_webstore(order, "paid")
+        elif order.next_fulfillment_retry_at and order.next_fulfillment_retry_at > datetime.utcnow():
+            logger.info("Order %s retry is already scheduled for %s", order_id, order.next_fulfillment_retry_at)
+            return web.Response(text="OK")
 
         # Fulfill the order (create Marzban/VHQ access).
-        try:
-            await _fulfill_order(session, order)
-        except Exception as exc:
-            issue = build_internal_access_error(
-                provider="webstore",
-                code="fulfillment_runtime",
-                admin_message=f"Unexpected webstore fulfillment error order_id={order.order_id}: {exc}",
-                raw_message=str(exc),
-            )
-            logger.exception(issue.admin_message)
-            await _mark_order_failed(order, issue)
+        await attempt_fulfill_order(session, order)
         if order.status == "delivered":
             await _disable_web_balance_autodebit_after_tariff_purchase(session, order)
             await _apply_order_bonus_spend(session, order)
@@ -2273,6 +2735,7 @@ async def handle_yookassa_webhook(request: web.Request) -> web.Response:
         # Notify admins about key delivery
         if order.status == "delivered":
             await _notify_admins_webstore(order, "delivered")
+            await _notify_linked_webstore_user(order, "delivered")
             await _sync_referral_credit_for_order(order.order_id)
 
     return web.Response(text="OK")
@@ -3271,6 +3734,26 @@ def _support_pool_get(token: str) -> dict:
     return _support_ws_pool[token]
 
 
+async def close_support_websockets() -> int:
+    """Close tracked support transports without waiting for remote peers."""
+    sockets: list[web.WebSocketResponse] = []
+    seen: set[int] = set()
+    for pool in _support_ws_pool.values():
+        candidates = [pool.get("client"), *pool.get("agents", [])]
+        for ws in candidates:
+            if ws is None or ws.closed or id(ws) in seen:
+                continue
+            seen.add(id(ws))
+            sockets.append(ws)
+
+    for ws in sockets:
+        # Waiting for a remote close frame can exceed systemd's stop timeout.
+        # aiohttp itself uses this transport helper on abnormal/timeout closes.
+        ws._set_code_close_transport(WSCloseCode.GOING_AWAY)
+    _support_ws_pool.clear()
+    return len(sockets)
+
+
 async def _support_broadcast(token: str, payload: dict, *, skip: object = None) -> None:
     data = json.dumps(payload, ensure_ascii=False)
     pool = _support_ws_pool.get(token, {})
@@ -3298,19 +3781,13 @@ def _verify_tg_login(data: dict, bot_token: str) -> bool:
     return computed == check_hash
 
 
+async def _get_all_webstore_admin_ids() -> set[int]:
+    return all_staff_recipient_ids()
+
+
 async def _get_all_target_agent_ids() -> set[int]:
     agent_ids = set(settings.support_agent_ids)
-    agent_ids.update(settings.admin_ids)
-    try:
-        from bot.models import User
-        from bot.database import async_session as bot_async_session
-        async with bot_async_session() as bot_sess:
-            db_adm = await bot_sess.execute(select(User.telegram_id).where(User.is_admin == True))
-            for uid in db_adm.scalars().all():
-                if uid:
-                    agent_ids.add(int(uid))
-    except Exception as e:
-        logger.warning("Failed to fetch bot DB admins for support notify: %s", e)
+    agent_ids.update(await _get_all_webstore_admin_ids())
     return agent_ids
 
 
@@ -3331,16 +3808,9 @@ async def _notify_support_agents(ticket: SupportTicket, first_message: str) -> N
         f"💬 <i>{html.escape(first_message[:200])}</i>\n\n"
         f"👉 {settings.subscription_base_url}/support/admin"
     )
-    api_url = f"https://api.telegram.org/bot{settings.admin_bot_token}/sendMessage"
-    try:
-        async with aiohttp.ClientSession() as http:
-            for agent_id in agent_ids:
-                try:
-                    await http.post(api_url, json={"chat_id": agent_id, "text": text, "parse_mode": "HTML"})
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.warning("Failed to notify support agents: %s", e)
+    delivered = await send_telegram_notifications(settings.admin_bot_token, agent_ids, text)
+    if delivered == 0:
+        logger.warning("New support ticket notification was not delivered")
 
 
 async def _notify_support_agents_message(ticket: SupportTicket, message_text: str) -> None:
@@ -3358,16 +3828,9 @@ async def _notify_support_agents_message(ticket: SupportTicket, message_text: st
         f"💬 <i>{html.escape(message_text[:200])}</i>\n\n"
         f"👉 {settings.subscription_base_url}/support/admin"
     )
-    api_url = f"https://api.telegram.org/bot{settings.admin_bot_token}/sendMessage"
-    try:
-        async with aiohttp.ClientSession() as http:
-            for agent_id in agent_ids:
-                try:
-                    await http.post(api_url, json={"chat_id": agent_id, "text": text, "parse_mode": "HTML"})
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.warning("Failed to notify support agents: %s", e)
+    delivered = await send_telegram_notifications(settings.admin_bot_token, agent_ids, text)
+    if delivered == 0:
+        logger.warning("Support message notification was not delivered")
 
 
 # ---------------------------------------------------------------------------
@@ -3827,6 +4290,7 @@ def setup_routes(app: web.Application) -> None:
     app.router.add_get("/api/store/internal/admin-clients-list", handle_internal_admin_clients_list)
     app.router.add_get("/api/store/internal/admin-balance-lookup", handle_internal_admin_balance_lookup)
     app.router.add_post("/api/store/internal/admin-balance-adjust", handle_internal_admin_balance_adjust)
+    app.router.add_post("/api/store/internal/adapt-event", handle_internal_adapt_event)
 
     # Profile
     app.router.add_get("/profile", handle_profile_page)

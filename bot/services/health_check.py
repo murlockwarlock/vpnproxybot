@@ -113,7 +113,7 @@ async def _check_xray_nodes(server: Server, session, bot=None) -> None:
 async def _alert_admins(bot, text: str, repeat: int = 1) -> None:
     """Send alert to all admins, optionally repeating multiple times."""
     for attempt in range(repeat):
-        for admin_id in settings.admin_ids:
+        for admin_id in settings.notification_recipient_ids:
             try:
                 await bot.send_message(admin_id, text, parse_mode="HTML")
             except Exception as e:

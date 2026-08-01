@@ -1830,7 +1830,7 @@ async def _execute_bulk_keys(bot, audience: str, tariff_id: int, custom_text: st
     async with async_session() as session:
         tariff = await session.get(Tariff, tariff_id)
         if not tariff:
-            for admin_id in settings.admin_ids:
+            for admin_id in settings.notification_recipient_ids:
                 try:
                     await bot.send_message(admin_id, "❌ Массовая выдача: тариф не найден.")
                 except Exception:
@@ -1922,7 +1922,7 @@ async def _execute_bulk_keys(bot, audience: str, tariff_id: int, custom_text: st
 
         # Progress every 50 users
         if (idx + 1) % 50 == 0:
-            for admin_id in settings.admin_ids:
+            for admin_id in settings.notification_recipient_ids:
                 try:
                     await bot.send_message(
                         admin_id,
@@ -1997,7 +1997,7 @@ async def _execute_bulk_keys(bot, audience: str, tariff_id: int, custom_text: st
         skipped,
         sent,
     )
-    for admin_id in settings.admin_ids:
+    for admin_id in settings.notification_recipient_ids:
         try:
             await bot.send_message(
                 admin_id,

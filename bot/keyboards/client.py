@@ -110,7 +110,7 @@ def _sort_tariffs_for_client(tariffs: list[Tariff]) -> list[Tariff]:
     )
 
 
-def tariffs_kb(tariffs: list[Tariff], stars_enabled: bool = True, has_product_types: bool = False) -> InlineKeyboardMarkup:
+def tariffs_kb(tariffs: list[Tariff], stars_enabled: bool = True, has_product_types: bool = False, intent_suffix: str = "") -> InlineKeyboardMarkup:
     """Build tariff selection keyboard grouped by family, then sorted by price."""
     builder = InlineKeyboardBuilder()
     current_group = None
@@ -126,11 +126,33 @@ def tariffs_kb(tariffs: list[Tariff], stars_enabled: bool = True, has_product_ty
         builder.row(
             InlineKeyboardButton(
                 text=label,
-                callback_data=f"tariff_{t.id}",
+                callback_data=f"tariff_{t.id}{intent_suffix}",
             )
         )
     back_callback = "buy" if has_product_types else "back_main"
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=back_callback))
+    return builder.as_markup()
+
+
+def purchase_action_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↻ Продлить подписку", callback_data="purchase_action_renew")],
+        [InlineKeyboardButton(text="↑ Улучшить подписку", callback_data="purchase_action_upgrade")],
+        [InlineKeyboardButton(text="➕ Создать новую", callback_data="buy_new")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="profile")],
+    ])
+
+
+def purchase_target_kb(subscriptions, action: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for sub in subscriptions:
+        label = sub.tariff.label if sub.tariff else f"Подписка #{sub.id}"
+        expires = sub.expires_at.strftime("%d.%m.%Y") if sub.expires_at else "—"
+        builder.row(InlineKeyboardButton(
+            text=f"{label} · до {expires}",
+            callback_data=f"purchase_{action}_{sub.id}",
+        ))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="buy"))
     return builder.as_markup()
 
 
@@ -264,15 +286,9 @@ def profile_kb(
         if has_device_manageable_subs:
             row.append(InlineKeyboardButton(text="📱 Устройства", callback_data="my_devices"))
         builder.row(*row)
-    # If multiple tariff options — show renewal choice; otherwise single button
-    if renewal_options and len(renewal_options) > 1:
-        builder.row(
-            InlineKeyboardButton(text=purchase_button_text, callback_data="renewal_choice"),
-        )
-    else:
-        builder.row(
-            InlineKeyboardButton(text=purchase_button_text, callback_data="buy"),
-        )
+    builder.row(
+        InlineKeyboardButton(text=purchase_button_text, callback_data="buy"),
+    )
     if balance_mode_enabled or balance_autodebit_enabled:
         builder.row(
             InlineKeyboardButton(text="💰 Пополнить баланс", callback_data="balance_menu"),

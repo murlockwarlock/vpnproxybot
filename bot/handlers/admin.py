@@ -69,6 +69,7 @@ from bot.services.vhq_subscription_proxy import (
     resolve_vhq_mirror_url,
 )
 from bot.services import vpn_manager
+from bot.utils.device_info import adapt_device_details, describe_user_agent, format_activity
 
 from bot.utils.texts import (
     ADMIN_PANEL,
@@ -1146,7 +1147,7 @@ async def admin_add_server_start(callback: CallbackQuery, state: FSMContext) -> 
         "Отправьте данные в формате:\n"
         "<code>Имя | Хост (IP) | API URL | API User | API Pass | Локация | Эмодзи | Макс.клиентов</code>\n\n"
         "Пример:\n"
-        "<code>NL-1 | 185.100.50.1 | http://185.100.50.1:8000 | admin | secret | Amsterdam | 🇳🇱 | 50</code>",
+        "<code>NL-1 | 192.0.2.10 | http://192.0.2.10:8000 | admin | secret | Amsterdam | 🇳🇱 | 50</code>",
         reply_markup=admin_back_kb(),
         parse_mode="HTML",
     )
@@ -1244,7 +1245,7 @@ async def admin_user_info(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         return
     
-    telegram_id = int(callback.data.split("_")[-1])
+    telegram_id = int(callback.data.removeprefix("adm_usr_info_"))
     async with async_session() as session:
         result = await session.execute(
             select(User).where(User.telegram_id == telegram_id)
@@ -1734,11 +1735,20 @@ async def admin_user_subs(callback: CallbackQuery) -> None:
 # ── Admin User Devices ────────────────────────────────
 
 @router.callback_query(F.data.startswith("adm_usr_devices_"))
-async def admin_user_devices(callback: CallbackQuery) -> None:
+async def admin_user_devices(callback: CallbackQuery, *, acknowledge: bool = True) -> None:
     if not _is_admin(callback.from_user.id):
         return
 
-    telegram_id = int(callback.data.split("_")[-1])
+    if acknowledge:
+        await callback.answer("Загружаем устройства…")
+
+    target_parts = callback.data.removeprefix("adm_usr_devices_").split("_", 1)
+    try:
+        telegram_id = int(target_parts[0])
+        selected_subscription_id = int(target_parts[1]) if len(target_parts) > 1 else None
+    except ValueError:
+        await callback.message.answer("Не удалось определить клиента или подписку.")
+        return
 
     async with async_session() as session:
         result = await session.execute(
@@ -1751,47 +1761,92 @@ async def admin_user_devices(callback: CallbackQuery) -> None:
         )
         user = result.scalar_one_or_none()
         if not user:
-            await callback.answer("Клиент не найден.", show_alert=True)
+            await callback.message.answer("Клиент не найден.")
             return
 
         active_subs = [s for s in user.subscriptions if s.status == SubStatus.ACTIVE]
-        # Prioritize Adapt subscriptions
-        subscription = next((sub for sub in active_subs if is_adapt_subscription(sub)), None)
-        if not subscription:
-            # Fallback to general subscription
-            subscription = next((sub for sub in active_subs if not is_vhq_subscription(sub)), None)
+        manageable_subs = active_subs
+        if selected_subscription_id is None and len(manageable_subs) > 1:
+            kb = InlineKeyboardBuilder()
+            for sub in manageable_subs:
+                label = sub.tariff.label if sub.tariff else f"Подписка #{sub.id}"
+                expires = _format_dt_msk(sub.expires_at, include_time=False)
+                kb.row(InlineKeyboardButton(
+                    text=f"{label} · до {expires}",
+                    callback_data=f"adm_usr_devices_{telegram_id}_{sub.id}",
+                ))
+            kb.row(InlineKeyboardButton(text="◀️ Назад к карточке", callback_data=f"adm_usr_refresh_{telegram_id}"))
+            await callback.message.edit_text(
+                "🖥 <b>Выберите подписку</b>\n\nУстройства каждой ссылки управляются отдельно.",
+                reply_markup=kb.as_markup(),
+                parse_mode="HTML",
+            )
+            return
+
+        subscription = next(
+            (sub for sub in manageable_subs if sub.id == selected_subscription_id),
+            manageable_subs[0] if len(manageable_subs) == 1 else None,
+        )
 
         if not subscription:
-            await callback.answer("У этого пользователя нет активной подписки.", show_alert=True)
+            await callback.message.answer("У этого пользователя нет активной подписки.")
             return
 
         if is_vhq_subscription(subscription):
-            await callback.answer("Для этого тарифа управление устройствами недоступно.", show_alert=True)
+            expires_str = _format_dt_msk(subscription.expires_at, include_time=True)
+            tariff_name = subscription.tariff.label if subscription.tariff else "Ваш тариф"
+            text = (
+                "🖥 <b>Управление устройствами (Админ)</b>\n"
+                f"Клиент: <code>{telegram_id}</code>\n"
+                f"Тариф: <b>{html.escape(tariff_name)}</b>\n\n"
+                f"📅 Подписка до: <b>{expires_str} МСК</b>\n\n"
+                "Отдельные данные об устройствах для этой подписки недоступны."
+            )
+            kb = InlineKeyboardBuilder()
+            kb.row(InlineKeyboardButton(text="◀️ Назад к карточке", callback_data=f"adm_usr_refresh_{telegram_id}"))
+            await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
             return
 
         if is_adapt_subscription(subscription):
             adapt_uuid = get_adapt_uuid_from_subscription(subscription)
             if not adapt_uuid:
-                await callback.answer("Ошибка: не найден UUID подписки Adapt.", show_alert=True)
+                await callback.message.answer("Не удалось загрузить устройства. Проверьте служебные данные подписки.")
                 return
 
-            try:
-                from bot.services.adapt_api import AdaptAPI, AdaptAPIError
-                devices = await AdaptAPI().get_devices(adapt_uuid)
-            except AdaptAPIError as exc:
-                logger.error(f"Failed to get adapt devices for sub {subscription.id}: {exc}")
-                await callback.answer("Не удалось получить список устройств. Сервер временно недоступен.", show_alert=True)
+            from bot.services.adapt_api import AdaptAPI
+            api = AdaptAPI()
+            devices_result, status_result = await asyncio.gather(
+                api.get_devices(adapt_uuid),
+                api.get_status(adapt_uuid),
+                return_exceptions=True,
+            )
+            if isinstance(devices_result, Exception):
+                exc = devices_result
+                logger.error("Failed to get device list for sub %s: %s", subscription.id, exc)
+                await callback.message.answer("Не удалось получить список устройств. Попробуйте позже.")
                 return
+            devices = devices_result
+
+            if isinstance(status_result, dict) and status_result.get("devices") is not None:
+                try:
+                    provider_limit = max(1, int(status_result["devices"]))
+                    if subscription.device_slots != provider_limit:
+                        subscription.device_slots = provider_limit
+                        await session.commit()
+                except (TypeError, ValueError):
+                    logger.warning("Invalid device limit for sub %s: %r", subscription.id, status_result.get("devices"))
+            elif isinstance(status_result, Exception):
+                logger.warning("Failed to refresh device limit for sub %s: %s", subscription.id, status_result)
 
             used_slots = len(devices)
             limit = subscription.device_slots or 1
             expires_str = _format_dt_msk(subscription.expires_at, include_time=True)
-            tariff_name = subscription.tariff.label if subscription.tariff else "Adapt"
+            tariff_name = subscription.tariff.label if subscription.tariff else "Ваш тариф"
 
             text = (
                 f"🖥 <b>Управление устройствами (Админ)</b>\n"
                 f"Клиент: <code>{telegram_id}</code>\n"
-                f"Тариф: <b>{tariff_name}</b>\n\n"
+                f"Тариф: <b>{html.escape(tariff_name)}</b>\n\n"
                 f"📅 Подписка до: <b>{expires_str} МСК</b>\n"
                 f"Подключено устройств: <b>{used_slots}</b> из <b>{limit}</b>\n"
             )
@@ -1800,10 +1855,15 @@ async def admin_user_devices(callback: CallbackQuery) -> None:
                 text += "\nУстройства пока не подключены."
             else:
                 for idx, dev in enumerate(devices, 1):
-                    dev_id = dev.get("id") or dev.get("device_id", "N/A")
-                    dev_name = dev.get("name") or dev.get("client_name") or f"Устройство {dev_id}"
-                    last_ip = dev.get("last_ip") or dev.get("ip") or "неизвестно"
-                    text += f"\n\n🖥 <b>{idx}. {dev_name}</b>\n🔹 Последний IP: <code>{last_ip}</code>"
+                    info = adapt_device_details(dev, idx)
+                    text += f"\n\n🖥 <b>{idx}. {html.escape(info['name'])}</b>"
+                    if info["model"] and info["model"] != info["name"]:
+                        text += f"\n📱 Модель: <b>{html.escape(info['model'])}</b>"
+                    text += (
+                        f"\n💻 ОС: <b>{html.escape(info['os'])}</b>"
+                        f"\n🕓 Последняя активность: <b>{info['last_activity']}</b>"
+                        f"\n🌐 Последний IP: <code>{html.escape(info['ip'])}</code>"
+                    )
 
             # Let's build a keyboard allowing the admin to delete any of these devices
             kb = InlineKeyboardBuilder()
@@ -1816,33 +1876,46 @@ async def admin_user_devices(callback: CallbackQuery) -> None:
             kb.row(InlineKeyboardButton(text="◀️ Назад к карточке", callback_data=f"adm_usr_refresh_{telegram_id}"))
 
             await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
-            await callback.answer()
             return
 
         # non-adapt logic (Marzban)
         proxy_result = await session.execute(
-            select(ProxyAccount).where(ProxyAccount.subscription_id == subscription.id)
+            select(ProxyAccount)
+            .options(selectinload(ProxyAccount.server))
+            .where(ProxyAccount.subscription_id == subscription.id)
         )
         proxies = proxy_result.scalars().all()
-        used_slots = len(proxies)
+        activity = await asyncio.gather(*(
+            vpn_manager.get_key_activity(proxy.server, proxy.marzban_username)
+            for proxy in proxies
+        ))
 
         expires_str = _format_dt_msk(subscription.expires_at, include_time=True)
         tariff_name = subscription.tariff.label if subscription.tariff else "Лайт"
         text = (
             f"🖥 <b>Управление устройствами (Админ)</b>\n"
             f"Клиент: <code>{telegram_id}</code>\n"
-            f"Тариф: <b>{tariff_name}</b>\n\n"
+            f"Тариф: <b>{html.escape(tariff_name)}</b>\n\n"
             f"📅 Подписка до: <b>{expires_str} МСК</b>\n"
-            f"Используется слотов: <b>{used_slots}</b> из <b>{subscription.device_slots}</b>\n\n"
-            f"Ключи:\n"
+            f"Доступно устройств: <b>{subscription.device_slots}</b>\n\n"
+            f"Данные подключения:\n"
         )
-        for proxy in proxies:
-            text += f"\n🔑 Location {proxy.server_id}: <code>{proxy.sub_url}</code>\n"
+        if not proxies:
+            text += "\nАктивный ключ не найден."
+        for index, (proxy, key_info) in enumerate(zip(proxies, activity), 1):
+            location = proxy.server.location or proxy.server.name
+            os_label = describe_user_agent(key_info.get("sub_last_user_agent"))
+            last_activity = format_activity(key_info.get("online_at"))
+            text += (
+                f"\n🔑 <b>{index}. {html.escape(location)}</b>"
+                f"\n💻 ОС последнего клиента: <b>{html.escape(os_label)}</b>"
+                f"\n🕓 Последняя активность: <b>{last_activity}</b>"
+                f"\n🔗 <code>{html.escape(proxy.sub_url)}</code>\n"
+            )
 
         kb = InlineKeyboardBuilder()
         kb.row(InlineKeyboardButton(text="◀️ Назад к карточке", callback_data=f"adm_usr_refresh_{telegram_id}"))
         await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
-        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("adm_del_dev_"))
@@ -1873,11 +1946,11 @@ async def admin_delete_device(callback: CallbackQuery) -> None:
             await callback.answer("Не удалось удалить устройство (API вернул false).", show_alert=True)
     except Exception as exc:
         logger.error(f"Failed to delete adapt device {device_id} for sub {sub_id} by admin: {exc}")
-        await callback.answer(f"Ошибка при удалении устройства: {exc}", show_alert=True)
+        await callback.answer("Не удалось удалить устройство. Попробуйте позже.", show_alert=True)
 
     # Refresh the device list page for admin!
-    callback.data = f"adm_usr_devices_{telegram_id}"
-    await admin_user_devices(callback)
+    callback.data = f"adm_usr_devices_{telegram_id}_{sub_id}"
+    await admin_user_devices(callback, acknowledge=False)
 
 
 # ── User Payments List ────────────────────────────────
@@ -2002,24 +2075,89 @@ async def admin_gen_key_user(message: Message, state: FSMContext) -> None:
 
     await state.update_data(manual_key_user=telegram_id)
 
-    # Skip server selection - go straight to tariff
     async with async_session() as session:
         result = await session.execute(
-            select(Tariff).where(Tariff.is_active == True).order_by(Tariff.price_rub)  # noqa: E712
+            select(User)
+            .options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
+            .where(User.telegram_id == telegram_id)
         )
-        db_tariffs = result.scalars().all()
+        user = result.scalar_one_or_none()
+    if not user:
+        await message.answer("❌ Пользователь не найден")
+        return
 
-    kb = _build_manual_key_tariff_kb(
-        db_tariffs,
-        back_callback="adm_back",
-    )
+    paid_subscriptions = [sub for sub in user.subscriptions if sub.billing_mode != "demo" and sub.tariff]
+    kb = InlineKeyboardBuilder()
+    for sub in sorted(paid_subscriptions, key=lambda item: (item.expires_at, item.id), reverse=True):
+        expires = _format_dt_msk(sub.expires_at, include_time=False)
+        kb.row(InlineKeyboardButton(
+            text=f"↻ Продлить #{sub.id} · {sub.tariff.label} · до {expires}",
+            callback_data=f"adm_key_action_renew_{sub.id}",
+        ))
+        if is_adapt_subscription(sub):
+            kb.row(InlineKeyboardButton(
+                text=f"↑ Улучшить #{sub.id} · {sub.tariff.label}",
+                callback_data=f"adm_key_action_upgrade_{sub.id}",
+            ))
+    kb.row(InlineKeyboardButton(text="➕ Создать новую подписку", callback_data="adm_key_action_new_0"))
+    kb.row(InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back"))
 
     await message.answer(
-        f"Ключ для <code>{telegram_id}</code>\n\nВыберите тариф:",
+        f"Ключ для <code>{telegram_id}</code>\n\nВыберите действие и подписку:",
         reply_markup=kb.as_markup(),
         parse_mode="HTML",
     )
     await state.set_state(AdminStates.waiting_manual_key_tariff)
+
+
+@router.callback_query(AdminStates.waiting_manual_key_tariff, F.data.startswith("adm_key_action_"))
+async def admin_gen_key_action(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    payload = callback.data.removeprefix("adm_key_action_")
+    action, raw_subscription_id = payload.rsplit("_", 1)
+    target_subscription_id = int(raw_subscription_id) or None
+    state_data = await state.get_data()
+    telegram_id = int(state_data["manual_key_user"])
+
+    async with async_session() as session:
+        target = await session.scalar(
+            select(Subscription)
+            .options(selectinload(Subscription.tariff))
+            .where(Subscription.id == target_subscription_id)
+            .where(Subscription.user.has(telegram_id=telegram_id))
+        ) if target_subscription_id else None
+        if action != "new" and (not target or not target.tariff):
+            await callback.answer("Подписка или её тариф не найдены", show_alert=True)
+            return
+        query = select(Tariff).where(Tariff.is_active == True)  # noqa: E712
+        if action == "renew":
+            query = query.where(Tariff.id == target.tariff_id)
+        elif action == "upgrade":
+            if not is_adapt_subscription(target) or not target.tariff.adapt_plan_uuid:
+                await callback.answer("Улучшение доступно только для Adapt", show_alert=True)
+                return
+            query = query.where(
+                Tariff.adapt_plan_uuid.is_not(None),
+                Tariff.price_rub > target.tariff.price_rub,
+            )
+        tariffs = (await session.execute(query.order_by(Tariff.price_rub))).scalars().all()
+
+    if not tariffs:
+        await callback.answer("Подходящих тарифов нет", show_alert=True)
+        return
+    await state.update_data(
+        manual_purchase_action=action,
+        manual_target_subscription_id=target_subscription_id,
+    )
+    kb = _build_manual_key_tariff_kb(tariffs, back_callback="adm_back")
+    await callback.message.edit_text(
+        "Выберите тариф для продления:" if action == "renew" else (
+            "Выберите более дорогой тариф:" if action == "upgrade" else "Выберите тариф для новой подписки:"
+        ),
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
 
 
 @router.callback_query(AdminStates.waiting_manual_key_tariff, F.data.startswith("adm_key_tariff_"))
@@ -2029,6 +2167,8 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
     tariff_id = int(callback.data.split("_")[-1])
     data = await state.get_data()
     telegram_id: int = data["manual_key_user"]
+    purchase_action = data.get("manual_purchase_action", "new")
+    target_subscription_id = data.get("manual_target_subscription_id")
     await state.clear()
     logger.info(
         "Manual key issuance requested: admin_id=%s target_telegram_id=%s tariff_id=%s",
@@ -2073,6 +2213,8 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
             try:
                 subscription, vpn_key = await create_or_extend_paid_access(
                     session, user=user, tariff=tariff, platform=platform,
+                    purchase_action=purchase_action,
+                    target_subscription_id=target_subscription_id,
                 )
             except AccessProvisionError as issue:
                 logger.error(
@@ -2208,6 +2350,9 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
 
 async def _show_user_info(message: Message, user: User) -> None:
     """Show comprehensive user card with all available data."""
+    from bot.services.webstore_bridge import fetch_linked_web_profile, sync_linked_web_subscriptions
+    web_profile = await fetch_linked_web_profile(user.telegram_id)
+    await sync_linked_web_subscriptions(user.telegram_id, web_profile)
     async with async_session() as session:
         # Re-fetch with all relations
         result = await session.execute(
@@ -4359,6 +4504,7 @@ async def admin_web_balance_query(message: Message, state: FSMContext) -> None:
 async def admin_web_balance_adjust(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         return
+    await callback.answer("Обрабатываем…")
     _, amount_str, profile_token = callback.data.split(":", 2)
     amount = int(amount_str)
     await _apply_web_balance_adjustment(callback, profile_token, amount)
@@ -4407,13 +4553,13 @@ async def _apply_web_balance_adjustment(event, profile_token: str, amount: int) 
                 if resp.status != 200:
                     err = data.get("error", str(resp.status))
                     if hasattr(event, "answer") and hasattr(event, "message"):
-                        await event.answer(f"Ошибка: {err}", show_alert=True)
+                        await event.message.answer(f"Ошибка: {err}")
                     else:
                         await event.answer(f"Ошибка: {err}")
                     return
     except Exception as e:
         if hasattr(event, "answer") and hasattr(event, "message"):
-            await event.answer(f"Ошибка соединения: {e}", show_alert=True)
+            await event.message.answer(f"Ошибка соединения: {e}")
         else:
             await event.answer(f"Ошибка соединения: {e}")
         return
@@ -4428,6 +4574,6 @@ async def _apply_web_balance_adjustment(event, profile_token: str, amount: int) 
             await event.message.edit_text(text, reply_markup=back_kb.as_markup(), parse_mode="HTML")
         except Exception:
             await event.message.answer(text, reply_markup=back_kb.as_markup(), parse_mode="HTML")
-        await event.answer()
+        # Callback was acknowledged before the network request.
     else:
         await event.answer(text, reply_markup=back_kb.as_markup(), parse_mode="HTML")

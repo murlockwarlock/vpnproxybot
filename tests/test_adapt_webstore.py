@@ -153,19 +153,20 @@ async def test_fulfill_adapt_order_missing_uuid():
 async def test_fulfill_adapt_order_renews_existing_same_tariff():
     from webstore.routes import _fulfill_adapt_order
 
+    adapt_uuid = "770fa622-a4bd-63f6-c938-668877662221"
     order = _make_order(tariff_key="adapt_30", order_id="renew-order")
     primary = _make_order(tariff_key="adapt_30", order_id="primary-order")
     primary.id = 10
     order.id = 11
-    primary.marzban_username = "adapt_existing-uuid"
-    primary.subscription_url = "https://darimiru.ru/vpnbot/adapt-sub/existing-uuid"
+    primary.marzban_username = f"adapt_{adapt_uuid}"
+    primary.subscription_url = f"https://darimiru.ru/vpnbot/adapt-sub/{adapt_uuid}"
+    order.purchase_action = "renew"
+    order.target_order_id = primary.order_id
 
     session = AsyncMock()
+    session.scalar = AsyncMock(return_value=primary)
 
-    with (
-        patch("webstore.routes._get_latest_web_access_order", new=AsyncMock(return_value=primary)),
-        patch("webstore.routes.AdaptAPI") as mock_cls,
-    ):
+    with patch("webstore.routes.AdaptAPI") as mock_cls:
         mock_api = AsyncMock()
         mock_api.renew_subscription = AsyncMock(return_value={"end_date": "2026-07-01T00:00:00Z"})
         mock_api.create_subscription = AsyncMock()
@@ -173,7 +174,7 @@ async def test_fulfill_adapt_order_renews_existing_same_tariff():
 
         await _fulfill_adapt_order(session, order, "plan-test-uuid")
 
-    mock_api.renew_subscription.assert_awaited_once_with("existing-uuid")
+    mock_api.renew_subscription.assert_awaited_once_with(adapt_uuid)
     mock_api.create_subscription.assert_not_called()
     assert order.status == "delivered"
     assert order.marzban_username == primary.marzban_username

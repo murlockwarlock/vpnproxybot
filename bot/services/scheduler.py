@@ -39,7 +39,7 @@ from bot.services.backup_service import create_and_send_backup
 from bot.services import vpn_manager
 from bot.keyboards.client import renew_kb
 from bot.services.balance_service import credit_user_balance, debit_user_balance, get_daily_charge_rub, next_charge_datetime
-from bot.services.notifications import notify_admins_issue, notify_expired, notify_expiring
+from bot.services.notifications import notify_admins_issue, notify_expired, notify_expiring, notify_staff_text
 from bot.services.recurring_retry import (
     MAX_PAYMENT_ATTEMPTS,
     can_retry_now,
@@ -208,7 +208,13 @@ async def auto_retry_failed_provisionings(bot) -> None:
     from bot.services.subscription_service import create_or_extend_paid_access, create_mtproto_subscription, get_primary_active_server
     from bot.services.device_slots import get_included_device_slots
     from bot.services.payment_service import credit_referral, log_referral_payment, credit_partner
-    from bot.handlers.payment import _platform_from_str, _is_deferred_platform, _delivery_platform_kb, _send_subscription_key_for_platform
+    from bot.handlers.payment import (
+        _delivery_platform_kb,
+        _is_deferred_platform,
+        _platform_from_str,
+        _purchase_access_kwargs,
+        _send_subscription_key_for_platform,
+    )
     from bot.services.vhq_routing import is_vhq_tariff
     
     # We retry payments from the last 2 days
@@ -317,6 +323,8 @@ async def auto_retry_failed_provisionings(bot) -> None:
                             tariff=tariff,
                             platform=delivery_platform,
                             bonus_days=bonus,
+                            provisioning_payment=payment,
+                            **_purchase_access_kwargs(platform_str or ""),
                         )
                     except AccessProvisionError as e:
                         logger.error(
@@ -463,11 +471,7 @@ async def auto_retry_failed_provisionings(bot) -> None:
                     f"Способ: {payment.method.value}\n"
                     f"Доступ успешно выдан авто-попыткой!"
                 )
-                for admin_id in settings.admin_ids:
-                    try:
-                        await bot.send_message(admin_id, admin_text, parse_mode="HTML")
-                    except Exception:
-                        pass
+                await notify_staff_text(bot, admin_text)
 
             except Exception as e:
                 logger.error("Error in auto-retry loop for payment ID=%s: %s", payment.id, e)
@@ -1286,6 +1290,22 @@ async def process_recurring_charges(bot):
             if not user or not tariff:
                 continue
 
+            if not sub:
+                profile.is_active = False
+                profile.consent_granted = False
+                await session.commit()
+                plog(
+                    "АВТОПРОДЛ_ОТКЛ",
+                    user_id=user.telegram_id,
+                    причина="подписка_не_найдена",
+                    tariff=tariff.label,
+                )
+                logger.warning(
+                    "Recurring profile %s disabled before charge: subscription is missing",
+                    profile.id,
+                )
+                continue
+
             if not tariff.is_active or tariff.is_admin_only:
                 plog(
                     "АВТОПРОДЛ_ПРОПУСК",
@@ -1325,7 +1345,7 @@ async def process_recurring_charges(bot):
                         )
                     except Exception:
                         pass
-                    for admin_id in settings.admin_ids:
+                    for admin_id in settings.notification_recipient_ids:
                         try:
                             await bot.send_message(
                                 admin_id,
@@ -1364,7 +1384,9 @@ async def process_recurring_charges(bot):
                         session,
                         user=user,
                         tariff=tariff,
-                        platform=sub.platform if sub else Platform.ANDROID,
+                        platform=sub.platform,
+                        purchase_action="renew",
+                        target_subscription_id=sub.id,
                     )
                 except AccessProvisionError as issue:
                     profile.is_active = False
@@ -1459,7 +1481,7 @@ async def process_recurring_charges(bot):
                 except Exception:
                     pass
 
-                for admin_id in settings.admin_ids:
+                for admin_id in settings.notification_recipient_ids:
                     try:
                         await bot.send_message(
                             admin_id,
@@ -1494,7 +1516,7 @@ async def process_recurring_charges(bot):
                     )
                 except Exception:
                     pass
-                for admin_id in settings.admin_ids:
+                for admin_id in settings.notification_recipient_ids:
                     try:
                         await bot.send_message(
                             admin_id,
@@ -1558,7 +1580,7 @@ async def process_recurring_charges(bot):
                         )
                     except Exception:
                         pass
-                    for admin_id in settings.admin_ids:
+                    for admin_id in settings.notification_recipient_ids:
                         try:
                             await bot.send_message(
                                 admin_id,
@@ -1593,7 +1615,7 @@ async def process_recurring_charges(bot):
                     except Exception:
                         pass
 
-                    for admin_id in settings.admin_ids:
+                    for admin_id in settings.notification_recipient_ids:
                         try:
                             await bot.send_message(
                                 admin_id,

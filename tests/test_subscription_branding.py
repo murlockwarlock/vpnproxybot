@@ -25,7 +25,7 @@ class _FakeMarzbanAPI:
 
 @pytest.mark.asyncio
 async def test_get_subscription_link_rewrites_to_instance_domain_and_path(monkeypatch):
-    server = Server(name="NL", host="72.56.71.124", api_url="https://vpn.psysoldatov.ru:8443")
+    server = Server(name="NL", host="192.0.2.10", api_url="https://panel.example.com:8443")
     monkeypatch.setattr(proxy_manager, "MarzbanAPI", _FakeMarzbanAPI)
     monkeypatch.setattr(bot_settings, "subscription_sub_path", "s")
     monkeypatch.setattr(bot_settings, "subscription_base_url", "https://loonapie.xyz")
@@ -37,7 +37,7 @@ async def test_get_subscription_link_rewrites_to_instance_domain_and_path(monkey
 
 @pytest.mark.asyncio
 async def test_get_subscription_link_keeps_default_sub_path_when_not_overridden(monkeypatch):
-    server = Server(name="EE", host="45.92.174.214", api_url="https://vpn.psysoldatov.ru:8443")
+    server = Server(name="NL2", host="198.51.100.20", api_url="https://panel.example.com:8443")
     monkeypatch.setattr(proxy_manager, "MarzbanAPI", _FakeMarzbanAPI)
     monkeypatch.setattr(bot_settings, "subscription_sub_path", "")
     monkeypatch.setattr(bot_settings, "subscription_base_url", "https://darimiru.ru")

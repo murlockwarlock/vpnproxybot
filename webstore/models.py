@@ -39,11 +39,38 @@ class WebOrder(Base):
     bonus_spent_at = Column(DateTime, nullable=True)
     access_expires_at = Column(DateTime, nullable=True)
     profile_token = Column(String(64), nullable=True, index=True)
+    purchase_action = Column(String(16), nullable=False, default="new")
+    target_order_id = Column(String(64), nullable=True, index=True)
     failure_message = Column(String(255), nullable=True)
+    failure_code = Column(String(64), nullable=True)
     failure_reason = Column(Text, nullable=True)
+    fulfillment_attempts = Column(Integer, nullable=False, default=0)
+    next_fulfillment_retry_at = Column(DateTime, nullable=True, index=True)
+    last_fulfillment_attempt_at = Column(DateTime, nullable=True)
+    target_snapshot_expires_at = Column(DateTime, nullable=True)
+    target_snapshot_plan_uuid = Column(String(64), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     paid_at = Column(DateTime, nullable=True)
     delivered_at = Column(DateTime, nullable=True)
+
+
+class WebNotificationOutbox(Base):
+    """Persistent Telegram notifications for payment-critical events."""
+
+    __tablename__ = "web_notification_outbox"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dedupe_key = Column(String(160), unique=True, nullable=False, index=True)
+    recipient_id = Column(BigInteger, nullable=False, index=True)
+    event = Column(String(32), nullable=False)
+    text = Column(Text, nullable=False)
+    status = Column(String(16), nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    last_attempt_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    sent_at = Column(DateTime, nullable=True)
 
 
 class WebAccount(Base):
@@ -108,6 +135,8 @@ class WebTelegramItem(Base):
     title = Column(String(128), nullable=False)
     subtitle = Column(String(256), nullable=True)
     key_value = Column(Text, nullable=True)
+    provider = Column(String(16), nullable=True)
+    adapt_plan_uuid = Column(String(64), nullable=True)
     status = Column(String(16), nullable=False, default="active")
     device_slots = Column(Integer, nullable=True)
     expires_at = Column(DateTime, nullable=True)

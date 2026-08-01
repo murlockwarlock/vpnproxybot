@@ -22,7 +22,7 @@ from bot.services.balance_mode_service import disable_balance_mode, enable_balan
 from bot.services.tariff_utils import format_subscription_duration
 from bot.services.vhq_subscription_proxy import get_subscription_display_key
 from bot.services.vhq_routing import is_vhq_subscription
-from bot.services.webstore_bridge import fetch_linked_web_profile, sync_user_profile
+from bot.services.webstore_bridge import fetch_linked_web_profile, sync_linked_web_subscriptions, sync_user_profile
 from bot.services.subscription_service import _format_proxy_links
 from bot.services.subscription_semantics import is_demo_subscription_row, paid_access_clause
 from bot.utils.texts import (
@@ -86,7 +86,7 @@ def _subscription_product_label(sub: Subscription, mtproto_accounts: list[MTProt
 def _subscription_tariff_label(sub: Subscription, mtproto_accounts: list[MTProtoAccount]) -> str:
     if getattr(sub, "billing_mode", None) == "demo":
         return "Демо-доступ"
-    if sub.tariff:
+    if getattr(sub, "tariff", None):
         return sub.tariff.label
     duration = format_subscription_duration(
         tariff_days=sub.tariff_days,
@@ -109,7 +109,7 @@ def _provider_label(sub: Subscription) -> str:
     if is_adapt_subscription(sub):
         return "Базовый"
     if is_vhq_subscription(sub):
-        return "VHQ"
+        return "Премиум"
     return "Лайт"
 
 
@@ -136,7 +136,11 @@ async def _build_renewal_options(session, user: User) -> list[tuple[int, str, fl
     for sub in subs:
         if sub.tariff_id and sub.tariff_id not in seen_tariff_ids:
             tariff = await session.get(Tariff, sub.tariff_id)
-            if tariff and tariff.is_active:
+            if (
+                tariff
+                and tariff.is_active
+                and (not tariff.is_admin_only or settings.is_admin(user.telegram_id))
+            ):
                 daily_rate = round(float(tariff.price_rub) / max(tariff.days, 1), 2)
                 options.append((tariff.id, tariff.label, daily_rate))
                 seen_tariff_ids.add(sub.tariff_id)
@@ -147,6 +151,8 @@ async def _build_renewal_options(session, user: User) -> list[tuple[int, str, fl
 @router.callback_query(F.data == "profile")
 async def show_profile(callback: CallbackQuery) -> None:
     """Show user profile with subscription count."""
+    web_profile = await fetch_linked_web_profile(callback.from_user.id)
+    await sync_linked_web_subscriptions(callback.from_user.id, web_profile)
     async with async_session() as session:
         result = await session.execute(
             select(User)
@@ -215,12 +221,11 @@ async def show_profile(callback: CallbackQuery) -> None:
         renewal_options = await _build_renewal_options(session, user)
 
     await sync_user_profile(user, user.subscriptions, mtproto_accounts)
-    web_profile = await fetch_linked_web_profile(user.telegram_id)
 
     sub_count = len(user.subscriptions)
     active_sub_count = sum(1 for sub in user.subscriptions if sub.status.value == "active")
     has_manageable_device_subs = any(
-        sub.status.value == "active" and not is_vhq_subscription(sub)
+        sub.status.value == "active"
         for sub in user.subscriptions
     )
     has_expired_paid_subs = any(
@@ -601,7 +606,7 @@ async def _build_keys_page(
         elif sub.tariff:
             tariff_line = f"📦 Тариф: {sub.tariff.label}\n"
         elif provider_label:
-            tariff_line = f"📦 Провайдер: {provider_label}\n"
+            tariff_line = f"📦 Тариф: {provider_label}\n"
         if is_adapt_subscription(sub) or is_vhq_subscription(sub):
             header = f"🔗 <b>Подписка Darimiru</b>"
         else:
@@ -779,13 +784,14 @@ async def recurring_on(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("adapt_freeze:"))
 async def adapt_freeze(callback: CallbackQuery) -> None:
     """Freeze an Adapt subscription."""
+    await callback.answer("Обрабатываем…")
     sub_id = int(callback.data.split(":")[1])
     async with async_session() as session:
         from bot.models import AdaptSubscription
         from bot.services.adapt_api import AdaptAPI, AdaptAPIError
         sub = await session.get(Subscription, sub_id)
         if not sub:
-            await callback.answer("Подписка не найдена", show_alert=True)
+            await callback.message.answer("Подписка не найдена. Если оплата уже прошла, напишите в поддержку.")
             return
 
         user_result = await session.execute(
@@ -793,7 +799,7 @@ async def adapt_freeze(callback: CallbackQuery) -> None:
         )
         user = user_result.scalar_one_or_none()
         if not user or sub.user_id != user.id:
-            await callback.answer("Нет доступа", show_alert=True)
+            await callback.message.answer("Нет доступа к этой подписке.")
             return
 
         result = await session.execute(
@@ -801,16 +807,17 @@ async def adapt_freeze(callback: CallbackQuery) -> None:
         )
         adapt_record = result.scalar_one_or_none()
         if not adapt_record:
-            await callback.answer("Подписка Adapt не найдена", show_alert=True)
+            await callback.message.answer("Служебные данные подписки не найдены. Напишите в поддержку.")
             return
         if adapt_record.is_frozen:
-            await callback.answer("Подписка уже заморожена", show_alert=True)
+            await callback.message.answer("Подписка уже заморожена.")
             return
 
         try:
             resp = await AdaptAPI().freeze_subscription(adapt_record.adapt_uuid)
         except AdaptAPIError as exc:
-            await callback.answer(f"Ошибка заморозки: {exc}", show_alert=True)
+            logger.warning("Subscription freeze failed subscription_id=%s: %s", sub_id, exc)
+            await callback.message.answer("Не удалось заморозить подписку. Попробуйте позже или напишите в поддержку.")
             return
 
         from datetime import datetime
@@ -818,20 +825,21 @@ async def adapt_freeze(callback: CallbackQuery) -> None:
         adapt_record.frozen_at = datetime.utcnow()
         await session.commit()
 
-    await callback.answer("✅ Подписка заморожена")
+    await callback.message.answer("✅ Подписка заморожена")
     await show_profile(callback)
 
 
 @router.callback_query(F.data.startswith("adapt_unfreeze:"))
 async def adapt_unfreeze(callback: CallbackQuery) -> None:
     """Unfreeze an Adapt subscription."""
+    await callback.answer("Обрабатываем…")
     sub_id = int(callback.data.split(":")[1])
     async with async_session() as session:
         from bot.models import AdaptSubscription
         from bot.services.adapt_api import AdaptAPI, AdaptAPIError
         sub = await session.get(Subscription, sub_id)
         if not sub:
-            await callback.answer("Подписка не найдена", show_alert=True)
+            await callback.message.answer("Подписка не найдена. Если оплата уже прошла, напишите в поддержку.")
             return
 
         user_result = await session.execute(
@@ -839,7 +847,7 @@ async def adapt_unfreeze(callback: CallbackQuery) -> None:
         )
         user = user_result.scalar_one_or_none()
         if not user or sub.user_id != user.id:
-            await callback.answer("Нет доступа", show_alert=True)
+            await callback.message.answer("Нет доступа к этой подписке.")
             return
 
         result = await session.execute(
@@ -847,16 +855,17 @@ async def adapt_unfreeze(callback: CallbackQuery) -> None:
         )
         adapt_record = result.scalar_one_or_none()
         if not adapt_record:
-            await callback.answer("Подписка Adapt не найдена", show_alert=True)
+            await callback.message.answer("Служебные данные подписки не найдены. Напишите в поддержку.")
             return
         if not adapt_record.is_frozen:
-            await callback.answer("Подписка не заморожена", show_alert=True)
+            await callback.message.answer("Подписка не заморожена.")
             return
 
         try:
             resp = await AdaptAPI().unfreeze_subscription(adapt_record.adapt_uuid)
         except AdaptAPIError as exc:
-            await callback.answer(f"Ошибка разморозки: {exc}", show_alert=True)
+            logger.warning("Subscription unfreeze failed subscription_id=%s: %s", sub_id, exc)
+            await callback.message.answer("Не удалось разморозить подписку. Попробуйте позже или напишите в поддержку.")
             return
 
         adapt_record.is_frozen = False
@@ -872,7 +881,7 @@ async def adapt_unfreeze(callback: CallbackQuery) -> None:
                 pass
         await session.commit()
 
-    await callback.answer("✅ Подписка разморожена")
+    await callback.message.answer("✅ Подписка разморожена")
     await show_profile(callback)
 
 
@@ -898,6 +907,7 @@ async def adapt_traffic(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("adapt_buy_traffic:"))
 async def adapt_buy_traffic(callback: CallbackQuery) -> None:
     """Purchase additional traffic for an Adapt subscription."""
+    await callback.answer("Обрабатываем…")
     parts = callback.data.split(":")
     sub_id = int(parts[1])
     gb_amount = int(parts[2])
@@ -907,7 +917,7 @@ async def adapt_buy_traffic(callback: CallbackQuery) -> None:
         from bot.services.adapt_api import AdaptAPI, AdaptAPIError
         sub = await session.get(Subscription, sub_id)
         if not sub:
-            await callback.answer("Подписка не найдена", show_alert=True)
+            await callback.message.answer("Подписка не найдена. Напишите в поддержку.")
             return
 
         user_result = await session.execute(
@@ -915,7 +925,7 @@ async def adapt_buy_traffic(callback: CallbackQuery) -> None:
         )
         user = user_result.scalar_one_or_none()
         if not user or sub.user_id != user.id:
-            await callback.answer("Нет доступа", show_alert=True)
+            await callback.message.answer("Нет доступа к этой подписке.")
             return
 
         result = await session.execute(
@@ -923,117 +933,33 @@ async def adapt_buy_traffic(callback: CallbackQuery) -> None:
         )
         adapt_record = result.scalar_one_or_none()
         if not adapt_record:
-            await callback.answer("Подписка Adapt не найдена", show_alert=True)
+            await callback.message.answer("Служебные данные подписки не найдены. Напишите в поддержку.")
             return
 
         try:
             resp = await AdaptAPI().purchase_traffic(adapt_record.adapt_uuid, gb_amount)
         except AdaptAPIError as exc:
-            await callback.answer(f"Ошибка: {exc}", show_alert=True)
+            logger.warning("Traffic purchase failed subscription_id=%s: %s", sub_id, exc)
+            await callback.message.answer("Не удалось докупить трафик. Попробуйте позже или напишите в поддержку.")
             return
 
         total_price = resp.get("total_price", "?")
 
-    await callback.answer(f"✅ Куплено {gb_amount} ГБ (списано {total_price} USD)")
+    await callback.message.answer(f"✅ Куплено {gb_amount} ГБ (списано {total_price} USD)")
     await show_profile(callback)
 
 
 @router.callback_query(F.data.startswith("adapt_upgrade:"))
 async def adapt_upgrade_menu(callback: CallbackQuery) -> None:
-    """Show upgrade plan options for an Adapt subscription."""
+    """Route legacy upgrade buttons into the paid upgrade flow."""
     sub_id = int(callback.data.split(":")[1])
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-    from bot.services.adapt_api import AdaptAPI, AdaptAPIError
-
-    try:
-        plans = await AdaptAPI().list_plans()
-    except AdaptAPIError as exc:
-        await callback.answer(f"Ошибка загрузки планов: {exc}", show_alert=True)
-        return
-
-    active_plans = [p for p in plans if p.get("is_active") and not p.get("is_trial")]
-    if not active_plans:
-        await callback.answer("Нет доступных планов для улучшения", show_alert=True)
-        return
-
-    buttons = []
-    for plan in active_plans:
-        name = plan.get("name", "?")
-        price = plan.get("retail_price_usd") or plan.get("price_usd", "?")
-        days = plan.get("days", "?")
-        plan_uuid = plan.get("uuid", "")
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"⬆️ {name} — {days} дн. / {price} USD",
-                callback_data=f"adapt_do_upgrade:{sub_id}:{plan_uuid}",
-            )
-        ])
-    buttons.append([InlineKeyboardButton(text="← Назад", callback_data="profile")])
-
-    await callback.message.edit_text(
-        "⬆️ <b>Улучшить тариф</b>\n\nВыберите новый план:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="HTML",
-    )
-    await callback.answer()
+    from bot.handlers.buy import choose_upgrade_target
+    callback.data = f"purchase_upgrade_{sub_id}"
+    await choose_upgrade_target(callback)
 
 
 @router.callback_query(F.data.startswith("adapt_do_upgrade:"))
 async def adapt_do_upgrade(callback: CallbackQuery) -> None:
-    """Execute upgrade to the selected Adapt plan."""
-    parts = callback.data.split(":")
-    sub_id = int(parts[1])
-    new_plan_uuid = parts[2]
-
-    async with async_session() as session:
-        from bot.models import AdaptSubscription
-        from bot.services.adapt_api import AdaptAPI, AdaptAPIError
-        sub = await session.get(Subscription, sub_id)
-        if not sub:
-            await callback.answer("Подписка не найдена", show_alert=True)
-            return
-
-        user_result = await session.execute(
-            select(User).where(User.telegram_id == callback.from_user.id)
-        )
-        user = user_result.scalar_one_or_none()
-        if not user or sub.user_id != user.id:
-            await callback.answer("Нет доступа", show_alert=True)
-            return
-
-        result = await session.execute(
-            select(AdaptSubscription).where(AdaptSubscription.subscription_id == sub_id)
-        )
-        adapt_record = result.scalar_one_or_none()
-        if not adapt_record:
-            await callback.answer("Подписка Adapt не найдена", show_alert=True)
-            return
-
-        new_tariff = await session.scalar(
-            select(Tariff).where(Tariff.adapt_plan_uuid == new_plan_uuid)
-        )
-        if not new_tariff:
-            await callback.answer("Тариф не найден", show_alert=True)
-            return
-
-        try:
-            resp = await AdaptAPI().renew_subscription_custom(adapt_record.adapt_uuid, new_tariff.days)
-        except AdaptAPIError as exc:
-            await callback.answer(f"Ошибка улучшения: {exc}", show_alert=True)
-            return
-
-        adapt_record.adapt_plan_uuid = new_plan_uuid
-        
-        # update expires_at
-        new_end_str = resp.get("end_date")
-        if new_end_str:
-            from datetime import datetime
-            sub.expires_at = datetime.fromisoformat(new_end_str.replace("Z", "+00:00")).replace(tzinfo=None)
-            adapt_record.end_date = sub.expires_at
-
-        await session.commit()
-
-        upgrade_price = resp.get("total_price", "?")
-
-    await callback.answer(f"✅ Тариф улучшен! Стоимость (в USD): {upgrade_price}")
-    await show_profile(callback)
+    """Legacy stale-message button: never change a plan without payment."""
+    await callback.answer("Эта кнопка устарела", show_alert=True)
+    await callback.message.answer("Откройте «Купить» → «Улучшить подписку», чтобы увидеть доплату и оплатить переход.")

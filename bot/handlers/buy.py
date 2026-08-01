@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import math
 from urllib.parse import urlparse
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from bot.config import settings
 from bot.database import async_session
@@ -17,10 +19,15 @@ from bot.keyboards.client import (
     platform_kb,
     product_type_kb,
     tariffs_kb,
+    purchase_action_kb,
+    purchase_target_kb,
 )
-from bot.models import BotSettings, Partner, Server, Tariff, TariffType, User
+from bot.models import BotSettings, Partner, Server, Subscription, Tariff, TariffType, User
 from bot.services.balance_service import get_user_balance
 from bot.services.legal_docs import build_legal_notice, get_all_legal_doc_urls
+from bot.services.purchase_intent import decode_intent, encode_intent, get_purchase_price_rub
+from bot.services.adapt_routing import is_adapt_subscription
+from bot.services.subscription_semantics import paid_access_clause
 from bot.services.tariff_rules import (
     INTRO_BASIC_ALREADY_USED_TEXT,
     build_darimiru_tariff_text,
@@ -130,6 +137,24 @@ async def start_purchase(callback: CallbackQuery) -> None:
     """Step 0 - Show product type selection, or skip to tariffs if only VPN."""
     async with async_session() as session:
         has_extra = await _has_non_vpn_tariffs(session, user_id=callback.from_user.id)
+        has_paid_sub = await session.scalar(
+            select(Subscription.id)
+            .where(Subscription.user.has(telegram_id=callback.from_user.id))
+            .where(paid_access_clause(Subscription))
+            .limit(1)
+        )
+
+    if has_paid_sub:
+        await callback.message.edit_text(
+            "Что вы хотите сделать?\n\n"
+            "<b>Продлить</b> — добавить срок к текущему тарифу.\n"
+            "<b>Улучшить</b> — перейти на более дорогой тариф с автоматическим зачётом остатка.\n"
+            "<b>Создать новую</b> — получить отдельную ссылку.",
+            reply_markup=purchase_action_kb(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
 
     if has_extra:
         try:
@@ -145,7 +170,102 @@ async def start_purchase(callback: CallbackQuery) -> None:
         return
 
     # No TG proxy tariffs — go directly to VPN tariff list
-    await _show_tariffs(callback, TariffType.VPN, has_product_types=False)
+    await _show_tariffs(callback, TariffType.VPN, has_product_types=False, intent_suffix="~n~0")
+
+
+@router.callback_query(F.data == "buy_new")
+async def start_new_purchase(callback: CallbackQuery) -> None:
+    async with async_session() as session:
+        has_extra = await _has_non_vpn_tariffs(session, user_id=callback.from_user.id)
+    if has_extra:
+        await callback.message.edit_text(
+            SELECT_PRODUCT_TYPE,
+            reply_markup=product_type_kb(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+    await _show_tariffs(callback, TariffType.VPN, has_product_types=False, intent_suffix="~n~0")
+
+
+async def _purchase_targets(telegram_id: int, *, adapt_only: bool = False) -> list[Subscription]:
+    async with async_session() as session:
+        result = await session.execute(
+            select(Subscription)
+            .options(selectinload(Subscription.tariff))
+            .where(Subscription.user.has(telegram_id=telegram_id))
+            .where(paid_access_clause(Subscription))
+            .order_by(Subscription.expires_at.desc(), Subscription.id.desc())
+        )
+        items = result.scalars().all()
+    if not settings.is_admin(telegram_id):
+        items = [sub for sub in items if not sub.tariff or not sub.tariff.is_admin_only]
+    return [sub for sub in items if is_adapt_subscription(sub)] if adapt_only else items
+
+
+@router.callback_query(F.data.in_({"purchase_action_renew", "purchase_action_upgrade"}))
+async def choose_purchase_target(callback: CallbackQuery) -> None:
+    action = callback.data.removeprefix("purchase_action_")
+    targets = await _purchase_targets(callback.from_user.id, adapt_only=action == "upgrade")
+    if not targets:
+        await callback.answer("Подходящих подписок не найдено", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "Выберите подписку, которую хотите продлить:" if action == "renew" else "Выберите подписку, которую хотите улучшить:",
+        reply_markup=purchase_target_kb(targets, action),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("purchase_renew_"))
+async def choose_renew_target(callback: CallbackQuery) -> None:
+    sub_id = int(callback.data.removeprefix("purchase_renew_"))
+    async with async_session() as session:
+        sub = await session.get(Subscription, sub_id)
+        tariff = await session.get(Tariff, sub.tariff_id) if sub and sub.tariff_id else None
+        owner_ok = bool(sub and await session.scalar(select(User.id).where(User.id == sub.user_id, User.telegram_id == callback.from_user.id)))
+    if not owner_ok or not tariff or not tariff.is_active:
+        await callback.answer("Тариф этой подписки больше недоступен", show_alert=True)
+        return
+    callback.data = f"tariff_{tariff.id}~r~{sub_id}"
+    await select_tariff(callback)
+
+
+@router.callback_query(F.data.startswith("purchase_upgrade_"))
+async def choose_upgrade_target(callback: CallbackQuery) -> None:
+    sub_id = int(callback.data.removeprefix("purchase_upgrade_"))
+    async with async_session() as session:
+        sub = await session.get(Subscription, sub_id)
+        current = await session.get(Tariff, sub.tariff_id) if sub and sub.tariff_id else None
+        owner_ok = bool(sub and await session.scalar(select(User.id).where(User.id == sub.user_id, User.telegram_id == callback.from_user.id)))
+        if (
+            not owner_ok
+            or not current
+            or not current.adapt_plan_uuid
+            or (current.is_admin_only and not settings.is_admin(callback.from_user.id))
+        ):
+            await callback.answer("Эту подписку сейчас нельзя улучшить", show_alert=True)
+            return
+        query = (
+            select(Tariff)
+            .where(Tariff.is_active == True)  # noqa: E712
+            .where(Tariff.adapt_plan_uuid.is_not(None))
+            .where(Tariff.price_rub > current.price_rub)
+            .order_by(Tariff.price_rub)
+        )
+        if not settings.is_admin(callback.from_user.id):
+            query = query.where(Tariff.is_admin_only == False)  # noqa: E712
+        result = await session.execute(query)
+        tariffs = result.scalars().all()
+        stars_enabled = await _get_stars_enabled(session)
+    if not tariffs:
+        await callback.answer("Более дорогих тарифов сейчас нет", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "Выберите новый тариф. Стоимость перехода рассчитается автоматически:",
+        reply_markup=tariffs_kb(tariffs, stars_enabled, intent_suffix=f"~u~{sub_id}"),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("ptype_"))
@@ -157,10 +277,10 @@ async def select_product_type(callback: CallbackQuery) -> None:
     except ValueError:
         tariff_type = TariffType.VPN
 
-    await _show_tariffs(callback, tariff_type, has_product_types=True)
+    await _show_tariffs(callback, tariff_type, has_product_types=True, intent_suffix="~n~0")
 
 
-async def _show_tariffs(callback: CallbackQuery, tariff_type: TariffType, has_product_types: bool = False) -> None:
+async def _show_tariffs(callback: CallbackQuery, tariff_type: TariffType, has_product_types: bool = False, intent_suffix: str = "") -> None:
     """Show tariffs filtered by type."""
     is_admin = settings.is_admin(callback.from_user.id)
     async with async_session() as session:
@@ -206,7 +326,7 @@ async def _show_tariffs(callback: CallbackQuery, tariff_type: TariffType, has_pr
     try:
         await callback.message.edit_text(
             text,
-            reply_markup=tariffs_kb(tariffs, stars_enabled, has_product_types=has_product_types),
+            reply_markup=tariffs_kb(tariffs, stars_enabled, has_product_types=has_product_types, intent_suffix=intent_suffix),
             parse_mode="HTML",
         )
     except TelegramBadRequest as e:
@@ -268,6 +388,9 @@ async def renew_tariff(callback: CallbackQuery) -> None:
     if not tariff.is_active:
         await callback.answer("Этот тариф больше недоступен", show_alert=True)
         return
+    if tariff.is_admin_only and not settings.is_admin(callback.from_user.id):
+        await callback.answer("Этот тариф больше недоступен", show_alert=True)
+        return
     if tariff.tariff_type in (TariffType.VPN, TariffType.BOTH) and not tariff.adapt_plan_uuid and not tariff.vhq_tier:
         await callback.answer("Этот тариф больше недоступен", show_alert=True)
         return
@@ -281,20 +404,32 @@ async def renew_tariff(callback: CallbackQuery) -> None:
 async def select_tariff(callback: CallbackQuery) -> None:
     """Step 2 - User picked a tariff, show platform selection or payment."""
     parts = callback.data.split("_")
-    tariff_id = int(parts[1])
+    tariff_token, purchase_action, target_subscription_id = decode_intent(parts[1])
+    tariff_id = int(tariff_token)
 
     async with async_session() as session:
         tariff = await session.get(Tariff, tariff_id)
         has_product_types = await _has_non_vpn_tariffs(session, user_id=callback.from_user.id)
         user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        if not tariff:
+            await callback.answer("Тариф не найден", show_alert=True)
+            return
+        if not tariff.is_active:
+            await callback.answer("Этот тариф больше недоступен", show_alert=True)
+            return
+        if tariff.is_admin_only and not settings.is_admin(callback.from_user.id):
+            await callback.answer("Этот тариф больше недоступен", show_alert=True)
+            return
         intro_basic_available = await can_purchase_intro_basic_tariff(session, user=user, tariff=tariff)
+        try:
+            purchase_price = await get_purchase_price_rub(
+                session, user=user, tariff=tariff, action=purchase_action,
+                target_subscription_id=target_subscription_id,
+            )
+        except ValueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
 
-    if not tariff:
-        await callback.answer("Тариф не найден", show_alert=True)
-        return
-    if not tariff.is_active:
-        await callback.answer("Этот тариф больше недоступен", show_alert=True)
-        return
     if not intro_basic_available:
         await callback.answer(INTRO_BASIC_ALREADY_USED_TEXT, show_alert=True)
         return
@@ -357,9 +492,10 @@ async def select_tariff(callback: CallbackQuery) -> None:
         user_balance = get_user_balance(user)
 
     partner_discount_text = await _partner_discount_text(callback.from_user.id, tariff)
-    price_str = f"{tariff.price_rub}₽"
+    price_str = f"{purchase_price}₽"
     if stars_enabled and tariff.price_stars:
-        price_str += f" / {tariff.price_stars}⭐"
+        quoted_stars = max(1, math.ceil(tariff.price_stars * purchase_price / tariff.price_rub))
+        price_str += f" / {quoted_stars}⭐"
     balance_info = f"💰 Ваш баланс: <b>{user_balance:.2f} ₽</b>\n\n" if user_balance > 0 else ""
     try:
         await callback.message.edit_text(
@@ -375,10 +511,10 @@ async def select_tariff(callback: CallbackQuery) -> None:
             + partner_discount_text,
             reply_markup=payment_kb(
                 tariff_id,
-                "deferred",
+                encode_intent("deferred", purchase_action, target_subscription_id),
                 stars_enabled,
                 user_balance,
-                float(tariff.price_rub),
+                float(purchase_price),
                 legal_urls,
                 back_callback=tariff_back,
             ),

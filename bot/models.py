@@ -229,6 +229,10 @@ class Payment(Base):
     
     tariff_id: Mapped[int | None] = mapped_column(ForeignKey("tariffs.id"), nullable=True)
     platform: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provisioning_operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    provisioning_baseline_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    provisioning_baseline_plan_uuid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provisioning_failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="payments")
     subscription: Mapped["Subscription"] = relationship(back_populates="payment")

@@ -17,7 +17,7 @@ def test_intro_basic_tariff_detection_matches_one_day_basic_trial():
 
 def test_darimiru_tariff_text_contains_descriptions_and_locations():
     text = build_darimiru_tariff_text(
-        "🇪🇪 Эстония  •  🇳🇱 Нидерланды  •  🇩🇪 Германия",
+        "🇳🇱 Нидерланды 1  •  🇳🇱 Нидерланды 2  •  🇩🇪 Германия",
         extra_device_tariffs=["Лайт (1 месяц)"],
     )
 
@@ -25,7 +25,9 @@ def test_darimiru_tariff_text_contains_descriptions_and_locations():
     assert "Тариф Максимум" in text
     assert "50 серверов" in text
     assert "80 серверов" in text
-    assert "🇪🇪 Эстония" in text
+    assert "🇳🇱 Нидерланды 1" in text
+    assert "🇳🇱 Нидерланды 2" in text
+    assert "Эстония" not in text
     assert "и другие" in text
     assert "1-5 устройств" in text
 

@@ -152,11 +152,17 @@ class WebStoreSettings:
         default_factory=lambda: os.getenv("ADMIN_BOT_TOKEN", "")
     )
     admin_ids: list[int] = field(default_factory=lambda: _env_admin_ids("ADMIN_IDS"))
+    owner_ids: list[int] = field(
+        default_factory=lambda: _env_admin_ids("OWNER_IDS", os.getenv("ADMIN_IDS", ""))
+    )
+    telegram_proxy: str = field(
+        default_factory=lambda: os.getenv("TELEGRAM_PROXY", "").strip().strip('"').strip("'")
+    )
     bridge_shared_secret: str = field(
         default_factory=lambda: os.getenv("BRIDGE_SHARED_SECRET", "")
     )
     referral_bridge_url: str = field(
-        default_factory=lambda: os.getenv("REFERRAL_BRIDGE_URL", "http://45.92.174.214:8080/vpnbot")
+        default_factory=lambda: os.getenv("REFERRAL_BRIDGE_URL", "")
     )
     vhq_partner_api_url: str = field(
         default_factory=lambda: os.getenv(
@@ -217,6 +223,10 @@ class WebStoreSettings:
         return bool(self.yookassa_shop_id and self.yookassa_secret_key)
 
     @property
+    def notification_recipient_ids(self) -> list[int]:
+        return sorted(set(self.admin_ids) | set(self.owner_ids) | set(self.support_agent_ids))
+
+    @property
     def bot_handle(self) -> str:
         parsed = urlparse(self.bot_url.strip())
         candidate = (parsed.path or "").strip("/").split("/", 1)[0]
@@ -230,7 +240,7 @@ settings = WebStoreSettings()
 # Tariffs available on the web store
 # key, label, days, price_rub, description, badge (optional)
 _MARZBAN_FEATURES = [
-    "3 сервера: Эстония, Германия, Нидерланды",
+    "3 сервера: Нидерланды 1, Нидерланды 2, Германия",
     "9 вариантов подключения на выбор",
     "3 устройства в тарифе",
     "Можно докупить дополнительные устройства",

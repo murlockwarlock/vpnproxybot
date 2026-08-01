@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -18,6 +19,7 @@ from bot.models import (
     PaymentStatus,
     Platform,
     ProxyAccount,
+    RecurringPaymentProfile,
     Server,
     SubStatus,
     Subscription,
@@ -164,7 +166,7 @@ async def test_duplicate_successful_payment_is_ignored(monkeypatch, db_session_f
 async def test_successful_stars_payment_delivers_key_and_guide(monkeypatch, db_session_factory):
     async with db_session_factory() as session:
         user = User(telegram_id=10003, username="buyer3", full_name="Buyer 3")
-        server = Server(name="NL", host="72.56.71.124", location="Netherlands")
+        server = Server(name="NL", host="192.0.2.10", location="Netherlands")
         tariff = Tariff(
             days=30,
             label="Тест 30 дней",
@@ -190,7 +192,7 @@ async def test_successful_stars_payment_delivers_key_and_guide(monkeypatch, db_s
     send_guide = AsyncMock()
     monkeypatch.setattr(guide_service, "send_guide", send_guide)
 
-    async def _create_access(session, user, tariff, platform, bonus_days):
+    async def _create_access(session, user, tariff, platform, bonus_days, **_kwargs):
         subscription = Subscription(
             user_id=user.id,
             server_id=server.id,
@@ -240,7 +242,7 @@ async def test_successful_stars_payment_delivers_key_and_guide(monkeypatch, db_s
 async def test_successful_telegram_pay_deferred_platform_creates_subscription(monkeypatch, db_session_factory):
     async with db_session_factory() as session:
         user = User(telegram_id=10031, username="buyer31", full_name="Buyer 31")
-        server = Server(name="NL", host="72.56.71.124", location="Netherlands")
+        server = Server(name="NL", host="192.0.2.10", location="Netherlands")
         tariff = Tariff(
             days=30,
             label="1 месяц",
@@ -260,7 +262,7 @@ async def test_successful_telegram_pay_deferred_platform_creates_subscription(mo
     monkeypatch.setattr(payment_handler, "log_referral_payment", AsyncMock())
     monkeypatch.setattr(payment_handler, "credit_referral", AsyncMock())
 
-    async def _create_access(session, user, tariff, platform, bonus_days):
+    async def _create_access(session, user, tariff, platform, bonus_days, **_kwargs):
         subscription = Subscription(
             user_id=user.id,
             server_id=server.id,
@@ -360,7 +362,7 @@ async def test_device_payment_reuses_existing_subscription_key(monkeypatch, db_s
 
     async with db_session_factory() as session:
         user = User(telegram_id=10004, username="devicebuyer", full_name="Device Buyer")
-        server = Server(name="NL", host="72.56.71.124", location="Netherlands")
+        server = Server(name="NL", host="192.0.2.10", location="Netherlands")
         session.add_all([user, server])
         await session.commit()
         await session.refresh(user)
@@ -413,7 +415,7 @@ async def test_device_payment_reuses_existing_subscription_key(monkeypatch, db_s
 async def test_auto_retry_failed_provisionings(monkeypatch, db_session_factory):
     async with db_session_factory() as session:
         user = User(telegram_id=10005, username="retrybuyer", full_name="Retry Buyer")
-        server = Server(name="NL", host="72.56.71.124", location="Netherlands")
+        server = Server(name="NL", host="192.0.2.10", location="Netherlands")
         tariff = Tariff(
             days=30,
             label="Retry Tariff",
@@ -437,7 +439,7 @@ async def test_auto_retry_failed_provisionings(monkeypatch, db_session_factory):
             status=PaymentStatus.COMPLETED,
             provider_payment_id="yookassa_retry_test_1",
             tariff_id=tariff.id,
-            platform="android",
+            platform="android~u~42",
         )
         session.add(payment)
         await session.commit()
@@ -465,7 +467,10 @@ async def test_auto_retry_failed_provisionings(monkeypatch, db_session_factory):
     monkeypatch.setattr(LeaseManager, "acquire_or_renew", AsyncMock(return_value=True))
     monkeypatch.setattr(LeaseManager, "release", AsyncMock())
 
-    async def _create_access(session, user, tariff, platform, bonus_days):
+    retry_intent = {}
+
+    async def _create_access(session, user, tariff, platform, bonus_days, **kwargs):
+        retry_intent.update(kwargs)
         subscription = Subscription(
             user_id=user.id,
             server_id=server.id,
@@ -499,3 +504,135 @@ async def test_auto_retry_failed_provisionings(monkeypatch, db_session_factory):
     assert bot.send_message.called
     assert send_guide.called
     assert credit_referral.called
+    assert retry_intent["purchase_action"] == "upgrade"
+    assert retry_intent["target_subscription_id"] == 42
+    assert retry_intent["provisioning_payment"].id == payment.id
+
+
+async def test_recurring_charge_renews_exact_linked_subscription(monkeypatch, db_session_factory):
+    from bot.services import payment_service, scheduler, subscription_service
+
+    async with db_session_factory() as session:
+        user = User(telegram_id=10006, username="recurring", full_name="Recurring")
+        server = Server(
+            name="recurring-server",
+            host="127.0.0.1",
+            location="Test",
+        )
+        tariff = Tariff(
+            days=30,
+            label="VPN 5 устройств",
+            price_rub=950,
+            price_stars=950,
+            tariff_type=TariffType.VPN,
+            is_active=True,
+        )
+        session.add_all([user, server, tariff])
+        await session.flush()
+        unrelated = Subscription(
+            user_id=user.id,
+            server_id=server.id,
+            tariff_months=1,
+            tariff_days=30,
+            status=SubStatus.EXPIRED,
+            device_slots=3,
+            client_name="unrelated",
+            platform=Platform.ANDROID,
+            expires_at=datetime.utcnow() - timedelta(days=2),
+        )
+        target = Subscription(
+            user_id=user.id,
+            server_id=server.id,
+            tariff_months=1,
+            tariff_days=30,
+            status=SubStatus.EXPIRED,
+            device_slots=5,
+            client_name="target",
+            platform=Platform.IOS,
+            expires_at=datetime.utcnow() - timedelta(days=1),
+        )
+        session.add_all([unrelated, target])
+        await session.flush()
+        profile = RecurringPaymentProfile(
+            user_id=user.id,
+            subscription_id=target.id,
+            tariff_id=tariff.id,
+            provider="yookassa",
+            provider_payment_method_id="pm-test",
+            is_active=True,
+            consent_granted=True,
+            next_charge_at=target.expires_at,
+        )
+        session.add(profile)
+        await session.commit()
+        target_id = target.id
+
+    monkeypatch.setattr(scheduler, "async_session", db_session_factory)
+    monkeypatch.setattr(scheduler.settings, "recurring_payments_enabled", True)
+    monkeypatch.setattr(scheduler.settings, "admin_ids", [])
+    charge = AsyncMock(return_value=("succeeded", "payment-recurring", "succeeded"))
+    monkeypatch.setattr(payment_service, "create_recurring_yookassa_payment", charge)
+    access_kwargs = {}
+
+    async def _renew(session, *, user, tariff, platform, **kwargs):
+        access_kwargs.update(kwargs)
+        subscription = await session.get(Subscription, target_id)
+        subscription.status = SubStatus.ACTIVE
+        subscription.expires_at = datetime.utcnow() + timedelta(days=30)
+        return subscription, "stable-key"
+
+    monkeypatch.setattr(subscription_service, "create_or_extend_paid_access", _renew)
+    bot = SimpleNamespace(send_message=AsyncMock())
+
+    await scheduler.process_recurring_charges(bot)
+
+    assert access_kwargs == {
+        "purchase_action": "renew",
+        "target_subscription_id": target_id,
+    }
+    charge.assert_awaited_once()
+
+
+async def test_recurring_profile_without_subscription_is_disabled_before_charge(
+    monkeypatch,
+    db_session_factory,
+):
+    from bot.services import payment_service, scheduler
+
+    async with db_session_factory() as session:
+        user = User(telegram_id=10007, username="orphan", full_name="Orphan")
+        tariff = Tariff(
+            days=30,
+            label="VPN",
+            price_rub=950,
+            price_stars=950,
+            tariff_type=TariffType.VPN,
+            is_active=True,
+        )
+        session.add_all([user, tariff])
+        await session.flush()
+        profile = RecurringPaymentProfile(
+            user_id=user.id,
+            tariff_id=tariff.id,
+            provider="yookassa",
+            provider_payment_method_id="pm-orphan",
+            is_active=True,
+            consent_granted=True,
+            next_charge_at=datetime.utcnow(),
+        )
+        session.add(profile)
+        await session.commit()
+        profile_id = profile.id
+
+    monkeypatch.setattr(scheduler, "async_session", db_session_factory)
+    monkeypatch.setattr(scheduler.settings, "recurring_payments_enabled", True)
+    charge = AsyncMock()
+    monkeypatch.setattr(payment_service, "create_recurring_yookassa_payment", charge)
+
+    await scheduler.process_recurring_charges(SimpleNamespace(send_message=AsyncMock()))
+
+    charge.assert_not_awaited()
+    async with db_session_factory() as session:
+        refreshed = await session.get(RecurringPaymentProfile, profile_id)
+        assert refreshed.is_active is False
+        assert refreshed.consent_granted is False

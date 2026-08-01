@@ -101,6 +101,22 @@ async def init_db() -> None:
             )
         except Exception:
             pass
+        for sql in (
+            "ALTER TABLE web_orders ADD COLUMN purchase_action VARCHAR(16) NOT NULL DEFAULT 'new'",
+            "ALTER TABLE web_orders ADD COLUMN target_order_id VARCHAR(64)",
+            "ALTER TABLE web_orders ADD COLUMN fulfillment_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE web_orders ADD COLUMN next_fulfillment_retry_at DATETIME",
+            "ALTER TABLE web_orders ADD COLUMN last_fulfillment_attempt_at DATETIME",
+            "ALTER TABLE web_orders ADD COLUMN target_snapshot_expires_at DATETIME",
+            "ALTER TABLE web_orders ADD COLUMN target_snapshot_plan_uuid VARCHAR(64)",
+            "ALTER TABLE web_orders ADD COLUMN failure_code VARCHAR(64)",
+            "ALTER TABLE web_telegram_items ADD COLUMN provider VARCHAR(16)",
+            "ALTER TABLE web_telegram_items ADD COLUMN adapt_plan_uuid VARCHAR(64)",
+        ):
+            try:
+                await conn.execute(__import__("sqlalchemy").text(sql))
+            except Exception:
+                pass
         try:
             await conn.execute(
                 __import__("sqlalchemy").text(

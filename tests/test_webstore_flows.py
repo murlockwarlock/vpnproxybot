@@ -256,7 +256,7 @@ async def test_yookassa_webhook_marks_order_delivered(monkeypatch, patched_webst
         session.add(order)
         await session.commit()
 
-    async def _fulfill(order):
+    async def _fulfill(_session, order):
         order.status = "delivered"
         order.subscription_url = "https://loonapie.xyz/s/final-token"
         order.delivered_at = datetime.utcnow()
@@ -381,3 +381,162 @@ async def test_device_slot_order_reuses_linked_telegram_key_and_increments_slots
         assert device.marzban_username == "sub_7"
         assert device.subscription_url == "https://loonapie.xyz/s/telegram-token"
         assert tg_item.device_slots == 4
+
+
+async def test_device_slot_order_rejects_adapt_subscription(monkeypatch, patched_webstore):
+    monkeypatch.setattr(webstore_routes, "_notify_admins_webstore", AsyncMock())
+    expires_at = datetime.utcnow() + timedelta(days=30)
+
+    async with patched_webstore() as session:
+        primary = WebOrder(
+            order_id="adapt-parent",
+            contact="user@example.com",
+            tariff_key="basic_30",
+            tariff_label="Базовый 3 устройства",
+            days=30,
+            amount_rub=249,
+            status="delivered",
+            profile_token="adapt-profile",
+            marzban_username="adapt_770fa622-a4bd-63f6-c938-668877662222",
+            subscription_url="https://test/adapt-sub/770fa622-a4bd-63f6-c938-668877662222",
+            access_expires_at=expires_at,
+            delivered_at=datetime.utcnow(),
+        )
+        device = WebOrder(
+            order_id="adapt-device",
+            contact="user@example.com",
+            tariff_key="device_slot",
+            tariff_label="Доп. устройство",
+            days=0,
+            amount_rub=100,
+            status="paid",
+            profile_token="adapt-profile",
+        )
+        session.add_all([primary, device])
+        await session.flush()
+
+        await webstore_routes._fulfill_device_slot_order(session, device)
+
+        assert device.status == "failed"
+        assert "улучшение тарифа" in device.failure_message
+        assert device.subscription_url is None
+
+
+async def test_web_adapt_upgrade_reuses_uuid_and_does_not_renew(monkeypatch, patched_webstore):
+    adapt_uuid = "770fa622-a4bd-63f6-c938-668877662222"
+    expires_at = datetime.utcnow() + timedelta(days=30)
+    async with patched_webstore() as session:
+        primary = WebOrder(
+            order_id="adapt-old", contact="user@example.com", tariff_key="basic_30",
+            tariff_label="Базовый 3 устройства", days=30, amount_rub=249,
+            status="delivered", profile_token="adapt-profile",
+            marzban_username=f"adapt_{adapt_uuid}", subscription_url=f"https://test/adapt-sub/{adapt_uuid}",
+            access_expires_at=datetime.utcnow() + timedelta(days=10), delivered_at=datetime.utcnow(),
+        )
+        upgrade = WebOrder(
+            order_id="adapt-upgrade", contact="user@example.com", tariff_key="basic_30_5",
+            tariff_label="Базовый 5 устройств", days=30, amount_rub=100,
+            status="paid", profile_token="adapt-profile", purchase_action="upgrade",
+            target_order_id="adapt-old",
+        )
+        session.add_all([primary, upgrade])
+        await session.flush()
+
+        api = AsyncMock()
+        api.upgrade_subscription = AsyncMock(return_value={"success": True, "devices": 5})
+        api.get_status = AsyncMock(return_value={"end_date": expires_at.isoformat(), "devices": 5})
+        api.renew_subscription = AsyncMock()
+        monkeypatch.setattr(webstore_routes, "AdaptAPI", lambda: api)
+
+        await webstore_routes._fulfill_adapt_order(session, upgrade, "new-plan-uuid")
+
+        assert upgrade.status == "delivered"
+        assert upgrade.subscription_url == primary.subscription_url
+        assert upgrade.marzban_username == primary.marzban_username
+        api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, "new-plan-uuid")
+        api.renew_subscription.assert_not_awaited()
+
+
+async def test_web_adapt_upgrade_accepts_linked_telegram_target(monkeypatch, patched_webstore):
+    adapt_uuid = "770fa622-a4bd-63f6-c938-668877662223"
+    old_plan_uuid = "661f9511-f3ac-52e5-b827-557766551111"
+    new_plan_uuid = "661f9511-f3ac-52e5-b827-557766552222"
+    new_end = datetime.utcnow() + timedelta(days=30)
+
+    async with patched_webstore() as session:
+        tg_item = WebTelegramItem(
+            profile_token="linked-profile",
+            telegram_id=123456,
+            item_type="vpn",
+            external_id="sub_8",
+            title="VPN",
+            key_value=f"https://test/adapt-sub/{adapt_uuid}",
+            provider="adapt",
+            adapt_plan_uuid=old_plan_uuid,
+            status="active",
+            device_slots=3,
+            expires_at=datetime.utcnow() + timedelta(days=10),
+        )
+        session.add(tg_item)
+        await session.flush()
+        upgrade = WebOrder(
+            order_id="adapt-tg-upgrade",
+            contact="user@example.com",
+            tariff_key="basic_30_5",
+            tariff_label="Базовый 5 устройств",
+            days=30,
+            amount_rub=100,
+            status="paid",
+            profile_token="linked-profile",
+            purchase_action="upgrade",
+            target_order_id=f"tg:{adapt_uuid}",
+        )
+        session.add(upgrade)
+        await session.flush()
+
+        api = AsyncMock()
+        api.upgrade_subscription = AsyncMock(return_value={"success": True, "devices": 5})
+        api.get_status = AsyncMock(return_value={"end_date": new_end.isoformat(), "devices": 5})
+        api.renew_subscription = AsyncMock()
+        monkeypatch.setattr(webstore_routes, "AdaptAPI", lambda: api)
+
+        await webstore_routes._fulfill_adapt_order(session, upgrade, new_plan_uuid)
+
+        assert upgrade.status == "delivered"
+        assert upgrade.subscription_url == tg_item.key_value
+        assert upgrade.marzban_username == f"adapt_{adapt_uuid}"
+        assert tg_item.adapt_plan_uuid == new_plan_uuid
+        assert tg_item.device_slots == 5
+        api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, new_plan_uuid)
+        api.renew_subscription.assert_not_awaited()
+
+
+async def test_web_profile_enriches_legacy_telegram_adapt_item(monkeypatch):
+    adapt_uuid = "770fa622-a4bd-63f6-c938-668877662224"
+    plan_uuid = "661f9511-f3ac-52e5-b827-557766552223"
+    expires_at = datetime.utcnow() + timedelta(days=20)
+    item = WebTelegramItem(
+        profile_token="legacy-profile",
+        telegram_id=123456,
+        item_type="vpn",
+        external_id="sub_9",
+        title="VPN",
+        key_value=f"https://test/adapt-sub/{adapt_uuid}",
+        status="active",
+    )
+    api = AsyncMock()
+    api.enabled = True
+    api.get_status = AsyncMock(return_value={
+        "plan_uuid": plan_uuid,
+        "devices": 5,
+        "end_date": expires_at.isoformat(),
+    })
+    monkeypatch.setattr(webstore_routes, "AdaptAPI", lambda: api)
+    session = AsyncMock()
+
+    await webstore_routes._enrich_legacy_telegram_adapt_items(session, [item])
+
+    assert item.provider == "adapt"
+    assert item.adapt_plan_uuid == plan_uuid
+    assert item.device_slots == 5
+    session.flush.assert_awaited_once()

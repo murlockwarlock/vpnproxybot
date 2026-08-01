@@ -45,7 +45,7 @@ async def test_paid_tariff_reuses_demo_key_and_disables_balance_autodebit(
         )
         server = Server(
             name="NL",
-            host="72.56.71.124",
+            host="192.0.2.10",
             api_url="https://panel.example",
             location="Netherlands",
             is_active=True,
@@ -112,7 +112,7 @@ async def test_plain_demo_key_is_still_demo(db_session_factory):
     now = datetime.utcnow()
     async with db_session_factory() as session:
         user = User(telegram_id=20001, username="demo", full_name="Demo")
-        server = Server(name="NL", host="72.56.71.124", location="Netherlands", is_active=True)
+        server = Server(name="NL", host="192.0.2.10", location="Netherlands", is_active=True)
         session.add_all([user, server])
         await session.flush()
         subscription = Subscription(

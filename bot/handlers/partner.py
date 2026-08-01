@@ -2402,7 +2402,7 @@ async def partner_apply_save(message: Message, state: FSMContext) -> None:
         f"Описание:\n{details}\n\n"
         f"Если подходящий кандидат, создайте партнёра через админку и укажите его Telegram ID."
     )
-    for admin_id in settings.admin_ids:
+    for admin_id in settings.notification_recipient_ids:
         try:
             await message.bot.send_message(
                 admin_id,
@@ -2592,7 +2592,7 @@ async def partner_payout_request_save(message: Message, state: FSMContext) -> No
         partner_name = partner.name
 
     await state.clear()
-    for admin_id in settings.admin_ids:
+    for admin_id in settings.notification_recipient_ids:
         try:
             admin_text = (
                 f"💸 <b>Новая заявка на выплату</b>\n\n"

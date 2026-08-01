@@ -318,7 +318,10 @@ async def _handle_web_link(message: Message, code: str) -> None:
     async with async_session() as session:
         result = await session.execute(
             select(User)
-            .options(selectinload(User.subscriptions).selectinload(Subscription.server))
+            .options(
+                selectinload(User.subscriptions).selectinload(Subscription.server),
+                selectinload(User.subscriptions).selectinload(Subscription.tariff),
+            )
             .where(User.telegram_id == message.from_user.id)
         )
         user = result.scalar_one_or_none()
@@ -348,7 +351,10 @@ async def _handle_web_auth(message: Message, code: str) -> None:
     async with async_session() as session:
         result = await session.execute(
             select(User)
-            .options(selectinload(User.subscriptions).selectinload(Subscription.server))
+            .options(
+                selectinload(User.subscriptions).selectinload(Subscription.server),
+                selectinload(User.subscriptions).selectinload(Subscription.tariff),
+            )
             .where(User.telegram_id == message.from_user.id)
         )
         user = result.scalar_one_or_none()
@@ -754,7 +760,7 @@ async def feedback_receive(message: Message, state: FSMContext) -> None:
     )
 
     # Collect all admin IDs from env settings AND database
-    admin_ids_to_notify = set(settings.admin_ids)
+    admin_ids_to_notify = set(settings.notification_recipient_ids)
     try:
         async with async_session() as db_sess:
             db_adm_res = await db_sess.execute(select(User.telegram_id).where(User.is_admin == True))

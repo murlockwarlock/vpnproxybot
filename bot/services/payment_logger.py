@@ -1,6 +1,7 @@
 """Structured payment event logger — writes to a separate log file."""
 
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 from datetime import datetime, timezone, timedelta
@@ -31,8 +32,10 @@ def _get_logger(stream: str, instance: str) -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    handler = logging.FileHandler(
+    handler = RotatingFileHandler(
         os.path.join(_log_dir(), f"{stream}_{instance}.log"),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
         encoding="utf-8",
     )
     handler.setFormatter(logging.Formatter("%(message)s"))

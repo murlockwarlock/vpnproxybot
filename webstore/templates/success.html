@@ -541,6 +541,12 @@
           setState("error");
         }
         else {
+          if (data.status === "paid" && data.failure_message) {
+            const pendingText = document.getElementById("pendingText");
+            const pendingActions = document.getElementById("pendingActions");
+            if (pendingText) pendingText.textContent = data.failure_message;
+            if (pendingActions) pendingActions.classList.add("visible");
+          }
           showPendingFallback();
         }
       } catch (e) {

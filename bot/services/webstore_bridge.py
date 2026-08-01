@@ -9,7 +9,13 @@ from typing import Any
 import aiohttp
 
 from bot.config import settings
-from bot.models import MTProtoAccount, Subscription, User
+from sqlalchemy import select
+
+from bot.database import async_session
+from bot.models import AdaptSubscription, MTProtoAccount, Platform, SubStatus, Subscription, Tariff, User
+from bot.services.adapt_api import AdaptAPI
+from bot.services.adapt_routing import build_adapt_client_name
+from bot.services.adapt_subscription_proxy import build_adapt_mirror_url
 from bot.services.subscription_service import _format_proxy_links
 from bot.services.tariff_utils import format_subscription_duration
 from bot.services.vhq_subscription_proxy import get_subscription_display_key
@@ -42,12 +48,19 @@ def serialize_profile_items(
             tariff_days=sub.tariff_days,
             tariff_months=sub.tariff_months,
         )
+        client_name = str(sub.client_name or "")
+        provider = "adapt" if client_name.startswith("adapt_") else (
+            "vhq" if client_name.startswith("vhq_") else "marzban"
+        )
+        tariff = getattr(sub, "tariff", None)
         items.append({
             "item_type": "vpn",
             "external_id": f"sub_{sub.id}",
             "title": title,
             "subtitle": subtitle,
             "key_value": get_subscription_display_key(sub),
+            "provider": provider,
+            "adapt_plan_uuid": str(getattr(tariff, "adapt_plan_uuid", "") or ""),
             "status": sub.status.value,
             "device_slots": sub.device_slots,
             "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
@@ -155,7 +168,6 @@ async def sync_user_profile(
 async def fetch_linked_web_profile(telegram_id: int) -> dict[str, Any] | None:
     if not _bridge_enabled():
         return None
-
     url = (
         f"{settings.webstore_api_base_url.rstrip('/')}/api/store/internal/web-profile"
         f"?telegram_id={telegram_id}"
@@ -172,3 +184,141 @@ async def fetch_linked_web_profile(telegram_id: int) -> dict[str, Any] | None:
     except Exception as exc:
         logger.warning("Failed to fetch linked web profile: %s", exc)
         return None
+
+
+def _web_adapt_uuid(order: dict[str, Any]) -> str | None:
+    import re
+    direct = str(order.get("adapt_uuid") or "").strip()
+    if re.fullmatch(r"[0-9a-f-]{36}", direct, re.IGNORECASE):
+        return direct
+    raw = str(order.get("raw_subscription_url") or order.get("subscription_url") or "")
+    match = re.search(r"/(?:adapt-sub|sub)/([0-9a-f-]{36})", raw, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _parse_web_datetime(value: Any):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo:
+            from datetime import timezone
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+    except ValueError:
+        return None
+
+
+async def sync_linked_web_subscriptions(telegram_id: int, profile: dict[str, Any] | None) -> bool:
+    """Import/update web Adapt UUIDs in the bot DB so bot/admin can manage them."""
+    if not profile:
+        return False
+    candidates: dict[str, dict[str, Any]] = {}
+    for order in profile.get("orders") or []:
+        adapt_uuid = _web_adapt_uuid(order)
+        if order.get("status") == "delivered" and order.get("provider") == "adapt" and adapt_uuid:
+            previous = candidates.get(adapt_uuid)
+            if not previous or str(order.get("created_at") or "") > str(previous.get("created_at") or ""):
+                candidates[adapt_uuid] = order
+    if not candidates:
+        return False
+
+    changed = False
+    async with async_session() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+        if not user:
+            return False
+        from bot.services.subscription_service import get_primary_active_server
+        server = await get_primary_active_server(session)
+        if not server:
+            return False
+
+        api = AdaptAPI()
+        plans_cache: list[dict[str, Any]] | None = None
+        for adapt_uuid, order in candidates.items():
+            record = await session.scalar(
+                select(AdaptSubscription).where(AdaptSubscription.adapt_uuid == adapt_uuid)
+            )
+            subscription = await session.get(Subscription, record.subscription_id) if record else None
+            if subscription and subscription.user_id != user.id:
+                logger.error("Refusing web Adapt UUID reassignment: uuid=%s old_user=%s new_user=%s", adapt_uuid, subscription.user_id, user.id)
+                continue
+
+            if not api.enabled:
+                logger.warning("Cannot import web Adapt subscription %s: API is disabled", adapt_uuid)
+                continue
+            try:
+                status = await api.get_status(adapt_uuid)
+            except Exception as exc:
+                logger.warning("Failed to refresh imported web Adapt subscription %s: %s", adapt_uuid, exc)
+                continue
+            plan_uuid = str(status.get("plan_uuid") or order.get("adapt_plan_uuid") or "").strip()
+            tariff = await session.scalar(
+                select(Tariff).where(Tariff.adapt_plan_uuid == plan_uuid).order_by(Tariff.id.desc()).limit(1)
+            ) if plan_uuid else None
+            expires_at = _parse_web_datetime(status.get("end_date") or order.get("access_expires_at"))
+            if not expires_at:
+                continue
+            actual_devices = status.get("devices")
+            if actual_devices is None and plan_uuid:
+                try:
+                    if plans_cache is None:
+                        plans_cache = await api.list_plans()
+                    plan = next(
+                        (
+                            item for item in plans_cache
+                            if str(item.get("uuid") or item.get("plan_uuid") or "").strip() == plan_uuid
+                        ),
+                        None,
+                    )
+                    actual_devices = plan.get("devices") if plan else None
+                except Exception as exc:
+                    logger.warning("Failed to resolve Adapt device limit for %s: %s", adapt_uuid, exc)
+            if actual_devices is None:
+                logger.warning("Cannot import web Adapt subscription %s: provider device limit is missing", adapt_uuid)
+                continue
+            devices = int(actual_devices)
+            public_url = str(order.get("subscription_url") or "").strip() or build_adapt_mirror_url(adapt_uuid)
+
+            if not subscription:
+                subscription = Subscription(
+                    user_id=user.id,
+                    server_id=server.id,
+                    tariff_months=int(order.get("days") or 0) // 30,
+                    tariff_days=int(order.get("days") or 0),
+                    billing_mode="tariff",
+                    status=SubStatus.ACTIVE,
+                    device_slots=devices,
+                    vpn_key=public_url,
+                    client_name=build_adapt_client_name(adapt_uuid),
+                    platform=user.platform or Platform.ANDROID,
+                    expires_at=expires_at,
+                    tariff_id=tariff.id if tariff else None,
+                )
+                session.add(subscription)
+                await session.flush()
+                record = AdaptSubscription(
+                    subscription_id=subscription.id,
+                    adapt_uuid=adapt_uuid,
+                    adapt_plan_uuid=plan_uuid,
+                    end_date=expires_at,
+                    traffic_limit_bytes=status.get("traffic_limit_bytes"),
+                )
+                session.add(record)
+            else:
+                subscription.server_id = server.id
+                subscription.status = SubStatus.ACTIVE if expires_at > datetime.utcnow() else SubStatus.EXPIRED
+                subscription.device_slots = devices
+                subscription.vpn_key = public_url
+                subscription.expires_at = expires_at
+                if tariff:
+                    subscription.tariff_id = tariff.id
+                    subscription.tariff_days = tariff.days
+                    subscription.tariff_months = tariff.days // 30
+                record.adapt_plan_uuid = plan_uuid or record.adapt_plan_uuid
+                record.end_date = expires_at
+                record.traffic_limit_bytes = status.get("traffic_limit_bytes")
+            changed = True
+        if changed:
+            await session.commit()
+    return changed

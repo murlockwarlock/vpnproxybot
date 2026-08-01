@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 from datetime import datetime
 
@@ -38,7 +39,7 @@ from bot.services.balance_service import credit_user_balance, debit_user_balance
 from bot.services import vpn_manager
 from bot.services.client_names import build_client_name
 from bot.services.device_slots import get_included_device_slots, get_max_device_slots
-from bot.services.notifications import notify_admins_issue, notify_admins_payment
+from bot.services.notifications import notify_admins_issue, notify_admins_payment, notify_staff_text
 from bot.services.payment_logger import plog
 from bot.services.payment_service import (
     create_stars_invoice,
@@ -53,6 +54,7 @@ from bot.services.subscription_service import (
     create_mtproto_subscription,
     create_or_extend_paid_access,
 )
+from bot.services.purchase_intent import decode_intent, get_purchase_price_rub
 from bot.services.tariff_rules import (
     INTRO_BASIC_ALREADY_USED_TEXT,
     can_purchase_intro_basic_tariff,
@@ -85,6 +87,7 @@ async def _get_tariff(tariff_id: int) -> Tariff | None:
 
 
 def _platform_from_str(platform_str: str) -> Platform:
+    platform_str, _, _ = decode_intent(platform_str)
     return {
         "android": Platform.ANDROID,
         "ios": Platform.IOS,
@@ -96,7 +99,18 @@ def _platform_from_str(platform_str: str) -> Platform:
 
 
 def _is_deferred_platform(platform_str: str) -> bool:
+    platform_str, _, _ = decode_intent(platform_str)
     return platform_str in {"deferred", "after_payment", "pending"}
+
+
+def _purchase_access_kwargs(platform_str: str) -> dict:
+    _, action, target_subscription_id = decode_intent(platform_str)
+    if action == "auto":
+        return {}
+    return {
+        "purchase_action": action,
+        "target_subscription_id": target_subscription_id,
+    }
 
 
 def _delivery_platform_kb(subscription_id: int) -> InlineKeyboardMarkup:
@@ -145,7 +159,7 @@ async def _get_key_change_explanation(session, user_id: int, current_sub_id: int
     )
     if previous:
         return (
-            "ℹ️ <b>Почему ключ другой?</b> Вы перешли на премиум-сеть (VHQ), "
+            "ℹ️ <b>Почему ключ другой?</b> Для выбранного тарифа нужна отдельная ссылка, "
             "поэтому для вас был сгенерирован новый, более быстрый ключ. "
             "Старый ключ демо-доступа больше не понадобится."
         )
@@ -432,6 +446,9 @@ async def _get_or_create_user(telegram_user) -> User:
 async def _ensure_intro_basic_available(callback: CallbackQuery, tariff: Tariff) -> bool:
     async with async_session() as session:
         user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        if not user:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return False
         if await can_purchase_intro_basic_tariff(session, user=user, tariff=tariff):
             return True
     await callback.answer(INTRO_BASIC_ALREADY_USED_TEXT, show_alert=True)
@@ -712,18 +729,30 @@ async def initiate_stars_payment(callback: CallbackQuery) -> None:
 
     async with async_session() as session:
         user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        if not user:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        try:
+            purchase_price = await get_purchase_price_rub(
+                session, user=user, tariff=tariff,
+                action=decode_intent(platform)[1],
+                target_subscription_id=decode_intent(platform)[2],
+            )
+        except ValueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
         discount = 0.0
         if use_bal == 1 and user:
-            discount = min(get_user_balance(user), tariff.price_rub)
+            discount = min(get_user_balance(user), purchase_price)
 
-    if discount >= tariff.price_rub and tariff.price_rub > 0:
+    if discount >= purchase_price and purchase_price > 0:
         await callback.answer("Баланса достаточно для полной оплаты. Используйте 'Оплатить с баланса'", show_alert=True)
         return
 
     final_price_stars = tariff.price_stars
-    if discount > 0 and tariff.price_rub > 0:
-        ratio = (tariff.price_rub - discount) / tariff.price_rub
-        final_price_stars = int(tariff.price_stars * ratio)
+    if purchase_price != tariff.price_rub or discount > 0:
+        ratio = (purchase_price - discount) / tariff.price_rub
+        final_price_stars = math.ceil(tariff.price_stars * ratio)
         if final_price_stars < 1:
             final_price_stars = 1
 
@@ -771,21 +800,33 @@ async def initiate_telegram_payment(callback: CallbackQuery) -> None:
 
     async with async_session() as session:
         user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        if not user:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        try:
+            purchase_price = await get_purchase_price_rub(
+                session, user=user, tariff=tariff,
+                action=decode_intent(platform)[1],
+                target_subscription_id=decode_intent(platform)[2],
+            )
+        except ValueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
         discount = 0.0
         if use_bal == 1 and user:
-            discount = min(get_user_balance(user), tariff.price_rub)
+            discount = min(get_user_balance(user), purchase_price)
 
-    if discount >= tariff.price_rub and tariff.price_rub > 0:
+    if discount >= purchase_price and purchase_price > 0:
         await callback.answer("Баланса достаточно для полной оплаты. Используйте 'Оплатить с баланса'", show_alert=True)
         return
 
-    final_price_rub = float(tariff.price_rub - discount)
+    final_price_rub = float(purchase_price - discount)
     
     # Telegram Pay minimum is ~1 USD (approx 65-70 RUB). We set 70 RUB as safe minimum.
     if 0 < final_price_rub < 70:
         if use_bal == 1:
             final_price_rub = 70.0
-            discount = float(tariff.price_rub - final_price_rub)
+            discount = float(purchase_price - final_price_rub)
         else:
             await callback.answer(f"Сумма к оплате ({final_price_rub} ₽) меньше минимальной (70 ₽).", show_alert=True)
             return
@@ -836,19 +877,45 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
             await callback.answer("Пользователь не найден", show_alert=True)
             return
 
-        if get_user_balance(user) < tariff.price_rub:
+        try:
+            purchase_price = await get_purchase_price_rub(
+                session, user=user, tariff=tariff,
+                action=decode_intent(platform_str)[1],
+                target_subscription_id=decode_intent(platform_str)[2],
+            )
+        except ValueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
+
+        if get_user_balance(user) < purchase_price:
             await callback.answer("Недостаточно средств на балансе", show_alert=True)
             return
+
+        await callback.answer("Обрабатываем оплату…")
 
         debit_user_balance(
             session,
             user,
-            float(tariff.price_rub),
+            float(purchase_price),
             BalanceTransactionKind.TOPUP,
             f"Оплата тарифа «{tariff.label}» с баланса",
             source_type="tariff",
             source_id=str(tariff.id),
         )
+
+        payment = Payment(
+            user_id=user.id,
+            subscription_id=None,
+            amount=int(round(float(purchase_price) * 100)),
+            currency="RUB",
+            method=PaymentMethod.BALANCE,
+            status=PaymentStatus.COMPLETED,
+            provider_payment_id="balance_" + str(uuid.uuid4()),
+            tariff_id=tariff.id,
+            platform=platform_str,
+        )
+        session.add(payment)
+        await session.commit()
 
         saved_platform = user.platform if _is_deferred_platform(platform_str) and user.platform and not is_tg_proxy_only else None
         needs_platform_choice = _is_deferred_platform(platform_str) and saved_platform is None and not is_tg_proxy_only
@@ -869,17 +936,32 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                     user=user,
                     tariff=tariff,
                     platform=delivery_platform,
+                    provisioning_payment=payment,
+                    **_purchase_access_kwargs(platform_str),
                 )
             except AccessProvisionError as issue:
-                credit_user_balance(
-                    session,
-                    user,
-                    float(tariff.price_rub),
-                    BalanceTransactionKind.REFUND,
-                    "Возврат на баланс после ошибки выдачи ключа",
-                    source_type="tariff",
-                    source_id=str(tariff.id),
-                )
+                ambiguous_adapt = issue.provider == "adapt" and issue.code in {
+                    "adapt_create_awaiting_webhook",
+                    "adapt_runtime",
+                    "adapt_api_error",
+                    "adapt_api_500",
+                    "adapt_api_502",
+                    "adapt_api_503",
+                    "adapt_api_504",
+                    "adapt_renew_failed",
+                    "adapt_upgrade_failed",
+                }
+                if not ambiguous_adapt:
+                    credit_user_balance(
+                        session,
+                        user,
+                        float(purchase_price),
+                        BalanceTransactionKind.REFUND,
+                        "Возврат на баланс после ошибки выдачи ключа",
+                        source_type="tariff",
+                        source_id=str(tariff.id),
+                    )
+                    payment.status = PaymentStatus.REFUNDED
                 plog(
                     "ОШИБКА_ВЫДАЧИ",
                     provider=issue.provider.upper(),
@@ -901,7 +983,7 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                     issue=issue,
                 )
                 await callback.message.answer(
-                    f"❌ {_build_delivery_issue_text(issue, refunded_balance=True)}",
+                    f"⚠️ {_build_delivery_issue_text(issue, refunded_balance=not ambiguous_adapt)}",
                     parse_mode="HTML",
                 )
                 return
@@ -923,12 +1005,13 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                 credit_user_balance(
                     session,
                     user,
-                    float(tariff.price_rub),
+                    float(purchase_price),
                     BalanceTransactionKind.REFUND,
                     "Возврат на баланс после ошибки выдачи ключа",
                     source_type="tariff",
                     source_id=str(tariff.id),
                 )
+                payment.status = PaymentStatus.REFUNDED
                 await session.commit()
                 return
 
@@ -942,12 +1025,13 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                     credit_user_balance(
                         session,
                         user,
-                        float(tariff.price_rub),
+                        float(purchase_price),
                         BalanceTransactionKind.REFUND,
                         "Возврат на баланс после ошибки сервера",
                         source_type="tariff",
                         source_id=str(tariff.id),
                     )
+                    payment.status = PaymentStatus.REFUNDED
                     await session.commit()
                     await callback.answer("Нет доступных серверов", show_alert=True)
                     return
@@ -979,12 +1063,13 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                 credit_user_balance(
                     session,
                     user,
-                    float(tariff.price_rub),
+                    float(purchase_price),
                     BalanceTransactionKind.REFUND,
                     "Возврат на баланс после ошибки создания Telegram-ускорителя",
                     source_type="tariff",
                     source_id=str(tariff.id),
                 )
+                payment.status = PaymentStatus.REFUNDED
                 await session.commit()
                 await callback.message.answer(
                     "❌ Ошибка создания Telegram-ускоритель.\nОбратитесь в поддержку.",
@@ -992,19 +1077,7 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                 )
                 return
 
-        # Create payment record
-        payment = Payment(
-            user_id=user.id,
-            subscription_id=subscription.id if subscription else None,
-            amount=tariff.price_rub * 100,
-            currency="RUB",
-            method=PaymentMethod.BALANCE,
-            status=PaymentStatus.COMPLETED,
-            provider_payment_id="balance_" + str(uuid.uuid4()),
-            tariff_id=tariff.id,
-            platform=delivery_platform.value if hasattr(delivery_platform, "value") else str(delivery_platform),
-        )
-        session.add(payment)
+        payment.subscription_id = subscription.id if subscription else None
         await session.flush()
 
         # Referrer logic
@@ -1088,7 +1161,7 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
             platform=delivery_platform.value if not is_tg_proxy_only else "telegram",
         )
 
-        await callback.answer("Оплата с баланса успешна!", show_alert=True)
+        await callback.message.answer("✅ Оплата с баланса успешна!")
 
 
 
@@ -1129,22 +1202,32 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
             await callback.answer("Ошибка: пользователь не найден", show_alert=True)
             return
 
+        try:
+            purchase_price = await get_purchase_price_rub(
+                session, user=user, tariff=tariff,
+                action=decode_intent(platform_str)[1],
+                target_subscription_id=decode_intent(platform_str)[2],
+            )
+        except ValueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
+
         # Calculate discount
         discount = 0.0
         if use_bal == 1:
-            discount = min(get_user_balance(user), tariff.price_rub)
+            discount = min(get_user_balance(user), purchase_price)
         
-        if discount >= tariff.price_rub and tariff.price_rub > 0:
+        if discount >= purchase_price and purchase_price > 0:
             await callback.answer("Баланса достаточно для полной оплаты. Используйте 'Оплатить с баланса'", show_alert=True)
             return
             
-        final_price_rub = float(tariff.price_rub - discount)
+        final_price_rub = float(purchase_price - discount)
         
         # YooKassa minimum is usually 10 RUB
         if 0 < final_price_rub < 10:
             if use_bal == 1:
                 final_price_rub = 10.0
-                discount = float(tariff.price_rub - final_price_rub)
+                discount = float(purchase_price - final_price_rub)
             else:
                 await callback.answer(f"Сумма к оплате ({final_price_rub} ₽) меньше минимальной (10 ₽).", show_alert=True)
                 return
@@ -1197,7 +1280,7 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
 
     await callback.message.answer(
         f"💳 <b>Оплата через YooKassa</b>\n\n"
-        f"Тариф: <b>{tariff.label}</b> - {tariff.price_rub}₽\n\n"
+        f"Тариф: <b>{tariff.label}</b> - {purchase_price}₽\n\n"
         f"<i>Ключ будет отправлен сюда автоматически после оплаты.</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1242,21 +1325,31 @@ async def initiate_robokassa_payment(callback: CallbackQuery) -> None:
             await callback.answer("Ошибка: пользователь не найден", show_alert=True)
             return
 
+        try:
+            purchase_price = await get_purchase_price_rub(
+                session, user=user, tariff=tariff,
+                action=decode_intent(platform_str)[1],
+                target_subscription_id=decode_intent(platform_str)[2],
+            )
+        except ValueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
+
         discount = 0.0
         if use_bal == 1:
-            discount = min(get_user_balance(user), tariff.price_rub)
+            discount = min(get_user_balance(user), purchase_price)
         
-        if discount >= tariff.price_rub and tariff.price_rub > 0:
+        if discount >= purchase_price and purchase_price > 0:
             await callback.answer("Баланса достаточно для полной оплаты. Используйте 'Оплатить с баланса'", show_alert=True)
             return
 
-        final_price_rub = float(tariff.price_rub - discount)
+        final_price_rub = float(purchase_price - discount)
 
         # Robokassa minimum is usually 50 RUB
         if 0 < final_price_rub < 50:
             if use_bal == 1:
                 final_price_rub = 50.0
-                discount = float(tariff.price_rub - final_price_rub)
+                discount = float(purchase_price - final_price_rub)
             else:
                 await callback.answer(f"Сумма к оплате ({final_price_rub} ₽) меньше минимальной (50 ₽).", show_alert=True)
                 return
@@ -1570,6 +1663,8 @@ async def process_successful_payment(message: Message) -> None:
                     tariff=tariff,
                     platform=delivery_platform,
                     bonus_days=bonus,
+                    provisioning_payment=payment,
+                    **_purchase_access_kwargs(platform_str),
                 )
             except AccessProvisionError as issue:
                 plog(
@@ -1965,10 +2060,6 @@ async def process_device_payment(message: Message, payload_str: str) -> None:
                 f"Подписка ID: {sub_id}\n"
                 f"Устройство: №{new_slot}"
             )
-            for admin_id in settings.admin_ids:
-                try:
-                    await message.bot.send_message(admin_id, admin_text, parse_mode="HTML")
-                except Exception:
-                    pass
+            await notify_staff_text(message.bot, admin_text)
         except Exception as e:
             logger.error(f"Failed to send admin notification: {e}")

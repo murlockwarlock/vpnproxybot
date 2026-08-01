@@ -1,6 +1,7 @@
 """Tests that inactive tariffs cannot be purchased through cached callbacks."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -8,7 +9,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from bot.models import Base, Tariff, TariffType
+from bot.models import Base, Platform, Server, Subscription, SubStatus, Tariff, TariffType, User
 
 
 pytestmark = pytest.mark.asyncio
@@ -76,6 +77,95 @@ async def test_select_tariff_rejects_inactive(db_session_factory, inactive_tarif
     assert "недоступен" in call_kwargs.args[0]
     # Must NOT proceed to platform selection
     callback.message.edit_text.assert_not_awaited()
+
+
+async def test_select_tariff_rejects_hidden_tariff_for_non_admin(db_session_factory):
+    """A cached/direct callback must not expose an admin-only tariff."""
+    from bot.handlers import buy as buy_handler
+
+    async with db_session_factory() as session:
+        tariff = Tariff(
+            days=30,
+            label="Скрытый",
+            price_rub=999,
+            price_stars=0,
+            tariff_type=TariffType.VPN,
+            is_active=True,
+            is_admin_only=True,
+        )
+        session.add(tariff)
+        await session.commit()
+        await session.refresh(tariff)
+        tariff_id = tariff.id
+
+    callback = _make_callback(tariff_id)
+    with patch("bot.handlers.buy.async_session", db_session_factory):
+        await buy_handler.select_tariff(callback)
+
+    callback.answer.assert_awaited_once_with("Этот тариф больше недоступен", show_alert=True)
+    callback.message.edit_text.assert_not_awaited()
+
+
+async def test_upgrade_menu_hides_admin_only_tariffs(db_session_factory):
+    """The upgrade keyboard for a regular user must contain only public tariffs."""
+    from bot.handlers import buy as buy_handler
+
+    async with db_session_factory() as session:
+        user = User(telegram_id=100500, full_name="User")
+        server = Server(name="test", host="127.0.0.1", location="Test")
+        current = Tariff(
+            days=30, label="Current", price_rub=100, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True, is_admin_only=False,
+            adapt_plan_uuid="plan-current",
+        )
+        hidden = Tariff(
+            days=30, label="Hidden", price_rub=200, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True, is_admin_only=True,
+            adapt_plan_uuid="plan-hidden",
+        )
+        public = Tariff(
+            days=30, label="Public", price_rub=300, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True, is_admin_only=False,
+            adapt_plan_uuid="plan-public",
+        )
+        session.add_all([user, server, current, hidden, public])
+        await session.flush()
+        subscription = Subscription(
+            user_id=user.id,
+            server_id=server.id,
+            tariff_id=current.id,
+            tariff_months=1,
+            tariff_days=30,
+            status=SubStatus.ACTIVE,
+            vpn_key="https://example.test/sub",
+            client_name="adapt_test",
+            platform=Platform.ANDROID,
+            expires_at=datetime.utcnow() + timedelta(days=10),
+        )
+        session.add(subscription)
+        await session.commit()
+        await session.refresh(subscription)
+        ids = subscription.id, hidden.id, public.id
+
+    sub_id, hidden_id, public_id = ids
+    callback = _make_callback(current.id)
+    callback.data = f"purchase_upgrade_{sub_id}"
+    with (
+        patch("bot.handlers.buy.async_session", db_session_factory),
+        patch("bot.handlers.buy.settings.is_admin", return_value=False),
+        patch("bot.handlers.buy._get_stars_enabled", new_callable=AsyncMock, return_value=False),
+    ):
+        await buy_handler.choose_upgrade_target(callback)
+
+    markup = callback.message.edit_text.await_args.kwargs["reply_markup"]
+    callbacks = [
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+    assert any(str(public_id) in value for value in callbacks)
+    assert all(str(hidden_id) not in value for value in callbacks)
 
 
 async def test_stars_payment_rejects_inactive(db_session_factory, inactive_tariff):

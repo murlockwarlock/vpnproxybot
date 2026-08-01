@@ -96,6 +96,12 @@ class Settings:
     bot_token: str = field(default_factory=lambda: os.getenv("BOT_TOKEN", ""))
     bot_client_prefix: str = field(default_factory=_default_bot_client_prefix)
     admin_ids: list[int] = field(default_factory=lambda: _env_admin_ids("ADMIN_IDS"))
+    owner_ids: list[int] = field(
+        default_factory=lambda: _env_admin_ids("OWNER_IDS", os.getenv("ADMIN_IDS", ""))
+    )
+    support_agent_ids: list[int] = field(
+        default_factory=lambda: _env_admin_ids("SUPPORT_AGENT_IDS", os.getenv("ADMIN_IDS", ""))
+    )
     support_username: str = field(default_factory=_default_support_username)
 
     # Database
@@ -132,10 +138,10 @@ class Settings:
     yookassa_shop_id: str = field(default_factory=lambda: os.getenv("YOOKASSA_SHOP_ID", ""))
     yookassa_secret_key: str = field(default_factory=lambda: os.getenv("YOOKASSA_SECRET_KEY", ""))
     yookassa_save_payment_method: bool = field(
-        default_factory=lambda: _env_bool("YOOKASSA_SAVE_PAYMENT_METHOD", True)
+        default_factory=lambda: _env_bool("YOOKASSA_SAVE_PAYMENT_METHOD", False)
     )
     recurring_payments_enabled: bool = field(
-        default_factory=lambda: _env_bool("RECURRING_PAYMENTS_ENABLED", True)
+        default_factory=lambda: _env_bool("RECURRING_PAYMENTS_ENABLED", False)
     )
 
     # Robokassa
@@ -309,6 +315,10 @@ class Settings:
 
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.admin_ids
+
+    @property
+    def notification_recipient_ids(self) -> list[int]:
+        return sorted(set(self.admin_ids) | set(self.owner_ids) | set(self.support_agent_ids))
 
 
 settings = Settings()

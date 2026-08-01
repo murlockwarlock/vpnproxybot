@@ -120,7 +120,7 @@ async def process_mailings(bot: Bot, stop_event: asyncio.Event | None = None) ->
             f"Успешно: {success_count}\n"
             f"Ошибки: {failure_count}"
         )
-        for admin_id in settings.admin_ids:
+        for admin_id in settings.notification_recipient_ids:
             try:
                 await bot.send_message(admin_id, report)
             except Exception:

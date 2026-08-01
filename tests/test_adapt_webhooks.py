@@ -118,9 +118,11 @@ async def test_adapt_webhook_correct_signature_processes():
     secret = "my-secret"
     body = json.dumps({
         "event": "subs.status_warning",
-        "subscription_uuid": "sub-abc",
-        "external_user_id": "111222",
-        "days_remaining": 3,
+        "data": {
+            "subscription_uuid": "sub-abc",
+            "external_user_id": "111222",
+            "days_remaining": 3,
+        },
     }).encode()
     sig = _hmac_sig(secret, body)
 

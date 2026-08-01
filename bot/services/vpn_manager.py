@@ -59,6 +59,19 @@ async def disable_key(server: Server, client_name: str) -> bool:
         return False
 
 
+async def get_key_activity(server: Server, client_name: str) -> dict:
+    """Return the available Marzban activity metadata for a subscription key."""
+    if settings.mock_mode:
+        return {}
+
+    try:
+        async with MarzbanAPI(server) as api:
+            return await api.get_user(client_name) or {}
+    except Exception as e:
+        logger.error("Failed to get key activity on %s: %s", server.name, e)
+        return {}
+
+
 async def get_server_status(server: Server) -> dict:
     """Get server status (peer count, uptime, etc.)."""
     if settings.mock_mode:

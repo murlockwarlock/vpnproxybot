@@ -18,7 +18,7 @@ A core feature of this architecture is its highly reliable and flexible billing 
 - **Robokassa:** Integrated gateway for global payments.
 - **Cryptomus (Crypto):** Support for cryptocurrency payments to ensure global accessibility.
 - **Telegram Native Payments:** Direct in-app purchases using Telegram's native payment provider.
-- **Subscriptions & Referrals:** Fully automated recurring billing and affiliate payout tracking.
+- **Subscriptions & Referrals:** Explicit renew/upgrade flows and affiliate payout tracking. Recurring charges are disabled by default.
 
 ## 🚀 Quick Start
 
@@ -31,8 +31,8 @@ A core feature of this architecture is its highly reliable and flexible billing 
 
 Clone the repository:
 ```bash
-git clone https://github.com/murlockwarlock/vpn-bot.git
-cd vpn-bot
+git clone https://github.com/murlockwarlock/vpnproxybot.git
+cd vpnproxybot
 ```
 
 Install dependencies:
@@ -60,8 +60,8 @@ python -m webstore
 ```
 
 ## 🛠 Deployment
-The repository includes deployment scripts for VPS instances (using `paramiko` and `systemd`). 
-Review the scripts in the root directory (e.g., `deploy_anewkabot.py`) and adjust the `YOUR_SERVER_IP` placeholder to match your VPS IP.
+
+Keep production addresses, paths and credentials in local environment files or your secret manager. They are intentionally not included in this public repository.
 
 ## 🤝 Contributing
 Contributions are welcome! Please open an issue or submit a pull request if you'd like to improve the codebase.

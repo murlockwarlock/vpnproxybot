@@ -623,6 +623,8 @@ async def test_partner_links_manage_and_toggle_own_link(monkeypatch, db_session,
 async def test_partner_apply_save_creates_application_and_notifies_admins(monkeypatch, db_session, db_session_factory):
     monkeypatch.setattr(partner_handler, "async_session", db_session_factory)
     monkeypatch.setattr(partner_handler.settings, "admin_ids", [90001, 90002])
+    monkeypatch.setattr(partner_handler.settings, "owner_ids", [90001, 90002])
+    monkeypatch.setattr(partner_handler.settings, "support_agent_ids", [90001, 90002])
 
     state = _State()
     callback = _make_callback(6003, "partner_apply_start")
@@ -768,6 +770,8 @@ async def test_partner_payout_request_save_creates_pending_request(monkeypatch, 
 
     monkeypatch.setattr(partner_handler, "async_session", db_session_factory)
     monkeypatch.setattr(partner_handler.settings, "admin_ids", [90001, 90002])
+    monkeypatch.setattr(partner_handler.settings, "owner_ids", [90001, 90002])
+    monkeypatch.setattr(partner_handler.settings, "support_agent_ids", [90001, 90002])
 
     state = _State({"pt_payout_amount": 750.0})
     message = _make_message(7008, "СБП +79991234567")

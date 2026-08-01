@@ -7,7 +7,7 @@ from aiohttp import web
 from webstore.alerts import notify_webstore_error
 from webstore.database import init_db
 from webstore.config import settings
-from webstore.routes import setup_routes
+from webstore.routes import close_support_websockets, setup_routes
 from webstore.scheduler import start_scheduler, stop_scheduler
 
 logging.basicConfig(
@@ -32,8 +32,11 @@ async def on_startup(app: web.Application) -> None:
     )
 
 
-async def on_cleanup(app: web.Application) -> None:
+async def on_shutdown(app: web.Application) -> None:
+    """Stop background work before waiting for HTTP/WebSocket clients."""
     stop_scheduler()
+    closed_sockets = await close_support_websockets()
+    logger.info("Closed %d support websocket(s) for shutdown", closed_sockets)
 
 
 def main() -> None:
@@ -80,11 +83,19 @@ def main() -> None:
 
     app = web.Application(middlewares=[error_alert_middleware])
     app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
+    app.on_shutdown.append(on_shutdown)
     setup_routes(app)
 
     logger.info("Starting web store on %s:%s", settings.host, settings.port)
-    web.run_app(app, host=settings.host, port=settings.port, print=None)
+    # The production unit has a short stop timeout.  Finish aiohttp cleanup
+    # before systemd resorts to SIGKILL, especially while SQLite is in use.
+    web.run_app(
+        app,
+        host=settings.host,
+        port=settings.port,
+        print=None,
+        shutdown_timeout=1.0,
+    )
 
 
 if __name__ == "__main__":

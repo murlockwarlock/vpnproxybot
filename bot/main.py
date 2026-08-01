@@ -15,6 +15,7 @@ from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefaul
 
 from bot.config import settings
 from bot.database import init_db
+from bot.telegram_client import create_telegram_bot
 
 
 async def main() -> None:
@@ -48,11 +49,13 @@ async def main() -> None:
         await _seed_demo_servers()
 
     # ── Bot + Dispatcher ───────────────────────────────
-    bot = Bot(
+    bot = create_telegram_bot(
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher(storage=MemoryStorage())
+    from bot.middlewares.error_feedback import ErrorFeedbackMiddleware
+    dp.update.outer_middleware(ErrorFeedbackMiddleware())
 
     # ── Register routers ───────────────────────────────
     from bot.handlers.admin import router as admin_router

@@ -22,6 +22,18 @@ def devices_kb(sub_id: int, can_buy: bool, price_rub: int) -> InlineKeyboardMark
     return builder.as_markup()
 
 
+def device_subscriptions_kb(subscriptions) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for sub in subscriptions:
+        label = sub.tariff.label if sub.tariff else f"Подписка #{sub.id}"
+        expires = sub.expires_at.strftime("%d.%m.%Y") if sub.expires_at else "—"
+        builder.row(InlineKeyboardButton(
+            text=f"{label} · до {expires}", callback_data=f"manage_devices_{sub.id}"
+        ))
+    builder.row(InlineKeyboardButton(text="◀️ Назад в профиль", callback_data="profile"))
+    return builder.as_markup()
+
+
 def buy_device_pay_kb(sub_id: int, stars_enabled: bool = True) -> InlineKeyboardMarkup:
     """Keyboard for selecting payment method for extra device slot."""
     builder = InlineKeyboardBuilder()
@@ -71,11 +83,16 @@ def adapt_devices_kb(sub_id: int, devices: list[dict]) -> InlineKeyboardMarkup:
     # We use dev_id or name to identify the device
     for dev in devices:
         dev_id = dev.get("id") or dev.get("device_id")
-        dev_name = dev.get("name") or dev.get("client_name") or f"Device {dev_id}"
+        dev_name = (
+            dev.get("name")
+            or dev.get("client_name")
+            or dev.get("device_model")
+            or f"устройство {dev_id}"
+        )
         if dev_id is not None:
             builder.row(
                 InlineKeyboardButton(
-                    text=f"🗑 Удалить {dev_name}",
+                    text=f"🗑 Удалить {str(dev_name)[:36]}",
                     callback_data=f"del_adapt_dev_{sub_id}_{dev_id}"
                 )
             )

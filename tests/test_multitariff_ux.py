@@ -25,6 +25,7 @@ def _make_tariff(
     t.price_rub = price
     t.days = days
     t.is_active = is_active
+    t.is_admin_only = False
     t.adapt_plan_uuid = adapt_plan_uuid
     return t
 
@@ -111,19 +112,23 @@ class TestProfileKbRenewalOptions:
         assert "buy" in callbacks
         assert "renewal_choice" not in callbacks
 
-    def test_profile_kb_multiple_tariffs_uses_renewal_choice_callback(self):
+    def test_profile_kb_multiple_tariffs_uses_purchase_action_callback(self):
         from bot.keyboards.client import profile_kb
         options = [(1, "Лайт", 4.17), (2, "Базовый", 8.30)]
         kb = profile_kb(renewal_options=options, has_daily_charge_tariff_choice=True)
         all_buttons = [btn for row in kb.inline_keyboard for btn in row]
         callbacks = [b.callback_data for b in all_buttons if b.callback_data]
-        assert "renewal_choice" in callbacks
-        assert "buy" not in callbacks
+        assert "buy" in callbacks
+        assert "renewal_choice" not in callbacks
 
     def test_profile_kb_daily_charge_button_when_multiple_tariffs(self):
         from bot.keyboards.client import profile_kb
         options = [(1, "Лайт", 4.17), (2, "Базовый", 8.30)]
-        kb = profile_kb(renewal_options=options, has_daily_charge_tariff_choice=True)
+        kb = profile_kb(
+            renewal_options=options,
+            has_daily_charge_tariff_choice=True,
+            balance_mode_enabled=True,
+        )
         all_buttons = [btn for row in kb.inline_keyboard for btn in row]
         callbacks = [b.callback_data for b in all_buttons if b.callback_data]
         assert "daily_charge_tariff_choice" in callbacks
@@ -252,13 +257,13 @@ class TestProviderLabel:
             label = _provider_label(sub)
         assert label == "Базовый"
 
-    def test_vhq_subscription_returns_vhq(self):
+    def test_vhq_subscription_uses_public_label(self):
         from bot.handlers.profile import _provider_label
         sub = MagicMock()
         with patch("bot.handlers.profile.is_adapt_subscription", return_value=False), \
              patch("bot.handlers.profile.is_vhq_subscription", return_value=True):
             label = _provider_label(sub)
-        assert label == "VHQ"
+        assert label == "Премиум"
 
     def test_marzban_subscription_returns_lait(self):
         from bot.handlers.profile import _provider_label
