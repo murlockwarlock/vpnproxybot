@@ -6,12 +6,21 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import TelegramObject
 
 from bot.config import settings
 from bot.services.notifications import notify_admins_issue
 
 logger = logging.getLogger(__name__)
+
+
+def _is_expired_callback_error(exc: Exception) -> bool:
+    """Telegram rejects callback acknowledgements after their short lifetime."""
+    if not isinstance(exc, TelegramBadRequest):
+        return False
+    text = str(exc).lower()
+    return "query is too old" in text or "query id is invalid" in text
 
 
 class ErrorFeedbackMiddleware(BaseMiddleware):
@@ -24,6 +33,12 @@ class ErrorFeedbackMiddleware(BaseMiddleware):
         try:
             return await handler(event, data)
         except Exception as exc:
+            if getattr(event, "callback_query", None) is not None and _is_expired_callback_error(exc):
+                # This commonly happens when an update was queued across a restart.  It is
+                # not an application incident and often occurs after the useful edit/send
+                # has already completed, so avoid misleading the user and paging staff.
+                logger.warning("Ignored expired Telegram callback: %s", exc)
+                return None
             logger.exception("Unhandled Telegram update error")
             callback = getattr(event, "callback_query", None)
             message = getattr(event, "message", None)
