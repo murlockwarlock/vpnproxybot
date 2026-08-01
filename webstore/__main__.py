@@ -1,6 +1,8 @@
 """Entry point for the web store service."""
 
 import logging
+import os
+import threading
 
 from aiohttp import web
 
@@ -15,6 +17,22 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("webstore")
+_shutdown_watchdog: threading.Timer | None = None
+
+
+def _force_bounded_shutdown() -> None:
+    logger.warning("aiohttp cleanup reached the bounded timeout; exiting process")
+    os._exit(0)
+
+
+def _arm_shutdown_watchdog(timeout_seconds: float = 5.0) -> None:
+    """Ensure aiohttp cannot hang forever while cancelling internal tasks."""
+    global _shutdown_watchdog
+    if _shutdown_watchdog is not None:
+        return
+    _shutdown_watchdog = threading.Timer(timeout_seconds, _force_bounded_shutdown)
+    _shutdown_watchdog.daemon = True
+    _shutdown_watchdog.start()
 
 
 async def on_startup(app: web.Application) -> None:
@@ -37,6 +55,7 @@ async def on_shutdown(app: web.Application) -> None:
     stop_scheduler()
     closed_sockets = await close_support_websockets()
     logger.info("Closed %d support websocket(s) for shutdown", closed_sockets)
+    _arm_shutdown_watchdog()
 
 
 def main() -> None:
