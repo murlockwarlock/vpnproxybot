@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from bot.keyboards.client import (
     payment_kb,
+    product_type_kb,
     purchase_intro_kb,
     purchase_subscription_kb,
     purchase_target_kb,
@@ -69,6 +70,23 @@ def test_tariffs_kb_groups_by_family_and_sorts_by_price():
     ]
 
 
+def test_tariffs_kb_can_return_to_selected_subscription():
+    tariffs = [
+        SimpleNamespace(
+            id=3,
+            label="Базовый (14 дней)",
+            days=14,
+            price_rub=125,
+            price_stars=0,
+            tariff_type="VPN",
+        )
+    ]
+
+    markup = tariffs_kb(tariffs, back_callback="purchase_return_244")
+
+    assert markup.inline_keyboard[-1][0].callback_data == "purchase_return_244"
+
+
 def test_subscription_target_button_is_short_and_keeps_term_visible():
     sub = SimpleNamespace(
         id=243,
@@ -91,6 +109,24 @@ def test_purchase_carousel_keyboard_has_expected_actions():
         purchase_subscription_kb(243, position=0, total=2, show_upgrade=True)
     )
     assert texts[:4] == ["↻ Продлить", "↑ Улучшить", "➕ Создать новую", "Следующая"]
+    markup = purchase_subscription_kb(243, position=0, total=2, show_upgrade=True)
+    callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+    assert "buy_new_243" in callbacks
+
+
+def test_product_type_keyboard_preserves_subscription_navigation():
+    markup = product_type_kb(
+        back_callback="purchase_return_243",
+        source_subscription_id=243,
+    )
+    callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+
+    assert callbacks == [
+        "ptype_vpn~243",
+        "ptype_tg_proxy~243",
+        "ptype_both~243",
+        "purchase_return_243",
+    ]
 
 
 def test_trial_carousel_omits_upgrade_action():

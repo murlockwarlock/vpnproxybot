@@ -444,7 +444,11 @@ async def test_web_adapt_upgrade_reuses_uuid_and_does_not_renew(monkeypatch, pat
 
         api = AsyncMock()
         api.upgrade_subscription = AsyncMock(return_value={"success": True, "devices": 5})
-        api.get_status = AsyncMock(return_value={"end_date": expires_at.isoformat(), "devices": 5})
+        api.get_status = AsyncMock(side_effect=[
+            {"plan_uuid": "old-plan-uuid", "end_date": primary.access_expires_at.isoformat(), "devices": 3},
+            {"plan_uuid": "new-plan-uuid", "end_date": expires_at.isoformat(), "devices": 5},
+        ])
+        api.list_plans = AsyncMock(return_value=[{"uuid": "new-plan-uuid", "devices": 5}])
         api.renew_subscription = AsyncMock()
         monkeypatch.setattr(webstore_routes, "AdaptAPI", lambda: api)
 
@@ -455,6 +459,96 @@ async def test_web_adapt_upgrade_reuses_uuid_and_does_not_renew(monkeypatch, pat
         assert upgrade.marzban_username == primary.marzban_username
         api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, "new-plan-uuid")
         api.renew_subscription.assert_not_awaited()
+
+
+async def test_web_expired_adapt_upgrade_reactivates_then_changes_to_cheaper_plan(
+    monkeypatch, patched_webstore
+):
+    adapt_uuid = "770fa622-a4bd-63f6-c938-668877662229"
+    expired_end = datetime.utcnow() - timedelta(days=2)
+    reactivated_end = datetime.utcnow() + timedelta(days=1)
+    upgraded_end = datetime.utcnow() + timedelta(days=30)
+    async with patched_webstore() as session:
+        primary = WebOrder(
+            order_id="adapt-expired-old", contact="user@example.com", tariff_key="annual-old",
+            tariff_label="Год", days=365, amount_rub=995,
+            status="delivered", profile_token="adapt-expired-profile",
+            marzban_username=f"adapt_{adapt_uuid}",
+            subscription_url=f"https://test/adapt-sub/{adapt_uuid}",
+            access_expires_at=expired_end, delivered_at=datetime.utcnow(),
+        )
+        upgrade = WebOrder(
+            order_id="adapt-expired-upgrade", contact="user@example.com", tariff_key="monthly-new",
+            tariff_label="Месяц", days=30, amount_rub=155,
+            status="paid", profile_token="adapt-expired-profile", purchase_action="upgrade",
+            target_order_id=primary.order_id,
+            target_snapshot_plan_uuid="annual-plan",
+            target_snapshot_expires_at=expired_end,
+        )
+        session.add_all([primary, upgrade])
+        await session.flush()
+
+        api = AsyncMock()
+        api.get_status.side_effect = [
+            {"plan_uuid": "annual-plan", "end_date": expired_end.isoformat(), "devices": 5},
+            {"plan_uuid": "annual-plan", "end_date": reactivated_end.isoformat(), "devices": 5},
+            {"plan_uuid": "monthly-plan", "end_date": upgraded_end.isoformat(), "devices": 1},
+        ]
+        api.list_plans.return_value = [{"uuid": "monthly-plan", "devices": 1}]
+        api.renew_subscription_custom.return_value = {"end_date": reactivated_end.isoformat()}
+        api.upgrade_subscription.return_value = {"success": True}
+        monkeypatch.setattr(webstore_routes, "AdaptAPI", lambda: api)
+
+        await webstore_routes._fulfill_adapt_order(session, upgrade, "monthly-plan")
+
+        assert upgrade.status == "delivered"
+        assert upgrade.subscription_url == primary.subscription_url
+        assert upgrade.access_expires_at == upgraded_end
+        api.renew_subscription_custom.assert_awaited_once_with(adapt_uuid, 3)
+        api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, "monthly-plan")
+
+
+async def test_web_expired_upgrade_retry_skips_second_reactivation(
+    monkeypatch, patched_webstore
+):
+    adapt_uuid = "770fa622-a4bd-63f6-c938-668877662230"
+    expired_end = datetime.utcnow() - timedelta(days=2)
+    reactivated_end = datetime.utcnow() + timedelta(days=1)
+    upgraded_end = datetime.utcnow() + timedelta(days=30)
+    async with patched_webstore() as session:
+        primary = WebOrder(
+            order_id="adapt-retry-old", contact="user@example.com", tariff_key="annual-old",
+            tariff_label="Год", days=365, amount_rub=995,
+            status="delivered", profile_token="adapt-retry-profile",
+            marzban_username=f"adapt_{adapt_uuid}",
+            subscription_url=f"https://test/adapt-sub/{adapt_uuid}",
+            access_expires_at=reactivated_end, delivered_at=datetime.utcnow(),
+        )
+        retry = WebOrder(
+            order_id="adapt-retry-upgrade", contact="user@example.com", tariff_key="monthly-new",
+            tariff_label="Месяц", days=30, amount_rub=155,
+            status="paid", profile_token="adapt-retry-profile", purchase_action="upgrade",
+            target_order_id=primary.order_id, fulfillment_attempts=2,
+            target_snapshot_plan_uuid="annual-plan",
+            target_snapshot_expires_at=expired_end,
+        )
+        session.add_all([primary, retry])
+        await session.flush()
+
+        api = AsyncMock()
+        api.get_status.side_effect = [
+            {"plan_uuid": "annual-plan", "end_date": reactivated_end.isoformat(), "devices": 5},
+            {"plan_uuid": "monthly-plan", "end_date": upgraded_end.isoformat(), "devices": 1},
+        ]
+        api.list_plans.return_value = [{"uuid": "monthly-plan", "devices": 1}]
+        api.upgrade_subscription.return_value = {"success": True}
+        monkeypatch.setattr(webstore_routes, "AdaptAPI", lambda: api)
+
+        await webstore_routes._fulfill_adapt_order(session, retry, "monthly-plan")
+
+        assert retry.status == "delivered"
+        api.renew_subscription_custom.assert_not_awaited()
+        api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, "monthly-plan")
 
 
 async def test_web_adapt_upgrade_accepts_linked_telegram_target(monkeypatch, patched_webstore):
@@ -496,7 +590,11 @@ async def test_web_adapt_upgrade_accepts_linked_telegram_target(monkeypatch, pat
 
         api = AsyncMock()
         api.upgrade_subscription = AsyncMock(return_value={"success": True, "devices": 5})
-        api.get_status = AsyncMock(return_value={"end_date": new_end.isoformat(), "devices": 5})
+        api.get_status = AsyncMock(side_effect=[
+            {"plan_uuid": old_plan_uuid, "end_date": tg_item.expires_at.isoformat(), "devices": 3},
+            {"plan_uuid": new_plan_uuid, "end_date": new_end.isoformat(), "devices": 5},
+        ])
+        api.list_plans = AsyncMock(return_value=[{"uuid": new_plan_uuid, "devices": 5}])
         api.renew_subscription = AsyncMock()
         monkeypatch.setattr(webstore_routes, "AdaptAPI", lambda: api)
 
@@ -509,6 +607,48 @@ async def test_web_adapt_upgrade_accepts_linked_telegram_target(monkeypatch, pat
         assert tg_item.device_slots == 5
         api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, new_plan_uuid)
         api.renew_subscription.assert_not_awaited()
+
+
+async def test_web_adapt_upgrade_is_not_delivered_when_provider_keeps_old_plan(monkeypatch, patched_webstore):
+    adapt_uuid = "770fa622-a4bd-63f6-c938-668877662225"
+    old_plan_uuid = "old-plan-uuid"
+    new_plan_uuid = "new-plan-uuid"
+    old_end = datetime.utcnow() + timedelta(days=10)
+
+    async with patched_webstore() as session:
+        primary = WebOrder(
+            order_id="adapt-old-mismatch", contact="user@example.com", tariff_key="basic_30",
+            tariff_label="Базовый 3 устройства", days=30, amount_rub=249,
+            status="delivered", profile_token="adapt-mismatch-profile",
+            marzban_username=f"adapt_{adapt_uuid}", subscription_url=f"https://test/adapt-sub/{adapt_uuid}",
+            access_expires_at=old_end, delivered_at=datetime.utcnow(),
+        )
+        upgrade = WebOrder(
+            order_id="adapt-upgrade-mismatch", contact="user@example.com", tariff_key="basic_30_5",
+            tariff_label="Базовый 5 устройств", days=30, amount_rub=100,
+            status="paid", profile_token="adapt-mismatch-profile", purchase_action="upgrade",
+            target_order_id=primary.order_id,
+        )
+        session.add_all([primary, upgrade])
+        await session.flush()
+
+        api = AsyncMock()
+        api.get_status.side_effect = [
+            {"plan_uuid": old_plan_uuid, "end_date": old_end.isoformat(), "devices": 3},
+            {"plan_uuid": old_plan_uuid, "end_date": old_end.isoformat(), "devices": 3},
+        ]
+        api.list_plans.return_value = [{"uuid": new_plan_uuid, "devices": 5}]
+        api.upgrade_subscription.return_value = {"success": True}
+        monkeypatch.setattr(webstore_routes, "AdaptAPI", lambda: api)
+        monkeypatch.setattr(webstore_routes, "_notify_admins_webstore", AsyncMock())
+        monkeypatch.setattr(webstore_routes, "_notify_linked_webstore_user", AsyncMock())
+
+        await webstore_routes._fulfill_adapt_order(session, upgrade, new_plan_uuid)
+
+        assert upgrade.status == "failed"
+        assert upgrade.failure_code == "adapt_result_mismatch"
+        assert upgrade.subscription_url is None
+        api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, new_plan_uuid)
 
 
 async def test_web_profile_enriches_legacy_telegram_adapt_item(monkeypatch):
@@ -540,6 +680,38 @@ async def test_web_profile_enriches_legacy_telegram_adapt_item(monkeypatch):
     assert item.adapt_plan_uuid == plan_uuid
     assert item.device_slots == 5
     session.flush.assert_awaited_once()
+
+
+async def test_web_profile_marks_expired_subscription_upgradeable_to_cheaper_tariff(monkeypatch):
+    annual = {
+        "key": "annual", "adapt_plan_uuid": "annual-plan",
+        "price_rub": 995, "days": 365,
+    }
+    monthly = {
+        "key": "monthly", "adapt_plan_uuid": "monthly-plan",
+        "price_rub": 155, "days": 30,
+    }
+    monkeypatch.setattr(webstore_routes, "get_store_tariffs", lambda: [annual, monthly])
+    monkeypatch.setattr(
+        webstore_routes,
+        "get_store_tariffs_by_key",
+        lambda: {"annual": annual, "monthly": monthly},
+    )
+    order = WebOrder(
+        order_id="expired-profile-order",
+        tariff_key="annual",
+        tariff_label="Год",
+        days=365,
+        amount_rub=995,
+        status="delivered",
+        marzban_username="adapt_770fa622-a4bd-63f6-c938-668877662231",
+        subscription_url="https://test/adapt-sub/770fa622-a4bd-63f6-c938-668877662231",
+        access_expires_at=datetime.utcnow() - timedelta(days=1),
+    )
+
+    payload = webstore_routes._serialize_orders([order])[0]
+
+    assert payload["can_upgrade"] is True
 
 
 async def test_admin_client_search_finds_telegram_username_and_subscription_key(patched_webstore):

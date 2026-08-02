@@ -880,10 +880,17 @@
           const target = encodeURIComponent(item.target_order_id);
           const plan = encodeURIComponent(item.adapt_plan_uuid);
           const renewAction = item.is_trial ? "upgrade" : "renew";
-          actionHtml = `
+          const expired = isActive ? "0" : "1";
+          actionHtml = !isActive ? `
+              <div class="subscription-actions">
+                <a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}&expired=1#tariffs">↻ Продлить</a>
+                <a class="ghost-btn" href="/buy?action=new#tariffs">➕ Создать новую</a>
+              </div>
+            ` : `
               <div class="subscription-actions">
                 <a class="ghost-btn" href="/buy?action=${renewAction}&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↻ Продлить</a>
-                ${isActive && !item.is_trial && item.can_upgrade ? `<a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↑ Улучшить</a>` : ""}
+                ${!item.is_trial && item.can_upgrade ? `<a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}&expired=${expired}#tariffs">↑ Улучшить</a>` : ""}
+                <a class="ghost-btn" href="/buy?action=new#tariffs">➕ Создать новую</a>
               </div>
             `;
         }
@@ -1019,10 +1026,17 @@
           const target = encodeURIComponent(o.order_id);
           const plan = encodeURIComponent(o.adapt_plan_uuid || "");
           const renewAction = o.is_trial ? "upgrade" : "renew";
-          actionHtml = `
+          const expired = isExpired ? "1" : "0";
+          actionHtml = isExpired ? `
+              <div class="subscription-actions">
+                <a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}&expired=1#tariffs">↻ Продлить</a>
+                <a class="ghost-btn" href="/buy?action=new#tariffs">➕ Создать новую</a>
+              </div>
+            ` : `
               <div class="subscription-actions">
                 <a class="ghost-btn" href="/buy?action=${renewAction}&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↻ Продлить</a>
-                ${!isExpired && !o.is_trial && o.can_upgrade ? `<a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}#tariffs">↑ Улучшить</a>` : ""}
+                ${!o.is_trial && o.can_upgrade ? `<a class="primary-btn" href="/buy?action=upgrade&target_order_id=${target}&current_plan_uuid=${plan}&expired=${expired}#tariffs">↑ Улучшить</a>` : ""}
+                <a class="ghost-btn" href="/buy?action=new#tariffs">➕ Создать новую</a>
               </div>
             `;
         }

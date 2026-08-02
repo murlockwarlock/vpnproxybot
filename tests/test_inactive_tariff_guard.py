@@ -7,9 +7,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from bot.models import Base, Platform, Server, Subscription, SubStatus, Tariff, TariffType, User
+from bot.models import AdaptSubscription, Base, Platform, Server, Subscription, SubStatus, Tariff, TariffType, User
 
 
 pytestmark = pytest.mark.asyncio
@@ -169,10 +170,17 @@ async def test_upgrade_menu_hides_admin_only_tariffs(db_session_factory):
     sub_id, hidden_id, public_id = ids
     callback = _make_callback(current.id)
     callback.data = f"purchase_upgrade_{sub_id}"
+    api = AsyncMock()
+    api.list_plans.return_value = [
+        {"uuid": "plan-current", "is_active": True},
+        {"uuid": "plan-public", "is_active": True},
+        {"uuid": "plan-hidden", "is_active": True},
+    ]
     with (
         patch("bot.handlers.buy.async_session", db_session_factory),
         patch("bot.handlers.buy.settings.is_admin", return_value=False),
         patch("bot.handlers.buy._get_stars_enabled", new_callable=AsyncMock, return_value=False),
+        patch("bot.handlers.buy.AdaptAPI", return_value=api),
     ):
         await buy_handler.choose_upgrade_target(callback)
 
@@ -185,6 +193,106 @@ async def test_upgrade_menu_hides_admin_only_tariffs(db_session_factory):
     ]
     assert any(str(public_id) in value for value in callbacks)
     assert all(str(hidden_id) not in value for value in callbacks)
+
+
+async def test_expired_subscription_tariff_choice_includes_same_and_cheaper_tariff(db_session_factory):
+    from bot.handlers import buy as buy_handler
+
+    async with db_session_factory() as session:
+        user = User(telegram_id=100502, full_name="User")
+        server = Server(name="test", host="127.0.0.1", location="Test")
+        current = Tariff(
+            days=365, label="Год", price_rub=995, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True,
+            adapt_plan_uuid="plan-annual",
+        )
+        cheaper = Tariff(
+            days=30, label="Месяц", price_rub=155, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True,
+            adapt_plan_uuid="plan-monthly",
+        )
+        impossible = Tariff(
+            days=7, label="Минимальный", price_rub=50, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True,
+            adapt_plan_uuid="plan-impossible",
+        )
+        session.add_all([user, server, current, cheaper, impossible])
+        await session.flush()
+        subscription = Subscription(
+            user_id=user.id, server_id=server.id, tariff_id=current.id,
+            tariff_months=12, tariff_days=365, status=SubStatus.EXPIRED,
+            vpn_key="https://example.test/sub", client_name="adapt_expired",
+            platform=Platform.ANDROID,
+            expires_at=datetime.utcnow() - timedelta(days=1),
+        )
+        session.add(subscription)
+        await session.commit()
+        sub_id = subscription.id
+        current_id = current.id
+        cheaper_id = cheaper.id
+        impossible_id = impossible.id
+
+    callback = _make_callback(current.id, user_id=100502)
+    callback.data = f"purchase_upgrade_{sub_id}"
+    api = AsyncMock()
+    api.list_plans.return_value = [
+        {"uuid": "plan-annual", "is_active": True, "price_usd": 12, "days": 365},
+        {"uuid": "plan-monthly", "is_active": True, "price_usd": 1, "days": 30},
+        {"uuid": "plan-impossible", "is_active": True, "price_usd": 0.05, "days": 7},
+    ]
+    with (
+        patch("bot.handlers.buy.async_session", db_session_factory),
+        patch("bot.handlers.buy.settings.is_admin", return_value=False),
+        patch("bot.handlers.buy._get_stars_enabled", new_callable=AsyncMock, return_value=False),
+        patch("bot.handlers.buy.AdaptAPI", return_value=api),
+    ):
+        await buy_handler._open_expired_tariff_choice(callback, sub_id)
+
+    markup = callback.message.edit_text.await_args.kwargs["reply_markup"]
+    callbacks = [
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+    assert f"tariff_{current_id}~u~{sub_id}" in callbacks
+    assert f"tariff_{cheaper_id}~u~{sub_id}" in callbacks
+    assert f"tariff_{impossible_id}~u~{sub_id}" not in callbacks
+
+
+async def test_expired_paid_renew_button_opens_all_tariffs(db_session_factory):
+    from bot.handlers import buy as buy_handler
+
+    async with db_session_factory() as session:
+        user = User(telegram_id=100504, full_name="User")
+        server = Server(name="test", host="127.0.0.1", location="Test")
+        tariff = Tariff(
+            days=30, label="Месяц", price_rub=155, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True,
+            adapt_plan_uuid="paid-plan",
+        )
+        session.add_all([user, server, tariff])
+        await session.flush()
+        subscription = Subscription(
+            user_id=user.id, server_id=server.id, tariff_id=tariff.id,
+            tariff_months=1, tariff_days=30, status=SubStatus.EXPIRED,
+            vpn_key="https://example.test/sub", client_name="adapt_expired",
+            platform=Platform.ANDROID,
+            expires_at=datetime.utcnow() - timedelta(days=1),
+        )
+        session.add(subscription)
+        await session.commit()
+        sub_id = subscription.id
+
+    callback = _FrozenCallback(f"purchase_renew_{sub_id}", user_id=100504)
+    open_tariffs = AsyncMock()
+    with (
+        patch("bot.handlers.buy.async_session", db_session_factory),
+        patch("bot.handlers.buy._open_expired_tariff_choice", open_tariffs),
+    ):
+        await buy_handler.choose_renew_target(callback)
+
+    open_tariffs.assert_awaited_once_with(callback, sub_id)
 
 
 async def test_purchase_carousel_contains_only_public_adapt_subscriptions(db_session_factory):
@@ -240,6 +348,123 @@ async def test_purchase_carousel_contains_only_public_adapt_subscriptions(db_ses
         targets = await buy_handler._purchase_targets(100500)
 
     assert [target.id for target in targets] == [public_id]
+
+
+async def test_purchase_targets_refresh_stale_adapt_plan_before_showing_actions(db_session_factory):
+    from bot.handlers import buy as buy_handler
+
+    provider_end = datetime.utcnow() + timedelta(days=120)
+    async with db_session_factory() as session:
+        user = User(telegram_id=100501, full_name="User")
+        server = Server(name="adapt-test", host="127.0.0.1", location="Test")
+        tariff_3 = Tariff(
+            days=90, label="90 дней • 3 устройства", price_rub=405, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True, adapt_plan_uuid="plan-3",
+        )
+        tariff_5 = Tariff(
+            days=90, label="90 дней • 5 устройств", price_rub=485, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True, adapt_plan_uuid="plan-5",
+        )
+        session.add_all([user, server, tariff_3, tariff_5])
+        await session.flush()
+        subscription = Subscription(
+            user_id=user.id, server_id=server.id, tariff_id=tariff_5.id,
+            tariff_months=3, tariff_days=90, status=SubStatus.ACTIVE, device_slots=5,
+            vpn_key="https://example.test/adapt", client_name="adapt_stale",
+            platform=Platform.ANDROID, expires_at=provider_end,
+        )
+        session.add(subscription)
+        await session.flush()
+        session.add(AdaptSubscription(
+            subscription_id=subscription.id,
+            adapt_uuid="adapt-subscription-uuid",
+            adapt_plan_uuid="plan-5",
+            end_date=provider_end,
+        ))
+        await session.commit()
+        subscription_id = subscription.id
+        tariff_3_id = tariff_3.id
+
+    api = AsyncMock()
+    api.get_status.return_value = {
+        "plan_uuid": "plan-3",
+        "devices": 3,
+        "end_date": provider_end.isoformat(),
+    }
+    with (
+        patch("bot.handlers.buy.async_session", db_session_factory),
+        patch("bot.handlers.buy.settings.is_admin", return_value=False),
+        patch("bot.handlers.buy.AdaptAPI", return_value=api),
+    ):
+        targets = await buy_handler._purchase_targets(100501)
+
+    assert [target.id for target in targets] == [subscription_id]
+    assert targets[0].tariff_id == tariff_3_id
+    assert targets[0].device_slots == 3
+    async with db_session_factory() as session:
+        stored = await session.get(Subscription, subscription_id)
+        adapt = await session.scalar(
+            select(AdaptSubscription).where(AdaptSubscription.subscription_id == subscription_id)
+        )
+        assert stored.tariff_id == tariff_3_id
+        assert stored.device_slots == 3
+        assert adapt.adapt_plan_uuid == "plan-3"
+
+
+async def test_purchase_targets_hide_separate_upgrade_for_expired_adapt_subscription(db_session_factory):
+    from bot.handlers import buy as buy_handler
+
+    expired_end = datetime.utcnow() - timedelta(days=2)
+    async with db_session_factory() as session:
+        user = User(telegram_id=100503, full_name="User")
+        server = Server(name="adapt-expired", host="127.0.0.1", location="Test")
+        annual = Tariff(
+            days=365, label="Год", price_rub=995, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True,
+            adapt_plan_uuid="plan-annual",
+        )
+        monthly = Tariff(
+            days=30, label="Месяц", price_rub=155, price_stars=0,
+            tariff_type=TariffType.VPN, is_active=True,
+            adapt_plan_uuid="plan-monthly",
+        )
+        session.add_all([user, server, annual, monthly])
+        await session.flush()
+        subscription = Subscription(
+            user_id=user.id, server_id=server.id, tariff_id=annual.id,
+            tariff_months=12, tariff_days=365, status=SubStatus.EXPIRED,
+            vpn_key="https://example.test/adapt", client_name="adapt_expired",
+            platform=Platform.ANDROID, expires_at=expired_end,
+        )
+        session.add(subscription)
+        await session.flush()
+        session.add(AdaptSubscription(
+            subscription_id=subscription.id,
+            adapt_uuid="expired-adapt-uuid",
+            adapt_plan_uuid="plan-annual",
+            end_date=expired_end,
+        ))
+        await session.commit()
+        subscription_id = subscription.id
+
+    api = AsyncMock()
+    api.get_status.return_value = {
+        "plan_uuid": "plan-annual",
+        "devices": 5,
+        "end_date": expired_end.isoformat(),
+    }
+    api.list_plans.return_value = [
+        {"uuid": "plan-annual", "devices": 5, "is_active": True},
+        {"uuid": "plan-monthly", "devices": 1, "is_active": True},
+    ]
+    with (
+        patch("bot.handlers.buy.async_session", db_session_factory),
+        patch("bot.handlers.buy.settings.is_admin", return_value=False),
+        patch("bot.handlers.buy.AdaptAPI", return_value=api),
+    ):
+        targets = await buy_handler._purchase_targets(100503, upgrade_only=True)
+
+    assert targets == []
 
 
 async def test_renew_target_does_not_mutate_frozen_callback(db_session_factory):
@@ -308,6 +533,35 @@ async def test_purchase_carousel_shows_url_and_does_not_mutate_callback():
     ]
 
 
+async def test_purchase_carousel_ignores_unchanged_message_and_acknowledges_button():
+    from aiogram.exceptions import TelegramBadRequest
+    from bot.handlers import buy as buy_handler
+
+    sub = SimpleNamespace(
+        id=243,
+        status=SimpleNamespace(value="active"),
+        tariff=SimpleNamespace(days=90, device_count=5),
+        tariff_days=90,
+        device_slots=5,
+        expires_at=datetime(2026, 10, 11),
+        vpn_key="https://example.test/sub",
+        client_name="adapt_test",
+    )
+    callback = _FrozenCallback("purchase_browse_0")
+    callback.message.edit_text.side_effect = TelegramBadRequest(
+        method=SimpleNamespace(),
+        message="Bad Request: message is not modified",
+    )
+    with patch(
+        "bot.handlers.buy._purchase_targets",
+        new_callable=AsyncMock,
+        side_effect=[[sub], []],
+    ):
+        await buy_handler.browse_purchase_subscriptions(callback)
+
+    callback.answer.assert_awaited_once()
+
+
 async def test_single_unpaid_trial_opens_paid_tariffs_immediately():
     from bot.handlers import buy as buy_handler
 
@@ -328,6 +582,111 @@ async def test_single_unpaid_trial_opens_paid_tariffs_immediately():
 
     open_trial.assert_awaited_once_with(callback, 199)
     callback.message.edit_text.assert_not_awaited()
+
+
+async def test_single_expired_subscription_shows_renew_or_create_choice():
+    from bot.handlers import buy as buy_handler
+
+    expired = SimpleNamespace(
+        id=244,
+        billing_mode="tariff",
+        expires_at=datetime.utcnow() - timedelta(days=2),
+        status=SimpleNamespace(value="expired"),
+        tariff=SimpleNamespace(days=30, device_count=3, adapt_plan_uuid="expired-plan"),
+        tariff_days=30,
+        device_slots=3,
+        vpn_key="https://example.test/expired",
+        client_name="adapt_expired",
+    )
+    callback = _FrozenCallback("buy")
+    with (
+        patch("bot.handlers.buy._has_non_vpn_tariffs", new_callable=AsyncMock, return_value=False),
+        patch("bot.handlers.buy._purchase_targets", new_callable=AsyncMock, return_value=[expired]),
+    ):
+        await buy_handler.start_purchase(callback)
+
+    edit = callback.message.edit_text.await_args
+    assert "Подписка 1/1" in edit.args[0]
+    texts = [
+        button.text
+        for row in edit.kwargs["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert "↻ Продлить" in texts
+    assert "➕ Создать новую" in texts
+    assert "↑ Улучшить" not in texts
+
+
+async def test_tariff_back_returns_to_exact_subscription_card():
+    from bot.handlers import buy as buy_handler
+
+    first = SimpleNamespace(
+        id=243,
+        billing_mode="tariff",
+        expires_at=datetime.utcnow() + timedelta(days=10),
+        status=SimpleNamespace(value="active"),
+        tariff=SimpleNamespace(days=30, device_count=3, adapt_plan_uuid="first-plan"),
+        tariff_days=30,
+        device_slots=3,
+        vpn_key="https://example.test/first",
+        client_name="adapt_first",
+    )
+    second = SimpleNamespace(
+        id=244,
+        billing_mode="tariff",
+        expires_at=datetime.utcnow() - timedelta(days=2),
+        status=SimpleNamespace(value="expired"),
+        tariff=SimpleNamespace(days=90, device_count=5, adapt_plan_uuid="second-plan"),
+        tariff_days=90,
+        device_slots=5,
+        vpn_key="https://example.test/second",
+        client_name="adapt_second",
+    )
+    callback = _FrozenCallback("purchase_return_244")
+    targets = AsyncMock(side_effect=[[first, second], []])
+    with patch("bot.handlers.buy._purchase_targets", targets):
+        await buy_handler.return_to_purchase_subscription(callback)
+
+    edit = callback.message.edit_text.await_args
+    assert "Подписка 2/2" in edit.args[0]
+    assert "https://example.test/second" in edit.args[0]
+    texts = [
+        button.text
+        for row in edit.kwargs["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert "↻ Продлить" in texts
+    assert "➕ Создать новую" in texts
+    assert "↑ Улучшить" not in texts
+
+
+async def test_payment_back_keeps_purchase_context():
+    from bot.handlers.buy import _tariff_payment_back_callback
+
+    assert _tariff_payment_back_callback(
+        tariff_type=TariffType.VPN,
+        has_product_types=False,
+        requested_purchase_action="upgrade",
+        target_subscription_id=244,
+    ) == "purchase_tariffs_244"
+    assert _tariff_payment_back_callback(
+        tariff_type=TariffType.VPN,
+        has_product_types=False,
+        requested_purchase_action="renew",
+        target_subscription_id=244,
+    ) == "purchase_return_244"
+    assert _tariff_payment_back_callback(
+        tariff_type=TariffType.VPN,
+        has_product_types=False,
+        requested_purchase_action="new",
+        target_subscription_id=244,
+    ) == "buy_new_244"
+    assert _tariff_payment_back_callback(
+        tariff_type=TariffType.BOTH,
+        has_product_types=True,
+        requested_purchase_action="new",
+        target_subscription_id=244,
+    ) == "ptype_both~244"
 
 
 async def test_paid_trial_user_sees_purchase_intro_before_carousel():
@@ -383,10 +742,17 @@ async def test_trial_renewal_shows_public_paid_plans_with_upgrade_intent(db_sess
         sub_id, public_id, hidden_id = subscription.id, public.id, hidden.id
 
     callback = _FrozenCallback(f"purchase_renew_{sub_id}")
+    api = AsyncMock()
+    api.list_plans.return_value = [
+        {"uuid": "trial-plan", "is_active": True, "price_usd": 0.4, "days": 7},
+        {"uuid": "public-plan", "is_active": True, "price_usd": 0.8, "days": 14},
+        {"uuid": "hidden-plan", "is_active": True, "price_usd": 1, "days": 14},
+    ]
     with (
         patch("bot.handlers.buy.async_session", db_session_factory),
         patch("bot.handlers.buy.settings.is_admin", return_value=False),
         patch("bot.handlers.buy._get_stars_enabled", new_callable=AsyncMock, return_value=False),
+        patch("bot.handlers.buy.AdaptAPI", return_value=api),
     ):
         await buy_handler.choose_renew_target(callback)
 

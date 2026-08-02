@@ -39,7 +39,7 @@ from bot.services.balance_service import credit_user_balance, debit_user_balance
 from bot.services import vpn_manager
 from bot.services.client_names import build_client_name
 from bot.services.device_slots import get_included_device_slots, get_max_device_slots
-from bot.services.notifications import notify_admins_issue, notify_admins_payment, notify_staff_text
+from bot.services.notifications import notify_admins_issue, notify_admins_payment, notify_expiring, notify_staff_text
 from bot.services.payment_logger import plog
 from bot.services.payment_service import (
     create_stars_invoice,
@@ -982,9 +982,10 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                     payment_source="Баланс",
                     issue=issue,
                 )
-                await callback.message.answer(
+                await notify_expiring(
+                    callback.bot,
+                    callback.from_user.id,
                     f"⚠️ {_build_delivery_issue_text(issue, refunded_balance=not ambiguous_adapt)}",
-                    parse_mode="HTML",
                 )
                 return
             if not subscription or not vpn_key:
@@ -1686,9 +1687,10 @@ async def process_successful_payment(message: Message) -> None:
                     payment_source="Stars/Telegram Pay",
                     issue=issue,
                 )
-                await message.answer(
+                await notify_expiring(
+                    message.bot,
+                    message.from_user.id,
                     f"❌ {_build_delivery_issue_text(issue)}",
-                    parse_mode="HTML",
                 )
                 return
             if not subscription or not vpn_key:

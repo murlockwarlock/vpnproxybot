@@ -11,6 +11,27 @@ _ACTION_CODES = {"new": "n", "renew": "r", "upgrade": "u"}
 _CODE_ACTIONS = {value: key for key, value in _ACTION_CODES.items()}
 
 
+def effective_expired_adapt_action(
+    action: str,
+    *,
+    current_plan_uuid: str | None,
+    selected_plan_uuid: str | None,
+    expires_at: datetime | None,
+    now: datetime | None = None,
+) -> str:
+    """Treat selecting the same plan on an expired tariff screen as renew."""
+    current = now or datetime.utcnow()
+    if (
+        action == "upgrade"
+        and expires_at
+        and expires_at <= current
+        and str(current_plan_uuid or "").strip()
+        and str(current_plan_uuid or "").strip() == str(selected_plan_uuid or "").strip()
+    ):
+        return "renew"
+    return action
+
+
 def encode_intent(value: str, action: str, target_subscription_id: int | None = None) -> str:
     """Append a compact operation context to a callback/platform value."""
     action = action if action in _ACTION_CODES else "new"
@@ -55,7 +76,6 @@ async def get_purchase_price_rub(session, *, user, tariff, action: str, target_s
     """Return and validate the customer-facing price for a purchase intent."""
     from bot.models import Subscription, Tariff
     from bot.services.adapt_routing import is_adapt_subscription
-    from bot.services.subscription_semantics import is_adapt_trial_tariff
 
     if action == "new" or action == "auto":
         return int(tariff.price_rub)
@@ -77,12 +97,15 @@ async def get_purchase_price_rub(session, *, user, tariff, action: str, target_s
         if current_tariff.id != tariff.id:
             raise ValueError("Для продления выберите текущий тариф")
         return int(tariff.price_rub)
-    if target.expires_at <= datetime.utcnow() and not is_adapt_trial_tariff(current_tariff):
-        raise ValueError("Улучшить можно только активную подписку")
     if not current_tariff.adapt_plan_uuid or not tariff.adapt_plan_uuid:
         raise ValueError("Для этой подписки улучшение сейчас недоступно")
     if current_tariff.adapt_plan_uuid == tariff.adapt_plan_uuid:
         raise ValueError("Эта подписка уже на выбранном тарифе")
+    if target.expires_at <= datetime.utcnow():
+        # Adapt upgrades active subscriptions only.  Fulfillment first
+        # reactivates an expired UUID for one custom day and immediately
+        # replaces its plan, so the customer pays the full selected tariff.
+        return int(tariff.price_rub)
     if int(tariff.price_rub) <= int(current_tariff.price_rub):
         raise ValueError("Улучшение доступно только на более дорогой тариф")
     price = calculate_upgrade_price_rub(

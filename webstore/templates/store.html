@@ -1870,6 +1870,7 @@
     const purchaseAction = ["new", "renew", "upgrade"].includes(storeParams.get("action")) ? storeParams.get("action") : "new";
     const targetOrderId = storeParams.get("target_order_id") || "";
     const currentPlanUuid = storeParams.get("current_plan_uuid") || "";
+    const targetExpired = storeParams.get("expired") === "1";
     const COOKIE_CONSENT_KEY = "webstore_cookie_consent";
     const PROFILE_COOKIE = "webstore_profile_token";
     const PROFILE_COOKIE_MAX_AGE = 60 * 60 * 24 * 30;
@@ -2020,7 +2021,11 @@
       const visibleTariffs = tariffs.filter(t => {
         if (purchaseAction === "renew" && currentPlanUuid) return t.adapt_plan_uuid === currentPlanUuid;
         if (purchaseAction === "upgrade" && currentTariff) {
-          return !!t.adapt_plan_uuid && t.adapt_plan_uuid !== currentPlanUuid && Number(t.price_rub) > Number(currentTariff.price_rub);
+          return !!t.adapt_plan_uuid
+            && (
+              (targetExpired && Number(currentTariff.days) > 7)
+              || (t.adapt_plan_uuid !== currentPlanUuid && Number(t.price_rub) > Number(currentTariff.price_rub))
+            );
         }
         return true;
       });

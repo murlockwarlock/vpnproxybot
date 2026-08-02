@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from bot.services.adapt_api import AdaptAPI, AdaptAPIError
+from bot.services.adapt_api import (
+    AdaptAPI,
+    AdaptAPIError,
+    can_upgrade_after_minimum_custom_renew,
+)
 
 
 def _make_api(api_id=12, api_key="testkey", base_url="https://test.adapt.example"):
@@ -44,6 +48,19 @@ def test_enabled_with_credentials():
 def test_disabled_without_credentials():
     api = AdaptAPI(api_id=0, api_key="", base_url="https://x.com")
     assert api.enabled is False
+
+
+def test_minimum_custom_renew_upgrade_requires_positive_delta():
+    current = {"uuid": "old", "price_usd": 1.0, "days": 10}
+
+    assert can_upgrade_after_minimum_custom_renew(
+        current,
+        {"uuid": "higher", "price_usd": 0.31, "days": 7},
+    ) is True
+    assert can_upgrade_after_minimum_custom_renew(
+        current,
+        {"uuid": "lower", "price_usd": 0.30, "days": 7},
+    ) is False
 
 
 def test_disabled_raises_on_post():
@@ -137,6 +154,26 @@ async def test_renew_subscription_success():
     with patch("aiohttp.ClientSession", return_value=session):
         result = await api.renew_subscription("sub-1")
     assert result["end_date"] == "2026-07-01T00:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_custom_renew_rejects_days_below_live_provider_minimum():
+    api = _make_api()
+
+    with pytest.raises(ValueError, match="at least 3 days"):
+        await api.renew_subscription_custom("sub-1", 1)
+
+
+@pytest.mark.asyncio
+async def test_custom_renew_sends_live_provider_minimum():
+    resp = _mock_response(200, {"subscription_uuid": "sub-1"})
+    session = _mock_session(resp)
+    api = _make_api()
+
+    with patch("aiohttp.ClientSession", return_value=session):
+        await api.renew_subscription_custom("sub-1", 3)
+
+    assert session.post.call_args.kwargs["json"]["custom_days"] == 3
 
 
 # ── freeze / unfreeze ─────────────────────────────────────────────────────────
@@ -257,4 +294,3 @@ async def test_get_balance_success():
     assert result["currency"] == "USD"
     call_body = session.post.call_args[1]["json"]
     assert call_body["api_key_id"] == 12
-

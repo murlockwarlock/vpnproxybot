@@ -110,7 +110,13 @@ def _sort_tariffs_for_client(tariffs: list[Tariff]) -> list[Tariff]:
     )
 
 
-def tariffs_kb(tariffs: list[Tariff], stars_enabled: bool = True, has_product_types: bool = False, intent_suffix: str = "") -> InlineKeyboardMarkup:
+def tariffs_kb(
+    tariffs: list[Tariff],
+    stars_enabled: bool = True,
+    has_product_types: bool = False,
+    intent_suffix: str = "",
+    back_callback: str | None = None,
+) -> InlineKeyboardMarkup:
     """Build tariff selection keyboard grouped by family, then sorted by price."""
     builder = InlineKeyboardBuilder()
     current_group = None
@@ -129,8 +135,8 @@ def tariffs_kb(tariffs: list[Tariff], stars_enabled: bool = True, has_product_ty
                 callback_data=f"tariff_{t.id}{intent_suffix}",
             )
         )
-    back_callback = "buy" if has_product_types else "back_main"
-    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=back_callback))
+    resolved_back_callback = back_callback or ("buy" if has_product_types else "back_main")
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=resolved_back_callback))
     return builder.as_markup()
 
 
@@ -160,6 +166,7 @@ def purchase_subscription_kb(
     position: int,
     total: int,
     show_upgrade: bool,
+    back_callback: str = "buy",
 ) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="↻ Продлить", callback_data=f"purchase_renew_{subscription_id}")],
@@ -168,7 +175,12 @@ def purchase_subscription_kb(
         rows.append([
             InlineKeyboardButton(text="↑ Улучшить", callback_data=f"purchase_upgrade_{subscription_id}")
         ])
-    rows.append([InlineKeyboardButton(text="➕ Создать новую", callback_data="buy_new")])
+    rows.append([
+        InlineKeyboardButton(
+            text="➕ Создать новую",
+            callback_data=f"buy_new_{subscription_id}",
+        )
+    ])
     if total > 1:
         rows.append([
             InlineKeyboardButton(
@@ -176,7 +188,7 @@ def purchase_subscription_kb(
                 callback_data=f"purchase_browse_{(position + 1) % total}",
             )
         ])
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="buy")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -499,19 +511,24 @@ def balance_payment_kb(amount_rub: int) -> InlineKeyboardMarkup:
 
 # ── Product Type ──────────────────────────────────────
 
-def product_type_kb() -> InlineKeyboardMarkup:
+def product_type_kb(
+    *,
+    back_callback: str = "back_main",
+    source_subscription_id: int | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    suffix = f"~{source_subscription_id}" if source_subscription_id else ""
     builder.row(
-        InlineKeyboardButton(text="🌐 Весь интернет", callback_data="ptype_vpn"),
+        InlineKeyboardButton(text="🌐 Весь интернет", callback_data=f"ptype_vpn{suffix}"),
     )
     builder.row(
-        InlineKeyboardButton(text="📱 Telegram-ускоритель", callback_data="ptype_tg_proxy"),
+        InlineKeyboardButton(text="📱 Telegram-ускоритель", callback_data=f"ptype_tg_proxy{suffix}"),
     )
     builder.row(
         InlineKeyboardButton(
             text="🔥 Весь интернет + Telegram-ускоритель",
-            callback_data="ptype_both",
+            callback_data=f"ptype_both{suffix}",
         ),
     )
-    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="back_main"))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=back_callback))
     return builder.as_markup()

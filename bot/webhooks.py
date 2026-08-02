@@ -34,6 +34,7 @@ from bot.models import (
     ReferralConfig,
     Server,
     Subscription,
+    SubStatus,
     Tariff,
     TariffType,
     User,
@@ -500,14 +501,11 @@ async def _process_and_deliver(
                     payment_source="YooKassa / Robokassa",
                     issue=issue,
                 )
-                try:
-                    await bot.send_message(
-                        chat_id,
-                        f"❌ {_build_delivery_issue_text(issue)}",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
+                await notify_expiring(
+                    bot,
+                    chat_id,
+                    f"❌ {_build_delivery_issue_text(issue)}",
+                )
                 return user.id, None
             if not subscription or not vpn_key:
                 logger.error(

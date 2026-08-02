@@ -149,6 +149,50 @@ async def test_adapt_webhook_correct_signature_processes():
     assert response.status == 200
 
 
+@pytest.mark.asyncio
+async def test_adapt_expired_webhook_marks_active_subscription_expired():
+    """The provider expiry event must update the local status and return 200."""
+    from bot.models import SubStatus
+    from bot.webhooks import handle_adapt_webhook
+
+    body = json.dumps({
+        "event": "subs.expired",
+        "data": {
+            "subscription_uuid": "sub-expired",
+            "external_user_id": "12345",
+        },
+    }).encode()
+    req = MagicMock()
+    req.read = AsyncMock(return_value=body)
+    req.headers = {}
+
+    adapt_record = MagicMock(subscription_id=77)
+    subscription = MagicMock(status=SubStatus.ACTIVE)
+    session_mock = AsyncMock()
+    session_mock.__aenter__ = AsyncMock(return_value=session_mock)
+    session_mock.__aexit__ = AsyncMock(return_value=False)
+    session_mock.execute = AsyncMock(
+        return_value=MagicMock(
+            scalar_one_or_none=MagicMock(return_value=adapt_record)
+        )
+    )
+    session_mock.get = AsyncMock(return_value=subscription)
+
+    with (
+        patch("bot.webhooks.settings") as mock_settings,
+        patch("bot.webhooks.async_session") as mock_session_cm,
+    ):
+        mock_settings.adapt_webhook_secret = ""
+        mock_settings.webstore_bridge_secret = ""
+        mock_session_cm.return_value = session_mock
+
+        response = await handle_adapt_webhook(req)
+
+    assert response.status == 200
+    assert subscription.status == SubStatus.EXPIRED
+    session_mock.commit.assert_awaited_once()
+
+
 # ── handle_adapt_subscription_proxy: invalid UUID format ─────────────────────
 
 @pytest.mark.asyncio

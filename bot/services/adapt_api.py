@@ -16,6 +16,32 @@ import aiohttp
 
 _TIMEOUT = aiohttp.ClientTimeout(total=20)
 _DEFAULT_BASE_URL = "https://network-api.adaptgroup.app"
+ADAPT_MIN_CUSTOM_RENEW_DAYS = 3
+
+
+def can_upgrade_after_minimum_custom_renew(
+    current_plan: dict[str, Any] | None,
+    target_plan: dict[str, Any] | None,
+) -> bool:
+    """Return whether Adapt's post-reactivation upgrade charge stays positive."""
+    if not current_plan or not target_plan:
+        return False
+    current_uuid = str(current_plan.get("uuid") or current_plan.get("plan_uuid") or "").strip()
+    target_uuid = str(target_plan.get("uuid") or target_plan.get("plan_uuid") or "").strip()
+    if not current_uuid or not target_uuid:
+        return False
+    if current_uuid == target_uuid:
+        return True
+    try:
+        current_price = float(current_plan["price_usd"])
+        current_days = int(current_plan["days"])
+        target_price = float(target_plan["price_usd"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if current_days <= 0:
+        return False
+    remaining_value = current_price / current_days * ADAPT_MIN_CUSTOM_RENEW_DAYS
+    return target_price - remaining_value > 0
 
 
 class AdaptAPIError(RuntimeError):
@@ -95,6 +121,10 @@ class AdaptAPI:
         
         Returns RenewSubscriptionCustomResponse with new end_date and total_price.
         """
+        if custom_days < ADAPT_MIN_CUSTOM_RENEW_DAYS:
+            raise ValueError(
+                f"Adapt custom renewal requires at least {ADAPT_MIN_CUSTOM_RENEW_DAYS} days"
+            )
         return await self._post(
             "/subs/renew/custom",
             {"subscription_uuid": subscription_uuid, "custom_days": custom_days},

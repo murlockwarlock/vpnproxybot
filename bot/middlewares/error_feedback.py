@@ -23,6 +23,12 @@ def _is_expired_callback_error(exc: Exception) -> bool:
     return "query is too old" in text or "query id is invalid" in text
 
 
+def _is_message_not_modified_error(exc: Exception) -> bool:
+    if not isinstance(exc, TelegramBadRequest):
+        return False
+    return "message is not modified" in str(exc).lower()
+
+
 class ErrorFeedbackMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -33,14 +39,21 @@ class ErrorFeedbackMiddleware(BaseMiddleware):
         try:
             return await handler(event, data)
         except Exception as exc:
-            if getattr(event, "callback_query", None) is not None and _is_expired_callback_error(exc):
+            callback = getattr(event, "callback_query", None)
+            if callback is not None and _is_expired_callback_error(exc):
                 # This commonly happens when an update was queued across a restart.  It is
                 # not an application incident and often occurs after the useful edit/send
                 # has already completed, so avoid misleading the user and paging staff.
                 logger.warning("Ignored expired Telegram callback: %s", exc)
                 return None
+            if callback is not None and _is_message_not_modified_error(exc):
+                logger.warning("Ignored unchanged Telegram message edit: %s", exc)
+                try:
+                    await callback.answer()
+                except Exception:
+                    pass
+                return None
             logger.exception("Unhandled Telegram update error")
-            callback = getattr(event, "callback_query", None)
             message = getattr(event, "message", None)
             support = settings.support_username or "поддержку"
             user_text = (

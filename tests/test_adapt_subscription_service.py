@@ -213,7 +213,9 @@ async def test_create_adapt_paid_subscription_renews_existing_for_same_plan():
         mock_api.get_status = AsyncMock(return_value={
             "plan_uuid": tariff.adapt_plan_uuid,
             "end_date": existing.expires_at.isoformat(),
+            "devices": 3,
         })
+        mock_api.list_plans = AsyncMock(return_value=[{"uuid": tariff.adapt_plan_uuid, "devices": 3}])
         mock_adapt_cls.return_value = mock_api
         sub, key = await _create_adapt_paid_subscription(
             session, user=user, tariff=tariff, platform=MagicMock()
@@ -389,7 +391,11 @@ async def test_create_adapt_paid_subscription_upgrades_without_second_renew():
         mock_api = AsyncMock()
         new_end = datetime.utcnow() + timedelta(days=30)
         mock_api.upgrade_subscription = AsyncMock(return_value={"success": True, "devices": 5})
-        mock_api.get_status = AsyncMock(return_value={"end_date": new_end.isoformat(), "devices": 5})
+        mock_api.get_status = AsyncMock(side_effect=[
+            {"plan_uuid": "old-plan-uuid", "end_date": existing.expires_at.isoformat(), "devices": 3},
+            {"plan_uuid": "new-plan-uuid", "end_date": new_end.isoformat(), "devices": 5},
+        ])
+        mock_api.list_plans = AsyncMock(return_value=[{"uuid": "new-plan-uuid", "devices": 5}])
         mock_adapt_cls.return_value = mock_api
 
         sub, key = await _create_adapt_paid_subscription(
@@ -404,6 +410,115 @@ async def test_create_adapt_paid_subscription_upgrades_without_second_renew():
     assert existing.tariff_id == tariff.id
     assert adapt_record.adapt_plan_uuid == "new-plan-uuid"
     assert existing.device_slots == 5
+
+
+@pytest.mark.asyncio
+async def test_expired_adapt_upgrade_reactivates_for_minimum_term_then_changes_plan():
+    from bot.services.subscription_service import _create_adapt_paid_subscription
+
+    session = AsyncMock()
+    user = _make_user()
+    tariff = _make_tariff(adapt_plan_uuid="cheaper-plan", days=30, label="30 дней")
+    server = _make_server()
+    expired_end = datetime.utcnow() - timedelta(days=3)
+    reactivated_end = datetime.utcnow() + timedelta(days=1)
+    upgraded_end = datetime.utcnow() + timedelta(days=30)
+    existing = MagicMock(id=177, device_slots=5, expires_at=expired_end)
+    adapt_record = MagicMock(
+        adapt_uuid="expired-sub-uuid",
+        adapt_plan_uuid="annual-plan",
+        end_date=expired_end,
+    )
+
+    with (
+        patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
+        patch("bot.services.subscription_service._adapt_subscription_by_id", new=AsyncMock(return_value=(existing, adapt_record))),
+        patch("bot.services.subscription_service.AdaptAPI") as api_cls,
+        patch("bot.services.subscription_service.build_adapt_mirror_url", return_value="stable-key"),
+        patch("bot.services.subscription_service.plog"),
+    ):
+        api = AsyncMock()
+        api.get_status.side_effect = [
+            {"plan_uuid": "annual-plan", "end_date": expired_end.isoformat(), "devices": 5},
+            {"plan_uuid": "annual-plan", "end_date": reactivated_end.isoformat(), "devices": 5},
+            {"plan_uuid": "cheaper-plan", "end_date": upgraded_end.isoformat(), "devices": 1},
+        ]
+        api.list_plans.return_value = [{"uuid": "cheaper-plan", "devices": 1}]
+        api.renew_subscription_custom.return_value = {"end_date": reactivated_end.isoformat()}
+        api.upgrade_subscription.return_value = {"success": True}
+        api_cls.return_value = api
+
+        result, key = await _create_adapt_paid_subscription(
+            session,
+            user=user,
+            tariff=tariff,
+            platform=MagicMock(),
+            purchase_action="upgrade",
+            target_subscription_id=existing.id,
+        )
+
+    api.renew_subscription_custom.assert_awaited_once_with("expired-sub-uuid", 3)
+    api.upgrade_subscription.assert_awaited_once_with("expired-sub-uuid", "cheaper-plan")
+    assert result is existing
+    assert key == "stable-key"
+    assert existing.expires_at == upgraded_end
+    assert existing.device_slots == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_upgrade_retry_does_not_repeat_custom_renewal():
+    from bot.services.subscription_service import _create_adapt_paid_subscription
+
+    session = AsyncMock()
+    user = _make_user()
+    tariff = _make_tariff(adapt_plan_uuid="target-plan", days=30)
+    server = _make_server()
+    baseline_end = datetime.utcnow() - timedelta(days=2)
+    reactivated_end = datetime.utcnow() + timedelta(days=1)
+    upgraded_end = datetime.utcnow() + timedelta(days=30)
+    existing = MagicMock(id=178, device_slots=3, expires_at=reactivated_end)
+    adapt_record = MagicMock(
+        adapt_uuid="retry-expired-sub",
+        adapt_plan_uuid="old-plan",
+        end_date=reactivated_end,
+    )
+    payment = MagicMock(
+        id=900,
+        provisioning_baseline_plan_uuid="old-plan",
+        provisioning_baseline_expires_at=baseline_end,
+        provisioning_failure_code="adapt_upgrade_failed",
+    )
+
+    with (
+        patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
+        patch("bot.services.subscription_service._adapt_subscription_by_id", new=AsyncMock(return_value=(existing, adapt_record))),
+        patch("bot.services.subscription_service.AdaptAPI") as api_cls,
+        patch("bot.services.subscription_service.build_adapt_mirror_url", return_value="stable-key"),
+        patch("bot.services.subscription_service.plog"),
+    ):
+        api = AsyncMock()
+        api.get_status.side_effect = [
+            {"plan_uuid": "old-plan", "end_date": reactivated_end.isoformat(), "devices": 3},
+            {"plan_uuid": "target-plan", "end_date": upgraded_end.isoformat(), "devices": 5},
+        ]
+        api.list_plans.return_value = [{"uuid": "target-plan", "devices": 5}]
+        api.upgrade_subscription.return_value = {"success": True}
+        api_cls.return_value = api
+
+        result, _ = await _create_adapt_paid_subscription(
+            session,
+            user=user,
+            tariff=tariff,
+            platform=MagicMock(),
+            purchase_action="upgrade",
+            target_subscription_id=existing.id,
+            provisioning_payment=payment,
+        )
+
+    api.renew_subscription_custom.assert_not_awaited()
+    api.upgrade_subscription.assert_awaited_once_with("retry-expired-sub", "target-plan")
+    assert result is existing
+    assert payment.provisioning_failure_code is None
 
 
 @pytest.mark.asyncio
@@ -435,7 +550,7 @@ async def test_adapt_upgrade_does_not_mutate_when_preflight_status_fails():
         mock_api.list_plans = AsyncMock(return_value=[{"uuid": "new-plan-uuid", "devices": 5}])
         mock_adapt_cls.return_value = mock_api
 
-        with pytest.raises(Exception, match="Adapt upgrade failed"):
+        with pytest.raises(Exception, match="Cannot safely verify Adapt state"):
             await _create_adapt_paid_subscription(
                 session,
                 user=user,
@@ -507,6 +622,7 @@ async def test_retry_reconciles_paid_renew_without_second_renew():
             "end_date": provider_end.isoformat(),
             "devices": 5,
         }
+        api.list_plans.return_value = [{"uuid": tariff.adapt_plan_uuid, "devices": 5}]
         api_cls.return_value = api
         result, _ = await _create_adapt_paid_subscription(
             session,
@@ -521,6 +637,102 @@ async def test_retry_reconciles_paid_renew_without_second_renew():
     renew.assert_not_awaited()
     assert result is existing
     assert existing.expires_at == provider_end
+
+
+@pytest.mark.asyncio
+async def test_renew_uses_provider_plan_and_refuses_stale_local_snapshot():
+    from bot.services.subscription_service import _create_adapt_paid_subscription
+
+    session = AsyncMock()
+    user = _make_user()
+    requested = _make_tariff(adapt_plan_uuid="five-device-plan", days=90)
+    actual_tariff = _make_tariff(adapt_plan_uuid="three-device-plan", days=90)
+    actual_tariff.id = 20
+    session.scalar.return_value = actual_tariff
+    server = _make_server()
+    provider_end = datetime.utcnow() + timedelta(days=300)
+    existing = MagicMock(id=231, expires_at=provider_end, device_slots=5)
+    adapt_record = MagicMock(
+        adapt_uuid="sub-stale-plan",
+        adapt_plan_uuid="five-device-plan",
+        end_date=provider_end,
+    )
+
+    with (
+        patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
+        patch("bot.services.subscription_service._adapt_subscription_by_id", new=AsyncMock(return_value=(existing, adapt_record))),
+        patch("bot.services.subscription_service.AdaptAPI") as api_cls,
+        patch("bot.services.subscription_service.renew_adapt_subscription", new=AsyncMock()) as renew,
+    ):
+        api = AsyncMock()
+        api.get_status.return_value = {
+            "plan_uuid": "three-device-plan",
+            "end_date": provider_end.isoformat(),
+            "devices": 3,
+        }
+        api.list_plans.return_value = [{"uuid": "five-device-plan", "devices": 5}]
+        api_cls.return_value = api
+
+        with pytest.raises(Exception, match="Refusing Adapt renew with a different plan"):
+            await _create_adapt_paid_subscription(
+                session,
+                user=user,
+                tariff=requested,
+                platform=MagicMock(),
+                purchase_action="renew",
+                target_subscription_id=existing.id,
+            )
+
+    renew.assert_not_awaited()
+    assert adapt_record.adapt_plan_uuid == "three-device-plan"
+    assert existing.tariff_id == actual_tariff.id
+    assert existing.device_slots == 3
+    session.commit.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_renew_does_not_record_success_when_provider_result_changes_plan():
+    from bot.services.subscription_service import _create_adapt_paid_subscription
+
+    session = AsyncMock()
+    user = _make_user()
+    tariff = _make_tariff(adapt_plan_uuid="five-device-plan", days=90)
+    server = _make_server()
+    before_end = datetime.utcnow() + timedelta(days=10)
+    existing = MagicMock(id=232, expires_at=before_end, device_slots=5)
+    adapt_record = MagicMock(
+        adapt_uuid="sub-result-mismatch",
+        adapt_plan_uuid="five-device-plan",
+        end_date=before_end,
+    )
+
+    with (
+        patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
+        patch("bot.services.subscription_service._adapt_subscription_by_id", new=AsyncMock(return_value=(existing, adapt_record))),
+        patch("bot.services.subscription_service.AdaptAPI") as api_cls,
+        patch("bot.services.subscription_service.renew_adapt_subscription", new=AsyncMock(return_value=True)) as renew,
+    ):
+        api = AsyncMock()
+        api.get_status.side_effect = [
+            {"plan_uuid": "five-device-plan", "end_date": before_end.isoformat(), "devices": 5},
+            {"plan_uuid": "three-device-plan", "end_date": (before_end + timedelta(days=90)).isoformat(), "devices": 3},
+        ]
+        api.list_plans.return_value = [{"uuid": "five-device-plan", "devices": 5}]
+        api_cls.return_value = api
+
+        with pytest.raises(Exception, match="unexpected result"):
+            await _create_adapt_paid_subscription(
+                session,
+                user=user,
+                tariff=tariff,
+                platform=MagicMock(),
+                purchase_action="renew",
+                target_subscription_id=existing.id,
+            )
+
+    renew.assert_awaited_once()
+    assert existing.device_slots == 3
+    session.commit.assert_awaited()
 
 
 @pytest.mark.asyncio

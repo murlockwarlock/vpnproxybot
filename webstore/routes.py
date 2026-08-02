@@ -28,8 +28,16 @@ from bot.services.provisioning_issues import (
 )
 from bot.services.vhq_partner_api import VHQPartnerAPI, VHQPartnerAPIError
 from bot.services.vhq_routing import get_vhq_spec_for_store_tariff
-from bot.services.adapt_api import AdaptAPI, AdaptAPIError
-from bot.services.purchase_intent import calculate_upgrade_price_rub
+from bot.services.adapt_api import (
+    ADAPT_MIN_CUSTOM_RENEW_DAYS,
+    AdaptAPI,
+    AdaptAPIError,
+    can_upgrade_after_minimum_custom_renew,
+)
+from bot.services.purchase_intent import (
+    calculate_upgrade_price_rub,
+    effective_expired_adapt_action,
+)
 try:
     from bot.services.adapt_subscription_proxy import build_adapt_mirror_url
 except (ImportError, Exception):
@@ -82,6 +90,7 @@ def _is_retryable_provision_issue(issue: AccessProvisionError) -> bool:
         "adapt_target_missing",
         "adapt_target_not_found",
         "adapt_renew_plan_mismatch",
+        "adapt_result_mismatch",
         "adapt_upgrade_same_plan",
         "device_requires_plan_upgrade",
         "vhq_request_invalid",
@@ -397,13 +406,15 @@ def _is_adapt_trial_store_tariff(tariff: dict | None) -> bool:
     )
 
 
-def _has_adapt_upgrade_option(tariff: dict | None) -> bool:
+def _has_adapt_upgrade_option(tariff: dict | None, *, allow_any: bool = False) -> bool:
     if not tariff or not str(tariff.get("adapt_plan_uuid") or "").strip():
         return False
+    current_plan_uuid = str(tariff.get("adapt_plan_uuid") or "").strip()
     current_price = int(tariff.get("price_rub") or 0)
     return any(
         str(candidate.get("adapt_plan_uuid") or "").strip()
-        and int(candidate.get("price_rub") or 0) > current_price
+        and str(candidate.get("adapt_plan_uuid") or "").strip() != current_plan_uuid
+        and (allow_any or int(candidate.get("price_rub") or 0) > current_price)
         for candidate in get_store_tariffs()
     )
 
@@ -449,7 +460,13 @@ def _serialize_orders(orders: list[WebOrder]) -> list[dict[str, str | int | None
             "status": o.status,
             "provider": _get_order_provider(o),
             "is_trial": _is_adapt_trial_store_tariff(tariffs_by_key.get(o.tariff_key)),
-            "can_upgrade": _has_adapt_upgrade_option(tariffs_by_key.get(o.tariff_key)),
+            "can_upgrade": _has_adapt_upgrade_option(
+                tariffs_by_key.get(o.tariff_key),
+                allow_any=bool(
+                    o.access_expires_at
+                    and o.access_expires_at <= datetime.utcnow()
+                ),
+            ),
             "adapt_plan_uuid": str((tariffs_by_key.get(o.tariff_key) or {}).get("adapt_plan_uuid") or ""),
             "adapt_uuid": _extract_adapt_uuid_from_web_order(o),
             "subscription_url": _display_order_subscription_url(o),
@@ -486,7 +503,11 @@ def _serialize_telegram_items(items: list[WebTelegramItem]) -> list[dict[str, st
                 tariffs_by_plan.get(str(item.adapt_plan_uuid or "").strip())
             ),
             "can_upgrade": _has_adapt_upgrade_option(
-                tariffs_by_plan.get(str(item.adapt_plan_uuid or "").strip())
+                tariffs_by_plan.get(str(item.adapt_plan_uuid or "").strip()),
+                allow_any=bool(
+                    item.expires_at
+                    and item.expires_at <= datetime.utcnow()
+                ),
             ),
             "target_order_id": (
                 f"tg:{_extract_adapt_uuid(item.key_value, item.external_id)}"
@@ -1271,7 +1292,7 @@ async def _get_profile_bundle(
 
 
 async def _enrich_legacy_telegram_adapt_items(session, items: list[WebTelegramItem]) -> None:
-    """Backfill provider/plan data for Telegram items saved before action support."""
+    """Refresh Telegram Adapt items from the provider before showing actions."""
     api = AdaptAPI()
     changed = False
     for item in items:
@@ -1279,7 +1300,7 @@ async def _enrich_legacy_telegram_adapt_items(session, items: list[WebTelegramIt
         if item.provider != provider:
             item.provider = provider or None
             changed = True
-        if provider != "adapt" or item.adapt_plan_uuid:
+        if provider != "adapt":
             continue
         adapt_uuid = _extract_adapt_uuid(item.key_value, item.external_id)
         if not adapt_uuid or not api.enabled:
@@ -1627,24 +1648,78 @@ async def handle_create_order(request: web.Request) -> web.Response:
                     target_order,
                 )
                 target_order_id = target_order.order_id
-                old_tariff = get_store_tariffs_by_key().get(target_order.tariff_key)
                 target_expires_at = target_order.access_expires_at
             else:
-                old_plan = str(target_telegram_item.adapt_plan_uuid or "").strip()
-                old_tariff = next(
-                    (
-                        candidate for candidate in get_store_tariffs()
-                        if str(candidate.get("adapt_plan_uuid") or "").strip() == old_plan
-                    ),
-                    None,
-                )
                 target_expires_at = target_telegram_item.expires_at
+            # Do not price or label a renew/upgrade from a cached web/Telegram
+            # snapshot.  Adapt is authoritative and legacy fulfillments may
+            # have changed only our local tariff row.
+            try:
+                checkout_api = AdaptAPI()
+                provider_status = await checkout_api.get_status(target_adapt_uuid)
+                provider_plans = await checkout_api.list_plans()
+            except Exception as exc:
+                logger.warning("Cannot verify Adapt target before checkout %s: %s", target_adapt_uuid, exc)
+                return web.json_response(
+                    {
+                        "error": (
+                            "Не удалось проверить выбранную подписку. "
+                            "Попробуйте ещё раз или напишите в поддержку."
+                        )
+                    },
+                    status=503,
+                )
+            old_plan = str(provider_status.get("plan_uuid") or "").strip()
+            old_tariff = next(
+                (
+                    candidate for candidate in get_store_tariffs()
+                    if str(candidate.get("adapt_plan_uuid") or "").strip() == old_plan
+                ),
+                None,
+            )
+            if provider_status.get("end_date"):
+                target_expires_at = _adapt_expires_at_from_response(provider_status, 0)
+            if target_telegram_item:
+                target_telegram_item.adapt_plan_uuid = old_plan or target_telegram_item.adapt_plan_uuid
+                if provider_status.get("devices") is not None:
+                    target_telegram_item.device_slots = int(provider_status["devices"])
+                if target_expires_at:
+                    target_telegram_item.expires_at = target_expires_at
+                target_telegram_item.updated_at = datetime.utcnow()
             old_plan_uuid = str((old_tariff or {}).get("adapt_plan_uuid") or "").strip()
             new_plan_uuid = str(tariff.get("adapt_plan_uuid") or "").strip()
+            new_provider_plan = next(
+                (
+                    item for item in provider_plans
+                    if str(item.get("uuid") or item.get("plan_uuid") or "").strip() == new_plan_uuid
+                ),
+                None,
+            )
+            old_provider_plan = next(
+                (
+                    item for item in provider_plans
+                    if str(item.get("uuid") or item.get("plan_uuid") or "").strip() == old_plan_uuid
+                ),
+                None,
+            )
             if not old_plan_uuid or not new_plan_uuid:
                 return web.json_response(
                     {"error": "Для этой подписки продление и улучшение через сайт сейчас недоступны"},
                     status=400,
+                )
+            if (
+                not new_provider_plan
+                or new_provider_plan.get("devices") is None
+                or new_provider_plan.get("is_active") is False
+            ):
+                return web.json_response(
+                    {
+                        "error": (
+                            "Выбранный тариф временно недоступен. "
+                            "Попробуйте позже или напишите в поддержку."
+                        )
+                    },
+                    status=503,
                 )
             try:
                 purchase_action = _effective_adapt_purchase_action(
@@ -1652,6 +1727,13 @@ async def handle_create_order(request: web.Request) -> web.Response:
                 )
             except ValueError as exc:
                 return web.json_response({"error": str(exc)}, status=400)
+            if not _is_adapt_trial_store_tariff(old_tariff):
+                purchase_action = effective_expired_adapt_action(
+                    purchase_action,
+                    current_plan_uuid=old_plan_uuid,
+                    selected_plan_uuid=new_plan_uuid,
+                    expires_at=target_expires_at,
+                )
             if purchase_action == "renew" and old_plan_uuid != new_plan_uuid:
                 return web.json_response(
                     {"error": "Для продления выберите тот же тариф. Для более дорогого используйте «Улучшить»."},
@@ -1660,16 +1742,34 @@ async def handle_create_order(request: web.Request) -> web.Response:
             if purchase_action == "upgrade":
                 if old_plan_uuid == new_plan_uuid:
                     return web.json_response({"error": "Эта подписка уже на выбранном тарифе"}, status=400)
-                if int(tariff["price_rub"]) <= int(old_tariff["price_rub"]):
-                    return web.json_response({"error": "Улучшение доступно только на более дорогой тариф"}, status=400)
-                if not target_expires_at or target_expires_at <= datetime.utcnow():
-                    return web.json_response({"error": "Улучшить можно только активную подписку"}, status=400)
-                original_amount_rub = calculate_upgrade_price_rub(
-                    current_price_rub=float(old_tariff["price_rub"]),
-                    current_days=int(old_tariff["days"]),
-                    new_price_rub=float(tariff["price_rub"]),
-                    expires_at=target_expires_at,
+                target_is_expired = bool(
+                    not target_expires_at
+                    or target_expires_at <= datetime.utcnow()
                 )
+                if target_is_expired:
+                    if not can_upgrade_after_minimum_custom_renew(
+                        old_provider_plan,
+                        new_provider_plan,
+                    ):
+                        return web.json_response(
+                            {
+                                "error": (
+                                    "На этот тариф нельзя перейти с сохранением ссылки. "
+                                    "Выберите «Создать новую» или другой тариф."
+                                )
+                            },
+                            status=400,
+                        )
+                    original_amount_rub = int(tariff["price_rub"])
+                else:
+                    if int(tariff["price_rub"]) <= int(old_tariff["price_rub"]):
+                        return web.json_response({"error": "Улучшение доступно только на более дорогой тариф"}, status=400)
+                    original_amount_rub = calculate_upgrade_price_rub(
+                        current_price_rub=float(old_tariff["price_rub"]),
+                        current_days=int(old_tariff["days"]),
+                        new_price_rub=float(tariff["price_rub"]),
+                        expires_at=target_expires_at,
+                    )
                 if original_amount_rub <= 0:
                     return web.json_response(
                         {"error": "Переход на этот тариф сейчас невозможен"},
@@ -2444,24 +2544,74 @@ async def _fulfill_adapt_order(session, order: WebOrder, adapt_plan_uuid: str) -
         try:
             api = AdaptAPI()
             already_applied = False
-            status_before: dict = {}
-            if int(order.fulfillment_attempts or 0) > 1:
-                status_before = await api.get_status(adapt_uuid)
-                status_plan_uuid = str(status_before.get("plan_uuid") or "").strip()
-                status_expires_at = (
-                    _adapt_expires_at_from_response(status_before, 0)
-                    if status_before.get("end_date")
-                    else None
+            status_before = await api.get_status(adapt_uuid)
+            plans = await api.list_plans()
+            target_plan = next(
+                (
+                    item for item in plans
+                    if str(item.get("uuid") or item.get("plan_uuid") or "").strip() == adapt_plan_uuid
+                ),
+                None,
+            )
+            expected_devices = target_plan.get("devices") if target_plan else None
+            if (
+                expected_devices is None
+                or (target_plan and target_plan.get("is_active") is False)
+            ):
+                raise build_internal_access_error(
+                    provider="adapt",
+                    code="adapt_target_plan_unavailable",
+                    admin_message=(
+                        f"Adapt target plan is unavailable for web order {order.order_id}: "
+                        f"target_plan={adapt_plan_uuid}"
+                    ),
+                    client_message=(
+                        "Оплата получена, но выбранный тариф временно недоступен у провайдера. "
+                        "Мы уже получили уведомление и разберёмся."
+                    ),
                 )
-                if action == "upgrade" and status_plan_uuid == adapt_plan_uuid:
-                    already_applied = True
-                elif (
-                    action == "renew"
-                    and order.target_snapshot_expires_at
-                    and status_expires_at
-                    and status_expires_at > order.target_snapshot_expires_at + timedelta(seconds=30)
-                ):
-                    already_applied = True
+            status_plan_uuid = str(status_before.get("plan_uuid") or "").strip()
+            status_expires_at = (
+                _adapt_expires_at_from_response(status_before, 0)
+                if status_before.get("end_date")
+                else None
+            )
+            if action == "renew" and status_plan_uuid != adapt_plan_uuid:
+                issue = build_internal_access_error(
+                    provider="adapt",
+                    code="adapt_renew_plan_mismatch",
+                    admin_message=(
+                        f"Refusing web Adapt renew on stale plan for order {order.order_id}: "
+                        f"provider_plan={status_plan_uuid} requested_plan={adapt_plan_uuid}"
+                    ),
+                    client_message=(
+                        "Оплата получена, но состояние подписки изменилось. "
+                        "Мы уже получили уведомление и разберёмся."
+                    ),
+                )
+                await _mark_order_failed(order, issue)
+                return
+            if action == "upgrade" and status_plan_uuid == adapt_plan_uuid:
+                already_applied = True
+            elif (
+                action == "renew"
+                and int(order.fulfillment_attempts or 0) > 1
+                and order.target_snapshot_expires_at
+                and status_expires_at
+                and status_expires_at > order.target_snapshot_expires_at + timedelta(seconds=30)
+            ):
+                already_applied = True
+
+            reactivation_already_applied = bool(
+                action == "upgrade"
+                and int(order.fulfillment_attempts or 0) > 1
+                and status_plan_uuid != adapt_plan_uuid
+                and status_plan_uuid == str(order.target_snapshot_plan_uuid or "").strip()
+                and order.target_snapshot_expires_at
+                and order.target_snapshot_expires_at <= datetime.utcnow()
+                and status_expires_at
+                and status_expires_at > order.target_snapshot_expires_at + timedelta(seconds=30)
+            )
 
             if already_applied:
                 resp = status_before
@@ -2475,15 +2625,93 @@ async def _fulfill_adapt_order(session, order: WebOrder, adapt_plan_uuid: str) -
             elif action == "renew":
                 resp = await api.renew_subscription(adapt_uuid)
             else:
+                if (
+                    status_expires_at
+                    and status_expires_at <= datetime.utcnow()
+                    and not reactivation_already_applied
+                ):
+                    await api.renew_subscription_custom(
+                        adapt_uuid,
+                        ADAPT_MIN_CUSTOM_RENEW_DAYS,
+                    )
+                    reactivated_status = await api.get_status(adapt_uuid)
+                    reactivated_plan_uuid = str(
+                        reactivated_status.get("plan_uuid") or ""
+                    ).strip()
+                    reactivated_expires_at = (
+                        _adapt_expires_at_from_response(reactivated_status, 0)
+                        if reactivated_status.get("end_date")
+                        else None
+                    )
+                    if (
+                        reactivated_plan_uuid != status_plan_uuid
+                        or not reactivated_expires_at
+                        or reactivated_expires_at <= datetime.utcnow()
+                    ):
+                        raise build_internal_access_error(
+                            provider="adapt",
+                            code="adapt_reactivation_mismatch",
+                            admin_message=(
+                                f"Adapt custom renewal did not reactivate expected plan "
+                                f"for web order {order.order_id}: expected={status_plan_uuid} "
+                                f"actual={reactivated_plan_uuid or 'missing'}"
+                            ),
+                            client_message=(
+                                "Оплата получена, но провайдер не подтвердил изменение подписки. "
+                                "Мы уже получили уведомление и разберёмся."
+                            ),
+                        )
+                    if primary:
+                        primary.access_expires_at = reactivated_expires_at
+                    if target_telegram_item:
+                        target_telegram_item.expires_at = reactivated_expires_at
+                        target_telegram_item.status = "active"
+                        target_telegram_item.updated_at = datetime.utcnow()
+                    _web_plog(
+                        "WEB_РЕАКТИВАЦИЯ",
+                        order_id=order.order_id,
+                        tariff=order.tariff_label,
+                        provider="adapt",
+                        context=f"action=upgrade adapt_uuid={adapt_uuid}",
+                    )
+                elif reactivation_already_applied:
+                    _web_plog(
+                        "WEB_ВЫДАЧА_СВЕРКА",
+                        order_id=order.order_id,
+                        tariff=order.tariff_label,
+                        provider="adapt",
+                        context=f"action=upgrade_reactivation adapt_uuid={adapt_uuid}",
+                    )
                 resp = await api.upgrade_subscription(adapt_uuid, adapt_plan_uuid)
-                try:
-                    status_resp = await api.get_status(adapt_uuid)
-                    resp = {
-                        **resp,
-                        **{key: value for key, value in status_resp.items() if value is not None},
-                    }
-                except Exception as status_exc:
-                    logger.warning("Adapt status refresh failed after web upgrade %s: %s", adapt_uuid, status_exc)
+            verified_status = status_before if already_applied else await api.get_status(adapt_uuid)
+            verified_plan_uuid = str(verified_status.get("plan_uuid") or "").strip()
+            verified_devices = verified_status.get("devices")
+            if (
+                verified_plan_uuid != adapt_plan_uuid
+                or verified_devices is None
+                or int(verified_devices) != int(expected_devices)
+            ):
+                raise build_internal_access_error(
+                    provider="adapt",
+                    code="adapt_result_mismatch",
+                    admin_message=(
+                        f"Adapt result mismatch for web order {order.order_id}: "
+                        f"expected_plan={adapt_plan_uuid} actual_plan={verified_plan_uuid or 'missing'} "
+                        f"expected_devices={expected_devices} actual_devices={verified_devices}"
+                    ),
+                    client_message=(
+                        "Оплата получена, но провайдер не подтвердил выбранный тариф. "
+                        "Мы уже получили уведомление и разберёмся."
+                    ),
+                )
+            resp = {
+                **resp,
+                **{key: value for key, value in verified_status.items() if value is not None},
+            }
+        except AccessProvisionError as issue:
+            logger.error(issue.admin_message)
+            await _mark_order_failed(order, issue)
+            return
         except AdaptAPIError as exc:
             issue = build_internal_access_error(
                 provider="adapt",

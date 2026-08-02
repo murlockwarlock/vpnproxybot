@@ -169,6 +169,11 @@ async def test_fulfill_adapt_order_renews_existing_same_tariff():
     with patch("webstore.routes.AdaptAPI") as mock_cls:
         mock_api = AsyncMock()
         mock_api.renew_subscription = AsyncMock(return_value={"end_date": "2026-07-01T00:00:00Z"})
+        mock_api.get_status = AsyncMock(side_effect=[
+            {"plan_uuid": "plan-test-uuid", "end_date": "2026-06-01T00:00:00Z", "devices": 3},
+            {"plan_uuid": "plan-test-uuid", "end_date": "2026-07-01T00:00:00Z", "devices": 3},
+        ])
+        mock_api.list_plans = AsyncMock(return_value=[{"uuid": "plan-test-uuid", "devices": 3}])
         mock_api.create_subscription = AsyncMock()
         mock_cls.return_value = mock_api
 

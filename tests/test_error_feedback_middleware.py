@@ -61,3 +61,32 @@ async def test_expired_callback_is_only_logged_without_user_or_staff_alert(monke
     callback.answer.assert_not_awaited()
     callback.message.answer.assert_not_awaited()
     notify_staff.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unchanged_message_is_acknowledged_without_staff_alert(monkeypatch):
+    callback = SimpleNamespace(
+        from_user=SimpleNamespace(id=123),
+        answer=AsyncMock(),
+        message=SimpleNamespace(answer=AsyncMock()),
+    )
+    event = SimpleNamespace(callback_query=callback, message=None)
+    notify_staff = AsyncMock()
+    monkeypatch.setattr(error_feedback, "notify_admins_issue", notify_staff)
+
+    async def failing_handler(_event, _data):
+        raise TelegramBadRequest(
+            method=SimpleNamespace(),
+            message="Bad Request: message is not modified",
+        )
+
+    result = await error_feedback.ErrorFeedbackMiddleware()(
+        failing_handler,
+        event,
+        {"bot": AsyncMock()},
+    )
+
+    assert result is None
+    callback.answer.assert_awaited_once()
+    callback.message.answer.assert_not_awaited()
+    notify_staff.assert_not_awaited()

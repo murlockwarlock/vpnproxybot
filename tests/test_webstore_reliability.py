@@ -91,6 +91,7 @@ async def test_adapt_renew_retry_reconciles_without_second_mutation(monkeypatch,
             "end_date": new_end.isoformat(),
             "devices": 5,
         }
+        api.list_plans.return_value = [{"uuid": "plan-old", "devices": 5}]
         monkeypatch.setattr(routes, "AdaptAPI", lambda: api)
         monkeypatch.setattr(
             routes,
