@@ -54,7 +54,7 @@ from bot.services.subscription_service import (
     create_mtproto_subscription,
     create_or_extend_paid_access,
 )
-from bot.services.purchase_intent import decode_intent, get_purchase_price_rub
+from bot.services.purchase_intent import decode_intent, encode_intent, get_purchase_price_rub
 from bot.services.tariff_rules import (
     INTRO_BASIC_ALREADY_USED_TEXT,
     can_purchase_intro_basic_tariff,
@@ -111,6 +111,20 @@ def _purchase_access_kwargs(platform_str: str) -> dict:
         "purchase_action": action,
         "target_subscription_id": target_subscription_id,
     }
+
+
+def _payment_method_back_callback(tariff_id: int, platform_str: str) -> str:
+    """Reopen the exact tariff payment-method screen after an external invoice."""
+    _, action, target_subscription_id = decode_intent(platform_str)
+    if action == "auto":
+        return f"tariff_{tariff_id}"
+    return f"tariff_{encode_intent(str(tariff_id), action, target_subscription_id)}"
+
+
+def _single_back_kb(callback_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=callback_data)],
+    ])
 
 
 def _delivery_platform_kb(subscription_id: int) -> InlineKeyboardMarkup:
@@ -661,7 +675,7 @@ async def initiate_yookassa_topup(callback: CallbackQuery) -> None:
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить через ЮKassa", url=payment.confirmation.confirmation_url)],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"balance_amount_{amount_rub}")],
         ]),
     )
     await callback.answer()
@@ -698,7 +712,7 @@ async def initiate_robokassa_topup(callback: CallbackQuery) -> None:
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить через Robokassa", url=payment_url)],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"balance_amount_{amount_rub}")],
         ]),
     )
     await callback.answer()
@@ -1267,7 +1281,9 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
         logger.error(f"Failed to create YooKassa payment: {exc}")
         await callback.message.answer(
             "❌ Ошибка создания платежа. Попробуйте позже или используйте другой способ оплаты.",
-            reply_markup=back_to_menu_kb(),
+            reply_markup=_single_back_kb(
+                _payment_method_back_callback(tariff_id, platform_str)
+            ),
         )
         await callback.answer()
         return
@@ -1286,7 +1302,10 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить через ЮKassa", url=confirmation_url)],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
+            [InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=_payment_method_back_callback(tariff_id, platform_str),
+            )],
         ]),
     )
     await callback.answer()
@@ -1386,7 +1405,10 @@ async def initiate_robokassa_payment(callback: CallbackQuery) -> None:
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить через Robokassa", url=payment_url)],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
+            [InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=_payment_method_back_callback(tariff_id, platform_str),
+            )],
         ]),
     )
     await callback.answer()

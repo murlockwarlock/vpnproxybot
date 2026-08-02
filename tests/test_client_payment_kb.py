@@ -135,3 +135,12 @@ def test_trial_carousel_omits_upgrade_action():
     )
     assert "↻ Продлить" in texts
     assert "↑ Улучшить" not in texts
+
+
+def test_external_payment_back_reopens_same_payment_method_screen():
+    from bot.handlers.payment import _payment_method_back_callback
+
+    assert _payment_method_back_callback(17, "deferred~r~197") == "tariff_17~r~197"
+    assert _payment_method_back_callback(17, "deferred~u~197") == "tariff_17~u~197"
+    assert _payment_method_back_callback(17, "deferred~n~197") == "tariff_17~n~197"
+    assert _payment_method_back_callback(17, "deferred") == "tariff_17"
