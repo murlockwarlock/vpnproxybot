@@ -170,17 +170,10 @@ async def test_upgrade_menu_hides_admin_only_tariffs(db_session_factory):
     sub_id, hidden_id, public_id = ids
     callback = _make_callback(current.id)
     callback.data = f"purchase_upgrade_{sub_id}"
-    api = AsyncMock()
-    api.list_plans.return_value = [
-        {"uuid": "plan-current", "is_active": True},
-        {"uuid": "plan-public", "is_active": True},
-        {"uuid": "plan-hidden", "is_active": True},
-    ]
     with (
         patch("bot.handlers.buy.async_session", db_session_factory),
         patch("bot.handlers.buy.settings.is_admin", return_value=False),
         patch("bot.handlers.buy._get_stars_enabled", new_callable=AsyncMock, return_value=False),
-        patch("bot.handlers.buy.AdaptAPI", return_value=api),
     ):
         await buy_handler.choose_upgrade_target(callback)
 
@@ -204,7 +197,6 @@ async def test_upgrade_menu_hides_admin_only_tariffs(db_session_factory):
     assert "Стоимость: <b>100 ₽</b>" in text
     assert "Использовано:" in text
     assert "Остаточная стоимость:" in text
-    api.list_plans.assert_not_awaited()
 
 
 async def test_expired_subscription_tariff_choice_includes_same_and_cheaper_tariff(db_session_factory):
@@ -246,17 +238,10 @@ async def test_expired_subscription_tariff_choice_includes_same_and_cheaper_tari
 
     callback = _make_callback(current.id, user_id=100502)
     callback.data = f"purchase_upgrade_{sub_id}"
-    api = AsyncMock()
-    api.list_plans.return_value = [
-        {"uuid": "plan-annual", "is_active": True, "price_usd": 12, "days": 365},
-        {"uuid": "plan-monthly", "is_active": True, "price_usd": 1, "days": 30},
-        {"uuid": "plan-impossible", "is_active": True, "price_usd": 0.05, "days": 7},
-    ]
     with (
         patch("bot.handlers.buy.async_session", db_session_factory),
         patch("bot.handlers.buy.settings.is_admin", return_value=False),
         patch("bot.handlers.buy._get_stars_enabled", new_callable=AsyncMock, return_value=False),
-        patch("bot.handlers.buy.AdaptAPI", return_value=api),
     ):
         await buy_handler._open_expired_tariff_choice(callback, sub_id)
 
@@ -270,7 +255,6 @@ async def test_expired_subscription_tariff_choice_includes_same_and_cheaper_tari
     assert f"tariff_{current_id}~u~{sub_id}" in callbacks
     assert f"tariff_{cheaper_id}~u~{sub_id}" in callbacks
     assert f"tariff_{impossible_id}~u~{sub_id}" in callbacks
-    api.list_plans.assert_not_awaited()
 
 
 async def test_expired_paid_renew_button_opens_all_tariffs(db_session_factory):
@@ -363,7 +347,7 @@ async def test_purchase_carousel_contains_only_public_adapt_subscriptions(db_ses
     assert [target.id for target in targets] == [public_id]
 
 
-async def test_purchase_target_refreshes_stale_adapt_plan_during_preflight(db_session_factory):
+async def test_purchase_targets_do_not_call_adapt_before_payment(db_session_factory):
     from bot.handlers import buy as buy_handler
 
     provider_end = datetime.utcnow() + timedelta(days=120)
@@ -396,36 +380,25 @@ async def test_purchase_target_refreshes_stale_adapt_plan_during_preflight(db_se
         ))
         await session.commit()
         subscription_id = subscription.id
-        tariff_3_id = tariff_3.id
+        tariff_5_id = tariff_5.id
 
-    api = AsyncMock()
-    api.get_status.return_value = {
-        "plan_uuid": "plan-3",
-        "devices": 3,
-        "end_date": provider_end.isoformat(),
-    }
     with (
         patch("bot.handlers.buy.async_session", db_session_factory),
         patch("bot.handlers.buy.settings.is_admin", return_value=False),
-        patch("bot.handlers.buy.AdaptAPI", return_value=api),
     ):
-        targets = await buy_handler._purchase_targets(
-            100501,
-            refresh_provider=True,
-            target_subscription_id=subscription_id,
-        )
+        targets = await buy_handler._purchase_targets(100501)
 
     assert [target.id for target in targets] == [subscription_id]
-    assert targets[0].tariff_id == tariff_3_id
-    assert targets[0].device_slots == 3
+    assert targets[0].tariff_id == tariff_5_id
+    assert targets[0].device_slots == 5
     async with db_session_factory() as session:
         stored = await session.get(Subscription, subscription_id)
         adapt = await session.scalar(
             select(AdaptSubscription).where(AdaptSubscription.subscription_id == subscription_id)
         )
-        assert stored.tariff_id == tariff_3_id
-        assert stored.device_slots == 3
-        assert adapt.adapt_plan_uuid == "plan-3"
+        assert stored.tariff_id == tariff_5_id
+        assert stored.device_slots == 5
+        assert adapt.adapt_plan_uuid == "plan-5"
 
 
 async def test_purchase_targets_hide_separate_upgrade_for_expired_adapt_subscription(db_session_factory):
@@ -464,20 +437,9 @@ async def test_purchase_targets_hide_separate_upgrade_for_expired_adapt_subscrip
         await session.commit()
         subscription_id = subscription.id
 
-    api = AsyncMock()
-    api.get_status.return_value = {
-        "plan_uuid": "plan-annual",
-        "devices": 5,
-        "end_date": expired_end.isoformat(),
-    }
-    api.list_plans.return_value = [
-        {"uuid": "plan-annual", "devices": 5, "is_active": True},
-        {"uuid": "plan-monthly", "devices": 1, "is_active": True},
-    ]
     with (
         patch("bot.handlers.buy.async_session", db_session_factory),
         patch("bot.handlers.buy.settings.is_admin", return_value=False),
-        patch("bot.handlers.buy.AdaptAPI", return_value=api),
     ):
         targets = await buy_handler._purchase_targets(100503, upgrade_only=True)
 
@@ -759,17 +721,10 @@ async def test_trial_renewal_shows_public_paid_plans_with_upgrade_intent(db_sess
         sub_id, public_id, hidden_id = subscription.id, public.id, hidden.id
 
     callback = _FrozenCallback(f"purchase_renew_{sub_id}")
-    api = AsyncMock()
-    api.list_plans.return_value = [
-        {"uuid": "trial-plan", "is_active": True, "price_usd": 0.4, "days": 7},
-        {"uuid": "public-plan", "is_active": True, "price_usd": 0.8, "days": 14},
-        {"uuid": "hidden-plan", "is_active": True, "price_usd": 1, "days": 14},
-    ]
     with (
         patch("bot.handlers.buy.async_session", db_session_factory),
         patch("bot.handlers.buy.settings.is_admin", return_value=False),
         patch("bot.handlers.buy._get_stars_enabled", new_callable=AsyncMock, return_value=False),
-        patch("bot.handlers.buy.AdaptAPI", return_value=api),
     ):
         await buy_handler.choose_renew_target(callback)
 
@@ -784,7 +739,6 @@ async def test_trial_renewal_shows_public_paid_plans_with_upgrade_intent(db_sess
     assert f"tariff_{public_id}~u~{sub_id}" in callbacks
     assert all(str(hidden_id) not in value for value in callbacks)
     assert callback.data == f"purchase_renew_{sub_id}"
-    api.list_plans.assert_not_awaited()
 
 
 async def test_subscription_count_text_is_explicit():

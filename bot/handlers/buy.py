@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime
 from html import escape
 from urllib.parse import urlparse
 
@@ -27,7 +26,6 @@ from bot.keyboards.client import (
     purchase_target_kb,
 )
 from bot.models import (
-    AdaptSubscription,
     BotSettings,
     Partner,
     Payment,
@@ -37,11 +35,6 @@ from bot.models import (
     Tariff,
     TariffType,
     User,
-)
-from bot.services.adapt_api import (
-    AdaptAPI,
-    can_upgrade_after_minimum_custom_renew,
-    retry_adapt_read,
 )
 from bot.services.balance_service import get_user_balance
 from bot.services.legal_docs import build_legal_notice, get_all_legal_doc_urls
@@ -355,7 +348,6 @@ async def browse_purchase_subscriptions(callback: CallbackQuery) -> None:
         for item in await _purchase_targets(
             callback.from_user.id,
             upgrade_only=True,
-            refresh_provider=False,
         )
     }
     try:
@@ -402,7 +394,6 @@ async def return_to_purchase_subscription(callback: CallbackQuery) -> None:
         for item in await _purchase_targets(
             callback.from_user.id,
             upgrade_only=True,
-            refresh_provider=False,
         )
     }
     sub = targets[position]
@@ -491,8 +482,6 @@ async def _purchase_targets(
     telegram_id: int,
     *,
     upgrade_only: bool = False,
-    refresh_provider: bool = False,
-    target_subscription_id: int | None = None,
 ) -> list[Subscription]:
     async with async_session() as session:
         query = (
@@ -502,87 +491,8 @@ async def _purchase_targets(
             .where(paid_access_clause(Subscription))
             .order_by(Subscription.expires_at.desc(), Subscription.id.desc())
         )
-        if target_subscription_id is not None:
-            query = query.where(Subscription.id == target_subscription_id)
         result = await session.execute(query)
         items = result.scalars().all()
-        adapt_items = [sub for sub in items if is_adapt_subscription(sub)]
-        if adapt_items and refresh_provider:
-            record_rows = await session.execute(
-                select(AdaptSubscription).where(
-                    AdaptSubscription.subscription_id.in_([sub.id for sub in adapt_items])
-                )
-            )
-            records = {row.subscription_id: row for row in record_rows.scalars().all()}
-            tariff_rows = await session.execute(
-                select(Tariff).where(Tariff.adapt_plan_uuid.is_not(None))
-            )
-            tariffs_by_plan = {
-                str(row.adapt_plan_uuid).strip(): row for row in tariff_rows.scalars().all()
-            }
-            api = AdaptAPI()
-            verified_ids: set[int] = set()
-            changed = False
-            status_targets = []
-            for sub in adapt_items:
-                record = records.get(sub.id)
-                if not record:
-                    # Legacy provider markers without an Adapt UUID cannot be
-                    # refreshed here; the paid-operation preflight still blocks
-                    # an unsafe mutation later.
-                    verified_ids.add(sub.id)
-                    continue
-                status_targets.append((sub, record))
-            statuses = await asyncio.gather(
-                *(
-                    retry_adapt_read(
-                        lambda record=record: api.get_status(record.adapt_uuid),
-                        label=f"subscription_status:{_sub.id}",
-                    )
-                    for _sub, record in status_targets
-                ),
-                return_exceptions=True,
-            )
-            for (sub, record), status in zip(status_targets, statuses):
-                try:
-                    if isinstance(status, BaseException):
-                        raise status
-                    plan_uuid = str(status.get("plan_uuid") or "").strip()
-                    devices = status.get("devices")
-                    end_raw = status.get("end_date")
-                    actual_tariff = tariffs_by_plan.get(plan_uuid)
-                    if not plan_uuid or devices is None or not end_raw or not actual_tariff:
-                        raise ValueError("provider status is incomplete or plan is not mapped")
-                    expires_at = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
-                    if expires_at.tzinfo is not None:
-                        expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
-                except Exception as exc:
-                    logger.warning(
-                        "Hiding unverified Adapt subscription from purchase actions: subscription_id=%s error=%s",
-                        sub.id,
-                        exc,
-                    )
-                    continue
-                verified_ids.add(sub.id)
-                if record.adapt_plan_uuid != plan_uuid:
-                    record.adapt_plan_uuid = plan_uuid
-                    changed = True
-                if sub.tariff_id != actual_tariff.id:
-                    sub.tariff_id = actual_tariff.id
-                    sub.tariff = actual_tariff
-                    sub.tariff_days = actual_tariff.days
-                    sub.tariff_months = actual_tariff.days // 30
-                    changed = True
-                if sub.device_slots != int(devices):
-                    sub.device_slots = int(devices)
-                    changed = True
-                if sub.expires_at != expires_at:
-                    sub.expires_at = expires_at
-                    record.end_date = expires_at
-                    changed = True
-            items = [sub for sub in items if not is_adapt_subscription(sub) or sub.id in verified_ids]
-            if changed:
-                await session.commit()
         upgrade_tariffs: list[tuple[str, float]] = []
         if upgrade_only:
             tariff_query = (
@@ -1059,26 +969,11 @@ async def _select_tariff_token(callback: CallbackQuery, encoded_tariff: str) -> 
     tariff_token, purchase_action, target_subscription_id = decode_intent(encoded_tariff)
     requested_purchase_action = purchase_action
     tariff_id = int(tariff_token)
-    callback_answered = False
-
-    async def respond(text: str | None = None, *, show_alert: bool = False) -> None:
-        nonlocal callback_answered
-        if not callback_answered:
-            await callback.answer(text, show_alert=show_alert)
-            callback_answered = True
-        elif text:
-            await callback.message.answer(text)
-
     if purchase_action in {"renew", "upgrade"}:
-        await respond("Проверяю подписку…")
-        verified_targets = await _purchase_targets(
-            callback.from_user.id,
-            refresh_provider=True,
-            target_subscription_id=target_subscription_id,
-        )
-        if not any(sub.id == target_subscription_id for sub in verified_targets):
-            await respond(
-                "Не удалось проверить выбранную подписку. Попробуйте ещё раз или напишите в поддержку.",
+        targets = await _purchase_targets(callback.from_user.id)
+        if not any(sub.id == target_subscription_id for sub in targets):
+            await callback.answer(
+                "Выбранная подписка не найдена. Попробуйте ещё раз или напишите в поддержку.",
                 show_alert=True,
             )
             return
@@ -1088,46 +983,14 @@ async def _select_tariff_token(callback: CallbackQuery, encoded_tariff: str) -> 
         has_product_types = await _has_non_vpn_tariffs(session, user_id=callback.from_user.id)
         user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
         if not tariff:
-            await respond("Тариф не найден", show_alert=True)
+            await callback.answer("Тариф не найден", show_alert=True)
             return
         if not tariff.is_active:
-            await respond("Этот тариф больше недоступен", show_alert=True)
+            await callback.answer("Этот тариф больше недоступен", show_alert=True)
             return
         if tariff.is_admin_only and not settings.is_admin(callback.from_user.id):
-            await respond("Этот тариф больше недоступен", show_alert=True)
+            await callback.answer("Этот тариф больше недоступен", show_alert=True)
             return
-        if tariff.adapt_plan_uuid:
-            await respond("Проверяю тариф…")
-            try:
-                provider_plans = await retry_adapt_read(
-                    lambda: AdaptAPI().list_plans(),
-                    label=f"selected_plan:{tariff.id}",
-                )
-                provider_plan = next(
-                    (
-                        item for item in provider_plans
-                        if str(item.get("uuid") or item.get("plan_uuid") or "").strip()
-                        == str(tariff.adapt_plan_uuid).strip()
-                    ),
-                    None,
-                )
-                if (
-                    not provider_plan
-                    or provider_plan.get("devices") is None
-                    or provider_plan.get("is_active") is False
-                ):
-                    raise ValueError("provider plan is unavailable")
-            except Exception as exc:
-                logger.warning(
-                    "Blocking unavailable Adapt tariff before payment: tariff_id=%s error=%s",
-                    tariff.id,
-                    exc,
-                )
-                await respond(
-                    "Не удалось проверить тариф. Попробуйте ещё раз или напишите в поддержку.",
-                    show_alert=True,
-                )
-                return
         if purchase_action == "upgrade" and target_subscription_id:
             target = await session.get(Subscription, target_subscription_id)
             current_tariff = (
@@ -1142,31 +1005,6 @@ async def _select_tariff_token(callback: CallbackQuery, encoded_tariff: str) -> 
                     selected_plan_uuid=tariff.adapt_plan_uuid,
                     expires_at=target.expires_at,
                 )
-            if (
-                target
-                and current_tariff
-                and target.expires_at <= datetime.utcnow()
-                and purchase_action == "upgrade"
-            ):
-                current_provider_plan = next(
-                    (
-                        item
-                        for item in provider_plans
-                        if str(item.get("uuid") or item.get("plan_uuid") or "").strip()
-                        == str(current_tariff.adapt_plan_uuid or "").strip()
-                    ),
-                    None,
-                )
-                if not can_upgrade_after_minimum_custom_renew(
-                    current_provider_plan,
-                    provider_plan,
-                ):
-                    await respond(
-                        "На этот тариф нельзя перейти с сохранением ссылки. "
-                        "Выберите «Создать новую» или другой тариф.",
-                        show_alert=True,
-                    )
-                    return
         intro_basic_available = await can_purchase_intro_basic_tariff(session, user=user, tariff=tariff)
         try:
             purchase_price = await get_purchase_price_rub(
@@ -1174,11 +1012,11 @@ async def _select_tariff_token(callback: CallbackQuery, encoded_tariff: str) -> 
                 target_subscription_id=target_subscription_id,
             )
         except ValueError as exc:
-            await respond(str(exc), show_alert=True)
+            await callback.answer(str(exc), show_alert=True)
             return
 
     if not intro_basic_available:
-        await respond(INTRO_BASIC_ALREADY_USED_TEXT, show_alert=True)
+        await callback.answer(INTRO_BASIC_ALREADY_USED_TEXT, show_alert=True)
         return
 
     # Keep the exact purchase context when returning from the payment screen.
@@ -1230,7 +1068,7 @@ async def _select_tariff_token(callback: CallbackQuery, encoded_tariff: str) -> 
         except TelegramBadRequest as e:
             if "message is not modified" not in str(e):
                 raise
-        await respond()
+        await callback.answer()
         return
 
     # VPN or Both — platform is selected after successful payment, before key delivery.
@@ -1255,7 +1093,6 @@ async def _select_tariff_token(callback: CallbackQuery, encoded_tariff: str) -> 
                 price=price_str,
                 legal_notice=build_legal_notice(legal_urls),
             )
-            + "\nПосле оплаты бот предложит выбрать устройство и отправит ключ с нужной инструкцией.\n"
             + build_tariff_purchase_note(tariff, darimiru=_is_darimiru_tariff_catalog())
             + partner_discount_text,
             reply_markup=payment_kb(
@@ -1273,7 +1110,7 @@ async def _select_tariff_token(callback: CallbackQuery, encoded_tariff: str) -> 
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e):
             raise
-    await respond()
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("plat_"))

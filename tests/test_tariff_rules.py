@@ -40,10 +40,26 @@ def test_extra_devices_are_supported_only_for_non_vhq_vpn_tariffs():
     assert supports_extra_devices(vhq_tariff) is False
     assert "можно докупить дополнительные устройства" in build_tariff_purchase_note(marzban_tariff).lower()
     assert "доступны только для тарифов на наших серверах" in build_tariff_purchase_note(vhq_tariff).lower()
-    assert "только на <b>1 устройство</b>" in build_tariff_purchase_note(vhq_tariff, darimiru=True).lower()
+    assert "на <b>1 устройство</b>" in build_tariff_purchase_note(vhq_tariff, darimiru=True).lower()
 
 
 def test_payment_note_mentions_three_devices_for_premium():
     premium_tariff = SimpleNamespace(label="Премиум • 30 дн", days=30, price_rub=249, tariff_type=TariffType.VPN)
 
     assert "на <b>3 устройства</b>" in build_tariff_purchase_note(premium_tariff, darimiru=True).lower()
+
+
+def test_payment_note_uses_selected_tariff_device_count():
+    tariff_3 = SimpleNamespace(
+        label="Базовый • 365 дн • 3📱• 474 Гб⚡️",
+        device_count=3,
+        tariff_type=TariffType.VPN,
+    )
+    tariff_5 = SimpleNamespace(
+        label="Базовый • 365 дн • 5📱• 549 Гб⚡️",
+        device_count=5,
+        tariff_type=TariffType.VPN,
+    )
+
+    assert "на <b>3 устройства</b>" in build_tariff_purchase_note(tariff_3, darimiru=True)
+    assert "на <b>5 устройств</b>" in build_tariff_purchase_note(tariff_5, darimiru=True)

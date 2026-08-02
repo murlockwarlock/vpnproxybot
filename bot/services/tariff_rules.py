@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from sqlalchemy import select
 
 from bot.models import Subscription, TariffType, User
@@ -93,13 +95,18 @@ def _tariff_family(tariff) -> str:
 
 def build_tariff_purchase_note(tariff, *, darimiru: bool = False) -> str:
     family = _tariff_family(tariff)
-    if darimiru and family == "basic":
-        return (
-            "\n🖥 Ключ по выбранному тарифу можно установить только на <b>1 устройство</b>. "
-            "Если вам нужно больше - выберите другой тариф."
-        )
-    if darimiru and family == "premium":
-        return "\n🖥 Ключ по выбранному тарифу можно установить на <b>3 устройства</b>."
+    if darimiru:
+        devices = int(getattr(tariff, "device_count", 0) or 0)
+        if devices <= 0:
+            match = re.search(r"(\d+)\s*📱", str(getattr(tariff, "label", "") or ""))
+            devices = int(match.group(1)) if match else (3 if family == "premium" else 1)
+        if devices % 10 == 1 and devices % 100 != 11:
+            noun = "устройство"
+        elif devices % 10 in (2, 3, 4) and devices % 100 not in (12, 13, 14):
+            noun = "устройства"
+        else:
+            noun = "устройств"
+        return f"\n🖥 Ключ по выбранному тарифу можно установить на <b>{devices} {noun}</b>."
 
     lines = [
         "",

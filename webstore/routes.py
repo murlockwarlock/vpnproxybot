@@ -32,8 +32,6 @@ from bot.services.adapt_api import (
     ADAPT_MIN_CUSTOM_RENEW_DAYS,
     AdaptAPI,
     AdaptAPIError,
-    can_upgrade_after_minimum_custom_renew,
-    retry_adapt_read,
 )
 from bot.services.purchase_intent import (
     MIN_PURCHASE_PRICE_RUB,
@@ -1605,6 +1603,7 @@ async def handle_create_order(request: web.Request) -> web.Response:
         target_order = None
         target_telegram_item = None
         if purchase_action != "new":
+            store_tariffs_by_key = get_store_tariffs_by_key()
             if target_order_id.startswith("tg:"):
                 requested_adapt_uuid = target_order_id.removeprefix("tg:")
                 telegram_items_result = await session.execute(
@@ -1647,6 +1646,12 @@ async def handle_create_order(request: web.Request) -> web.Response:
                     (
                         candidate for candidate in related_result.scalars().all()
                         if _extract_adapt_uuid_from_web_order(candidate) == target_adapt_uuid
+                        and str(
+                            (store_tariffs_by_key.get(candidate.tariff_key) or {}).get(
+                                "adapt_plan_uuid"
+                            )
+                            or ""
+                        ).strip()
                     ),
                     target_order,
                 )
@@ -1654,83 +1659,22 @@ async def handle_create_order(request: web.Request) -> web.Response:
                 target_expires_at = target_order.access_expires_at
             else:
                 target_expires_at = target_telegram_item.expires_at
-            # Do not price or label a renew/upgrade from a cached web/Telegram
-            # snapshot.  Adapt is authoritative and legacy fulfillments may
-            # have changed only our local tariff row.
-            try:
-                checkout_api = AdaptAPI()
-                provider_status, provider_plans = await asyncio.gather(
-                    retry_adapt_read(
-                        lambda: checkout_api.get_status(target_adapt_uuid),
-                        label=f"web_checkout_status:{target_order_id}",
-                    ),
-                    retry_adapt_read(
-                        checkout_api.list_plans,
-                        label=f"web_checkout_plan:{tariff_key}",
-                    ),
-                )
-            except Exception as exc:
-                logger.warning("Cannot verify Adapt target before checkout %s: %s", target_adapt_uuid, exc)
-                return web.json_response(
-                    {
-                        "error": (
-                            "Не удалось проверить выбранную подписку. "
-                            "Попробуйте ещё раз или напишите в поддержку."
-                        )
-                    },
-                    status=503,
-                )
-            old_plan = str(provider_status.get("plan_uuid") or "").strip()
-            old_tariff = next(
-                (
-                    candidate for candidate in get_store_tariffs()
-                    if str(candidate.get("adapt_plan_uuid") or "").strip() == old_plan
-                ),
-                None,
+            tariffs_by_plan = {
+                str(candidate.get("adapt_plan_uuid") or "").strip(): candidate
+                for candidate in get_store_tariffs()
+                if str(candidate.get("adapt_plan_uuid") or "").strip()
+            }
+            old_tariff = (
+                store_tariffs_by_key.get(target_order.tariff_key)
+                if target_order
+                else tariffs_by_plan.get(str(target_telegram_item.adapt_plan_uuid or "").strip())
             )
-            if provider_status.get("end_date"):
-                target_expires_at = _adapt_expires_at_from_response(provider_status, 0)
-            if target_telegram_item:
-                target_telegram_item.adapt_plan_uuid = old_plan or target_telegram_item.adapt_plan_uuid
-                if provider_status.get("devices") is not None:
-                    target_telegram_item.device_slots = int(provider_status["devices"])
-                if target_expires_at:
-                    target_telegram_item.expires_at = target_expires_at
-                target_telegram_item.updated_at = datetime.utcnow()
             old_plan_uuid = str((old_tariff or {}).get("adapt_plan_uuid") or "").strip()
             new_plan_uuid = str(tariff.get("adapt_plan_uuid") or "").strip()
-            new_provider_plan = next(
-                (
-                    item for item in provider_plans
-                    if str(item.get("uuid") or item.get("plan_uuid") or "").strip() == new_plan_uuid
-                ),
-                None,
-            )
-            old_provider_plan = next(
-                (
-                    item for item in provider_plans
-                    if str(item.get("uuid") or item.get("plan_uuid") or "").strip() == old_plan_uuid
-                ),
-                None,
-            )
             if not old_plan_uuid or not new_plan_uuid:
                 return web.json_response(
                     {"error": "Для этой подписки продление и улучшение через сайт сейчас недоступны"},
                     status=400,
-                )
-            if (
-                not new_provider_plan
-                or new_provider_plan.get("devices") is None
-                or new_provider_plan.get("is_active") is False
-            ):
-                return web.json_response(
-                    {
-                        "error": (
-                            "Выбранный тариф временно недоступен. "
-                            "Попробуйте позже или напишите в поддержку."
-                        )
-                    },
-                    status=503,
                 )
             try:
                 purchase_action = _effective_adapt_purchase_action(
@@ -1758,19 +1702,6 @@ async def handle_create_order(request: web.Request) -> web.Response:
                     or target_expires_at <= datetime.utcnow()
                 )
                 if target_is_expired:
-                    if not can_upgrade_after_minimum_custom_renew(
-                        old_provider_plan,
-                        new_provider_plan,
-                    ):
-                        return web.json_response(
-                            {
-                                "error": (
-                                    "На этот тариф нельзя перейти с сохранением ссылки. "
-                                    "Выберите «Создать новую» или другой тариф."
-                                )
-                            },
-                            status=400,
-                        )
                     original_amount_rub = int(tariff["price_rub"])
                 else:
                     if int(tariff["price_rub"]) <= int(old_tariff["price_rub"]):

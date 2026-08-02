@@ -11,7 +11,6 @@ from bot.services.adapt_api import (
     AdaptAPI,
     AdaptAPIError,
     can_upgrade_after_minimum_custom_renew,
-    retry_adapt_read,
 )
 
 
@@ -62,17 +61,6 @@ def test_minimum_custom_renew_upgrade_requires_positive_delta():
         current,
         {"uuid": "lower", "price_usd": 0.30, "days": 7},
     ) is False
-
-
-@pytest.mark.asyncio
-async def test_retry_adapt_read_retries_transient_failure():
-    operation = AsyncMock(side_effect=[TimeoutError(), {"ok": True}])
-
-    with patch("bot.services.adapt_api.asyncio.sleep", new_callable=AsyncMock):
-        result = await retry_adapt_read(operation, label="test", timeout=0.01)
-
-    assert result == {"ok": True}
-    assert operation.await_count == 2
 
 
 def test_disabled_raises_on_post():
