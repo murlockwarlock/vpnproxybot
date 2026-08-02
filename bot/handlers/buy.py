@@ -234,6 +234,54 @@ async def _has_completed_payment(telegram_id: int) -> bool:
     return payment_id is not None
 
 
+async def _quote_tariff_list(
+    telegram_id: int,
+    tariffs: list[Tariff],
+    *,
+    action: str,
+    target_subscription_id: int,
+) -> tuple[list[Tariff], dict[int, float]]:
+    """Use the same quote as checkout for every tariff shown to the client."""
+    async with async_session() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+        target = await session.get(Subscription, target_subscription_id)
+        current_tariff = (
+            await session.get(Tariff, target.tariff_id)
+            if target and target.tariff_id
+            else None
+        )
+        priced_tariffs: list[Tariff] = []
+        prices: dict[int, float] = {}
+        for tariff in tariffs:
+            candidate_action = action
+            if target and current_tariff:
+                candidate_action = effective_expired_adapt_action(
+                    action,
+                    current_plan_uuid=current_tariff.adapt_plan_uuid,
+                    selected_plan_uuid=tariff.adapt_plan_uuid,
+                    expires_at=target.expires_at,
+                )
+            try:
+                prices[tariff.id] = await get_purchase_price_rub(
+                    session,
+                    user=user,
+                    tariff=tariff,
+                    action=candidate_action,
+                    target_subscription_id=target_subscription_id,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "Hiding tariff with unavailable quote: user=%s tariff=%s target=%s error=%s",
+                    telegram_id,
+                    tariff.id,
+                    target_subscription_id,
+                    exc,
+                )
+                continue
+            priced_tariffs.append(tariff)
+    return priced_tariffs, prices
+
+
 def _purchase_subscription_text(sub: Subscription, position: int, total: int) -> str:
     status = "активна" if sub.status.value == "active" else "срок закончился"
     expires = sub.expires_at.strftime("%d.%m.%Y") if sub.expires_at else "—"
@@ -689,6 +737,12 @@ async def _open_renew_target(callback: CallbackQuery, sub_id: int) -> None:
                 )
             )
         ]
+        tariffs, price_overrides = await _quote_tariff_list(
+            callback.from_user.id,
+            tariffs,
+            action="upgrade",
+            target_subscription_id=sub_id,
+        )
         if not tariffs:
             await callback.answer("Подходящих тарифов сейчас нет. Напишите в поддержку.", show_alert=True)
             return
@@ -699,6 +753,7 @@ async def _open_renew_target(callback: CallbackQuery, sub_id: int) -> None:
                 stars_enabled,
                 intent_suffix=f"~u~{sub_id}",
                 back_callback=f"purchase_return_{sub_id}",
+                price_overrides_rub=price_overrides,
             ),
         )
         await callback.answer()
@@ -761,6 +816,12 @@ async def _open_upgrade_target(callback: CallbackQuery, sub_id: int) -> None:
         tariff for tariff in tariffs
         if str(tariff.adapt_plan_uuid or "").strip() in available_plan_uuids
     ]
+    tariffs, price_overrides = await _quote_tariff_list(
+        callback.from_user.id,
+        tariffs,
+        action="upgrade",
+        target_subscription_id=sub_id,
+    )
     if not tariffs:
         await callback.answer("Других доступных тарифов сейчас нет", show_alert=True)
         return
@@ -771,6 +832,7 @@ async def _open_upgrade_target(callback: CallbackQuery, sub_id: int) -> None:
             stars_enabled,
             intent_suffix=f"~u~{sub_id}",
             back_callback=f"purchase_return_{sub_id}",
+            price_overrides_rub=price_overrides,
         ),
     )
     await callback.answer()
@@ -840,6 +902,12 @@ async def _open_expired_tariff_choice(callback: CallbackQuery, sub_id: int) -> N
             provider_plans_by_uuid.get(str(tariff.adapt_plan_uuid or "").strip()),
         )
     ]
+    tariffs, price_overrides = await _quote_tariff_list(
+        callback.from_user.id,
+        tariffs,
+        action="upgrade",
+        target_subscription_id=sub_id,
+    )
     if not tariffs:
         await callback.answer("Доступных тарифов сейчас нет", show_alert=True)
         return
@@ -850,6 +918,7 @@ async def _open_expired_tariff_choice(callback: CallbackQuery, sub_id: int) -> N
             stars_enabled,
             intent_suffix=f"~u~{sub_id}",
             back_callback=f"purchase_return_{sub_id}",
+            price_overrides_rub=price_overrides,
         ),
     )
     await callback.answer()
@@ -1224,7 +1293,7 @@ async def _select_tariff_token(callback: CallbackQuery, encoded_tariff: str) -> 
                 price=price_str,
                 legal_notice=build_legal_notice(legal_urls),
             )
-            + "\nЕсли устройство уже выбирали раньше, ключ придёт сразу. Если нет — после оплаты бот спросит устройство и отправит ключ с нужным гайдом.\n"
+            + "\nПосле оплаты бот предложит выбрать устройство и отправит ключ с нужной инструкцией.\n"
             + build_tariff_purchase_note(tariff, darimiru=_is_darimiru_tariff_catalog())
             + partner_discount_text,
             reply_markup=payment_kb(

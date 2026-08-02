@@ -12,6 +12,19 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from webstore import routes as webstore_routes
+
+
+async def test_store_upgrade_price_uses_rendered_payment_minimum():
+    html = webstore_routes._render(
+        "store.html",
+        tariffs=[{"key": "test", "price_rub": 100, "days": 30}],
+        MIN_PURCHASE_PRICE_RUB=10,
+    )
+
+    assert "Math.max(10," in html
+    assert "{{MIN_PURCHASE_PRICE_RUB}}" not in html
+
+
 from webstore.models import Base, WebBalanceAccount, WebOrder, WebProfileLink, WebTelegramItem
 
 pytestmark = pytest.mark.asyncio

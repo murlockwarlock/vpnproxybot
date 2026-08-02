@@ -97,3 +97,43 @@ async def test_expired_paid_subscription_can_move_to_cheaper_tariff_for_full_pri
     )
 
     assert price == 155
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("new_price", "remaining_days", "expected"),
+    [
+        (101, 9.8, 10),
+        (130, 9.4, 37),
+    ],
+)
+async def test_active_upgrade_quote_respects_payment_minimum_only_below_ten(
+    new_price,
+    remaining_days,
+    expected,
+):
+    now = datetime.utcnow()
+    current = SimpleNamespace(
+        id=1, days=10, price_rub=100, adapt_plan_uuid="current-plan"
+    )
+    target = SimpleNamespace(
+        id=201,
+        user_id=10,
+        tariff_id=1,
+        expires_at=now + timedelta(days=remaining_days),
+        client_name="adapt_active",
+    )
+    upgrade = SimpleNamespace(
+        id=2, days=10, price_rub=new_price, adapt_plan_uuid="upgrade-plan"
+    )
+    session = SimpleNamespace(get=AsyncMock(side_effect=[target, current]))
+
+    price = await get_purchase_price_rub(
+        session,
+        user=SimpleNamespace(id=10),
+        tariff=upgrade,
+        action="upgrade",
+        target_subscription_id=201,
+    )
+
+    assert price == expected

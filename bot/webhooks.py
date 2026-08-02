@@ -58,15 +58,7 @@ from bot.services.provisioning_issues import AccessProvisionError
 from bot.services.subscription_service import create_mtproto_subscription, create_or_extend_paid_access
 from bot.services.vhq_routing import is_vhq_tariff
 from bot.services.vhq_subscription_proxy import fetch_vhq_mirror_payload, resolve_vhq_mirror_token
-from bot.utils.texts import (
-    GUIDE_ANDROID,
-    GUIDE_IOS,
-    GUIDE_MAC,
-    GUIDE_WINDOWS,
-    GUIDE_ANDROID_TV,
-    KEY_DELIVERED,
-    MTPROTO_KEY_DELIVERED,
-)
+from bot.utils.texts import MTPROTO_KEY_DELIVERED, SELECT_DEVICE_AFTER_PAYMENT
 
 logger = logging.getLogger(__name__)
 lease_manager = LeaseManager(settings.instance_id)
@@ -455,7 +447,7 @@ async def _process_and_deliver(
         is_both = tariff.tariff_type == TariffType.BOTH
 
         saved_platform = user.platform if _is_deferred_platform(platform_str) and user.platform and not is_tg_proxy_only else None
-        needs_platform_choice = _is_deferred_platform(platform_str) and saved_platform is None and not is_tg_proxy_only
+        needs_platform_choice = _is_deferred_platform(platform_str) and not is_tg_proxy_only
         delivery_platform = saved_platform or platform
 
         if user.platform is None and not is_tg_proxy_only and not _is_deferred_platform(platform_str):
@@ -590,39 +582,24 @@ async def _process_and_deliver(
         try:
             await bot.send_message(
                 chat_id,
-                "✅ <b>Оплата прошла.</b>\n\n"
-                "Выберите устройство, и я отправлю ключ вместе с подходящим гайдом.",
+                SELECT_DEVICE_AFTER_PAYMENT,
                 parse_mode="HTML",
                 reply_markup=_delivery_platform_kb(subscription_id),
             )
         except Exception as exc:
             logger.error(f"Failed to send platform picker to chat {chat_id}: {exc}")
-    elif vpn_key_str:
-        key_display = vpn_key_str if len(vpn_key_str) <= 200 else vpn_key_str[:200] + "..."
+    elif vpn_key_str and subscription_id:
         try:
-            await bot.send_message(
-                chat_id,
-                KEY_DELIVERED.format(key=key_display, expires=expires_str),
-                parse_mode="HTML",
+            from bot.handlers.payment import _send_subscription_key_for_platform
+            delivered = await _send_subscription_key_for_platform(
+                bot=bot,
+                chat_id=chat_id,
+                telegram_id=telegram_user_id,
+                subscription_id=subscription_id,
+                platform=delivery_platform,
             )
-            await bot.send_message(
-                chat_id,
-                f"📋 <b>Полный ключ (нажмите чтобы скопировать):</b>\n\n<code>{vpn_key_str}</code>",
-                parse_mode="HTML",
-            )
-            guides = {
-                Platform.ANDROID: GUIDE_ANDROID,
-                Platform.IOS: GUIDE_IOS,
-                Platform.MAC: GUIDE_MAC,
-                Platform.WINDOWS: GUIDE_WINDOWS,
-                Platform.ANDROID_TV: GUIDE_ANDROID_TV,
-            }
-            from bot.services.guide_service import send_guide
-            await send_guide(
-                bot, chat_id, delivery_platform,
-                guides.get(delivery_platform, GUIDE_ANDROID),
-                reply_markup=back_to_menu_kb(),
-            )
+            if not delivered:
+                logger.error("Webhook could not deliver subscription ID=%s", subscription_id)
         except Exception as exc:
             logger.error(f"Failed to send key to chat {chat_id}: {exc}")
 

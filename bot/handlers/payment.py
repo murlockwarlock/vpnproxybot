@@ -67,8 +67,9 @@ from bot.utils.texts import (
     GUIDE_MAC,
     GUIDE_WINDOWS,
     GUIDE_ANDROID_TV,
-    KEY_DELIVERED,
     MTPROTO_KEY_DELIVERED,
+    SELECT_DEVICE_AFTER_PAYMENT,
+    SUBSCRIPTION_READY,
 )
 
 logger = logging.getLogger(__name__)
@@ -142,19 +143,15 @@ def _delivery_platform_kb(subscription_id: int) -> InlineKeyboardMarkup:
 
 
 async def _ask_platform_before_key(message_or_callback, subscription_id: int) -> None:
-    text = (
-        "✅ <b>Оплата прошла.</b>\n\n"
-        "Выберите устройство, и я отправлю ключ вместе с подходящим гайдом."
-    )
     if isinstance(message_or_callback, CallbackQuery):
         await message_or_callback.message.edit_text(
-            text,
+            SELECT_DEVICE_AFTER_PAYMENT,
             parse_mode="HTML",
             reply_markup=_delivery_platform_kb(subscription_id),
         )
     else:
         await message_or_callback.answer(
-            text,
+            SELECT_DEVICE_AFTER_PAYMENT,
             parse_mode="HTML",
             reply_markup=_delivery_platform_kb(subscription_id),
         )
@@ -205,10 +202,9 @@ async def _send_subscription_key_for_platform(
     if not vpn_key:
         return False
 
-    key_display = vpn_key if len(vpn_key) <= 200 else vpn_key[:200] + "..."
     await bot.send_message(
         chat_id,
-        KEY_DELIVERED.format(key=key_display, expires=expires_str),
+        SUBSCRIPTION_READY.format(expires=expires_str),
         parse_mode="HTML",
     )
     if explanation:
@@ -216,7 +212,7 @@ async def _send_subscription_key_for_platform(
     
     await bot.send_message(
         chat_id,
-        f"📋 <b>Полный ключ (нажмите чтобы скопировать):</b>\n\n<code>{vpn_key}</code>",
+        f"<code>{vpn_key}</code>",
         parse_mode="HTML",
     )
     guides = {
@@ -932,7 +928,7 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
         await session.commit()
 
         saved_platform = user.platform if _is_deferred_platform(platform_str) and user.platform and not is_tg_proxy_only else None
-        needs_platform_choice = _is_deferred_platform(platform_str) and saved_platform is None and not is_tg_proxy_only
+        needs_platform_choice = _is_deferred_platform(platform_str) and not is_tg_proxy_only
         delivery_platform = saved_platform or platform
 
         if user.platform is None and not is_tg_proxy_only and not _is_deferred_platform(platform_str):
@@ -1120,34 +1116,13 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
         # Deliver keys. For the new flow, choose platform after payment and then send the guide.
         if vpn_key and needs_platform_choice and subscription:
             await _ask_platform_before_key(callback, subscription.id)
-        elif vpn_key:
-            from bot.utils.texts import KEY_DELIVERED, GUIDE_ANDROID, GUIDE_IOS, GUIDE_MAC, GUIDE_WINDOWS, GUIDE_ANDROID_TV
-            key_display = vpn_key if len(vpn_key) <= 200 else vpn_key[:200] + "..."
-            
-            client_name = subscription.client_name if subscription else ""
-            explanation = await _get_key_change_explanation(session, user.id, subscription.id if subscription else 0, client_name)
-            
-            await callback.message.edit_text(
-                KEY_DELIVERED.format(key=key_display, expires=expires_str),
-                parse_mode="HTML",
-            )
-            
-            if explanation:
-                await callback.message.answer(explanation, parse_mode="HTML")
-            
-            await callback.message.answer(
-                f"📋 <b>Полный ключ:</b>\n\n<code>{vpn_key}</code>",
-                parse_mode="HTML",
-            )
-
-            guides = {
-                "android": GUIDE_ANDROID, "ios": GUIDE_IOS, "mac": GUIDE_MAC,
-                "windows": GUIDE_WINDOWS, "android_tv": GUIDE_ANDROID_TV,
-            }
-            from bot.services.guide_service import send_guide
-            await send_guide(
-                callback.bot, callback.from_user.id,
-                delivery_platform, guides.get(delivery_platform.value if hasattr(delivery_platform, "value") else str(delivery_platform), GUIDE_ANDROID),
+        elif vpn_key and subscription:
+            await _send_subscription_key_for_platform(
+                bot=callback.bot,
+                chat_id=callback.from_user.id,
+                telegram_id=callback.from_user.id,
+                subscription_id=subscription.id,
+                platform=delivery_platform,
             )
 
         if proxy_link:
@@ -1652,7 +1627,7 @@ async def process_successful_payment(message: Message) -> None:
             return
 
         saved_platform = user.platform if _is_deferred_platform(platform_str) and user.platform and not is_tg_proxy_only else None
-        needs_platform_choice = _is_deferred_platform(platform_str) and saved_platform is None and not is_tg_proxy_only
+        needs_platform_choice = _is_deferred_platform(platform_str) and not is_tg_proxy_only
         delivery_platform = saved_platform or platform
 
         if user.platform is None and not is_tg_proxy_only and not _is_deferred_platform(platform_str):
@@ -1869,38 +1844,13 @@ async def process_successful_payment(message: Message) -> None:
         # Deliver keys to user. New purchases choose the platform after payment.
         if vpn_key and needs_platform_choice and subscription:
             await _ask_platform_before_key(message, subscription.id)
-        elif vpn_key:
-            key_display = vpn_key if len(vpn_key) <= 200 else vpn_key[:200] + "..."
-            
-            client_name = subscription.client_name if subscription else ""
-            explanation = await _get_key_change_explanation(session, user.id, subscription.id if subscription else 0, client_name)
-            
-            await message.answer(
-                KEY_DELIVERED.format(key=key_display, expires=expires_str),
-                parse_mode="HTML",
-            )
-            
-            if explanation:
-                await message.answer(explanation, parse_mode="HTML")
-            
-            await message.answer(
-                f"📋 <b>Полный ключ (нажмите чтобы скопировать):</b>\n\n"
-                f"<code>{vpn_key}</code>",
-                parse_mode="HTML",
-            )
-
-            guides = {
-                Platform.ANDROID: GUIDE_ANDROID,
-                Platform.IOS: GUIDE_IOS,
-                Platform.MAC: GUIDE_MAC,
-                Platform.WINDOWS: GUIDE_WINDOWS,
-                Platform.ANDROID_TV: GUIDE_ANDROID_TV,
-            }
-            from bot.services.guide_service import send_guide
-            await send_guide(
-                message.bot, message.from_user.id,
-                delivery_platform, guides.get(delivery_platform, GUIDE_ANDROID),
-                reply_markup=back_to_menu_kb(),
+        elif vpn_key and subscription:
+            await _send_subscription_key_for_platform(
+                bot=message.bot,
+                chat_id=message.from_user.id,
+                telegram_id=message.from_user.id,
+                subscription_id=subscription.id,
+                platform=delivery_platform,
             )
 
         if proxy_link:

@@ -35,6 +35,7 @@ from bot.services.adapt_api import (
     can_upgrade_after_minimum_custom_renew,
 )
 from bot.services.purchase_intent import (
+    MIN_PURCHASE_PRICE_RUB,
     calculate_upgrade_price_rub,
     effective_expired_adapt_action,
 )
@@ -1500,6 +1501,7 @@ async def handle_store_page(request: web.Request) -> web.Response:
         DAILY_CHARGE_RUB=f"{daily_charge_rub:.2f}" if daily_charge_rub is not None else "3.17",
         DEVICE_RULES_NOTE=_build_webstore_device_rules_note(tariffs),
         TARIFF_EXPLANATION_HTML=_build_tariff_explanation_html(tariffs),
+        MIN_PURCHASE_PRICE_RUB=MIN_PURCHASE_PRICE_RUB,
     )
     return web.Response(text=html, content_type="text/html")
 
@@ -1764,11 +1766,14 @@ async def handle_create_order(request: web.Request) -> web.Response:
                 else:
                     if int(tariff["price_rub"]) <= int(old_tariff["price_rub"]):
                         return web.json_response({"error": "Улучшение доступно только на более дорогой тариф"}, status=400)
-                    original_amount_rub = calculate_upgrade_price_rub(
-                        current_price_rub=float(old_tariff["price_rub"]),
-                        current_days=int(old_tariff["days"]),
-                        new_price_rub=float(tariff["price_rub"]),
-                        expires_at=target_expires_at,
+                    original_amount_rub = max(
+                        MIN_PURCHASE_PRICE_RUB,
+                        calculate_upgrade_price_rub(
+                            current_price_rub=float(old_tariff["price_rub"]),
+                            current_days=int(old_tariff["days"]),
+                            new_price_rub=float(tariff["price_rub"]),
+                            expires_at=target_expires_at,
+                        ),
                     )
                 if original_amount_rub <= 0:
                     return web.json_response(

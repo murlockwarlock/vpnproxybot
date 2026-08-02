@@ -301,7 +301,11 @@ async def auto_retry_failed_provisionings(bot) -> None:
                 is_both = tariff.tariff_type == TariffType.BOTH
 
                 saved_platform = user.platform if platform_str and _is_deferred_platform(platform_str) and user.platform and not is_tg_proxy_only else None
-                needs_platform_choice = platform_str and _is_deferred_platform(platform_str) and saved_platform is None and not is_tg_proxy_only
+                needs_platform_choice = bool(
+                    platform_str
+                    and _is_deferred_platform(platform_str)
+                    and not is_tg_proxy_only
+                )
                 delivery_platform = saved_platform or platform
 
                 if user.platform is None and not is_tg_proxy_only and not (platform_str and _is_deferred_platform(platform_str)):
@@ -412,10 +416,10 @@ async def auto_retry_failed_provisionings(bot) -> None:
 
                 if vpn_key and needs_platform_choice and subscription:
                     try:
+                        from bot.utils.texts import SELECT_DEVICE_AFTER_PAYMENT
                         await bot.send_message(
                             user.telegram_id,
-                            "✅ <b>Оплата прошла.</b>\n\n"
-                            "Выберите устройство, и я отправлю ключ вместе с подходящим гайдом.",
+                            SELECT_DEVICE_AFTER_PAYMENT,
                             parse_mode="HTML",
                             reply_markup=_delivery_platform_kb(subscription.id),
                         )

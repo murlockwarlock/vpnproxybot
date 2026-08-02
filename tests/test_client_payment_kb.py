@@ -87,6 +87,23 @@ def test_tariffs_kb_can_return_to_selected_subscription():
     assert markup.inline_keyboard[-1][0].callback_data == "purchase_return_244"
 
 
+def test_tariffs_kb_displays_checkout_upgrade_quote():
+    tariff = SimpleNamespace(
+        id=3,
+        label="Базовый (14 дней)",
+        days=14,
+        price_rub=125,
+        price_stars=1250,
+        tariff_type="VPN",
+    )
+
+    texts = _button_texts(
+        tariffs_kb([tariff], stars_enabled=True, price_overrides_rub={3: 10})
+    )
+
+    assert "Базовый (14 дней) - 10₽ / 100⭐" in texts
+
+
 def test_subscription_target_button_is_short_and_keeps_term_visible():
     sub = SimpleNamespace(
         id=243,

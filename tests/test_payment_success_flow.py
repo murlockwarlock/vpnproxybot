@@ -126,7 +126,7 @@ async def test_successful_stars_payment_is_persisted_even_if_provisioning_fails(
     assert payment.method == PaymentMethod.STARS
     assert payment.status == PaymentStatus.COMPLETED
     assert payment.subscription_id is None
-    message.answer.assert_awaited_once()
+    message.bot.send_message.assert_awaited_once()
 
 
 async def test_duplicate_successful_payment_is_ignored(monkeypatch, db_session_factory):
@@ -186,6 +186,7 @@ async def test_successful_stars_payment_delivers_key_and_guide(monkeypatch, db_s
     monkeypatch.setattr(payment_handler, "_notify_delivery_issue", AsyncMock())
     monkeypatch.setattr(payment_handler, "log_referral_payment", AsyncMock())
     monkeypatch.setattr(payment_handler, "credit_referral", AsyncMock())
+    monkeypatch.setattr(payment_handler, "notify_admins_payment", AsyncMock())
 
     from bot.services import guide_service
 
@@ -228,12 +229,17 @@ async def test_successful_stars_payment_delivers_key_and_guide(monkeypatch, db_s
     assert payment is not None
     assert payment.status == PaymentStatus.COMPLETED
     assert payment.subscription_id is not None
-    assert message.answer.await_count == 2
-    first_text = message.answer.await_args_list[0].args[0]
-    second_text = message.answer.await_args_list[1].args[0]
-    assert "Оплата прошла успешно" in first_text
-    assert "https://loonapie.xyz/s/test-token" in first_text
-    assert "<code>https://loonapie.xyz/s/test-token</code>" in second_text
+    message.answer.assert_not_awaited()
+    user_messages = [
+        call.args[1]
+        for call in message.bot.send_message.await_args_list
+        if call.args[0] == message.from_user.id
+    ]
+    assert len(user_messages) == 2
+    first_text, second_text = user_messages
+    assert "Подписка готова" in first_text
+    assert "https://loonapie.xyz/s/test-token" not in first_text
+    assert second_text == "<code>https://loonapie.xyz/s/test-token</code>"
     send_guide.assert_awaited_once()
     assert send_guide.await_args.args[1] == message.from_user.id
     assert send_guide.await_args.args[2] == Platform.ANDROID
@@ -241,7 +247,12 @@ async def test_successful_stars_payment_delivers_key_and_guide(monkeypatch, db_s
 
 async def test_successful_telegram_pay_deferred_platform_creates_subscription(monkeypatch, db_session_factory):
     async with db_session_factory() as session:
-        user = User(telegram_id=10031, username="buyer31", full_name="Buyer 31")
+        user = User(
+            telegram_id=10031,
+            username="buyer31",
+            full_name="Buyer 31",
+            platform=Platform.IOS,
+        )
         server = Server(name="NL", host="192.0.2.10", location="Netherlands")
         tariff = Tariff(
             days=30,
@@ -261,6 +272,7 @@ async def test_successful_telegram_pay_deferred_platform_creates_subscription(mo
     monkeypatch.setattr(payment_handler, "_notify_delivery_issue", AsyncMock())
     monkeypatch.setattr(payment_handler, "log_referral_payment", AsyncMock())
     monkeypatch.setattr(payment_handler, "credit_referral", AsyncMock())
+    monkeypatch.setattr(payment_handler, "notify_admins_payment", AsyncMock())
 
     async def _create_access(session, user, tariff, platform, bonus_days, **_kwargs):
         subscription = Subscription(

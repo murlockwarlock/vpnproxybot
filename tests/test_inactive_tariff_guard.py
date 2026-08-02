@@ -193,6 +193,12 @@ async def test_upgrade_menu_hides_admin_only_tariffs(db_session_factory):
     ]
     assert any(str(public_id) in value for value in callbacks)
     assert all(str(hidden_id) not in value for value in callbacks)
+    button_texts = [
+        button.text
+        for row in markup.inline_keyboard
+        for button in row
+    ]
+    assert "Public - 267₽" in button_texts
 
 
 async def test_expired_subscription_tariff_choice_includes_same_and_cheaper_tariff(db_session_factory):

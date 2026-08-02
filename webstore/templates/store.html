@@ -1870,6 +1870,7 @@
     const purchaseAction = ["new", "renew", "upgrade"].includes(storeParams.get("action")) ? storeParams.get("action") : "new";
     const targetOrderId = storeParams.get("target_order_id") || "";
     const currentPlanUuid = storeParams.get("current_plan_uuid") || "";
+    const targetExpiresAt = storeParams.get("expires_at") || "";
     const targetExpired = storeParams.get("expired") === "1";
     const COOKIE_CONSENT_KEY = "webstore_cookie_consent";
     const PROFILE_COOKIE = "webstore_profile_token";
@@ -2034,6 +2035,17 @@
         return;
       }
       visibleTariffs.forEach((t, i) => {
+        let displayPrice = Number(t.price_rub);
+        if (purchaseAction === "upgrade" && currentTariff && !targetExpired && targetExpiresAt) {
+          const expiryMs = Date.parse(targetExpiresAt);
+          if (Number.isFinite(expiryMs)) {
+            const remainingDays = Math.max(0, (expiryMs - Date.now()) / 86400000);
+            const residual = Number(currentTariff.price_rub)
+              / Math.max(Number(currentTariff.days), 1)
+              * remainingDays;
+            displayPrice = Math.max({{MIN_PURCHASE_PRICE_RUB}}, Math.ceil(Number(t.price_rub) - residual - 1e-9));
+          }
+        }
         const perDay = (t.price_rub / t.days).toFixed(1);
         const featured = i === visibleTariffs.length - 1;
         const card = document.createElement("div");
@@ -2042,9 +2054,9 @@
           ${t.badge ? `<div class="tariff-badge">${t.badge}</div>` : ""}
           <div class="tariff-label">${t.label}</div>
           <div class="tariff-desc">${t.description}</div>
-          <div class="tariff-price">${t.price_rub} <span>₽</span></div>
-          <div class="tariff-per-month">${t.days >= 365 ? Math.round(t.price_rub / 12) + " ₽/мес" : "Оплата одним платежом"}</div>
-          <div class="tariff-per-day">${perDay} ₽ в день</div>
+          <div class="tariff-price">${displayPrice} <span>₽</span></div>
+          <div class="tariff-per-month">${purchaseAction === "upgrade" ? "Доплата за улучшение" : (t.days >= 365 ? Math.round(t.price_rub / 12) + " ₽/мес" : "Оплата одним платежом")}</div>
+          <div class="tariff-per-day">${purchaseAction === "upgrade" ? "" : perDay + " ₽ в день"}</div>
           <ul class="tariff-features">
             ${(t.features || []).map(f => `<li>${f}</li>`).join("")}
           </ul>

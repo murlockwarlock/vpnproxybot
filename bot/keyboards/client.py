@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+from typing import Mapping
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -116,6 +119,7 @@ def tariffs_kb(
     has_product_types: bool = False,
     intent_suffix: str = "",
     back_callback: str | None = None,
+    price_overrides_rub: Mapping[int, float] | None = None,
 ) -> InlineKeyboardMarkup:
     """Build tariff selection keyboard grouped by family, then sorted by price."""
     builder = InlineKeyboardBuilder()
@@ -125,10 +129,16 @@ def tariffs_kb(
         if group_name != current_group:
             current_group = group_name
             builder.row(InlineKeyboardButton(text=f"— {group_name} —", callback_data="noop"))
+        display_price = (price_overrides_rub or {}).get(t.id, t.price_rub)
+        display_price = int(display_price) if float(display_price).is_integer() else display_price
         if stars_enabled and t.price_stars:
-            label = f"{t.label} - {t.price_rub}₽ / {t.price_stars}⭐"
+            display_stars = max(
+                1,
+                math.ceil(float(t.price_stars) * float(display_price) / float(t.price_rub)),
+            )
+            label = f"{t.label} - {display_price}₽ / {display_stars}⭐"
         else:
-            label = f"{t.label} - {t.price_rub}₽"
+            label = f"{t.label} - {display_price}₽"
         builder.row(
             InlineKeyboardButton(
                 text=label,

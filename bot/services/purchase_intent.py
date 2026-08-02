@@ -9,6 +9,7 @@ from datetime import datetime
 VALID_ACTIONS = {"auto", "new", "renew", "upgrade"}
 _ACTION_CODES = {"new": "n", "renew": "r", "upgrade": "u"}
 _CODE_ACTIONS = {value: key for key, value in _ACTION_CODES.items()}
+MIN_PURCHASE_PRICE_RUB = 10
 
 
 def effective_expired_adapt_action(
@@ -103,7 +104,7 @@ async def get_purchase_price_rub(session, *, user, tariff, action: str, target_s
         raise ValueError("Эта подписка уже на выбранном тарифе")
     if target.expires_at <= datetime.utcnow():
         # Adapt upgrades active subscriptions only.  Fulfillment first
-        # reactivates an expired UUID for one custom day and immediately
+        # reactivates an expired UUID for the provider minimum and immediately
         # replaces its plan, so the customer pays the full selected tariff.
         return int(tariff.price_rub)
     if int(tariff.price_rub) <= int(current_tariff.price_rub):
@@ -116,4 +117,4 @@ async def get_purchase_price_rub(session, *, user, tariff, action: str, target_s
     )
     if price <= 0:
         raise ValueError("Переход на этот тариф сейчас невозможен")
-    return price
+    return max(MIN_PURCHASE_PRICE_RUB, price)
