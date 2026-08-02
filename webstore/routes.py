@@ -33,6 +33,7 @@ from bot.services.adapt_api import (
     AdaptAPI,
     AdaptAPIError,
     can_upgrade_after_minimum_custom_renew,
+    retry_adapt_read,
 )
 from bot.services.purchase_intent import (
     MIN_PURCHASE_PRICE_RUB,
@@ -1658,8 +1659,16 @@ async def handle_create_order(request: web.Request) -> web.Response:
             # have changed only our local tariff row.
             try:
                 checkout_api = AdaptAPI()
-                provider_status = await checkout_api.get_status(target_adapt_uuid)
-                provider_plans = await checkout_api.list_plans()
+                provider_status, provider_plans = await asyncio.gather(
+                    retry_adapt_read(
+                        lambda: checkout_api.get_status(target_adapt_uuid),
+                        label=f"web_checkout_status:{target_order_id}",
+                    ),
+                    retry_adapt_read(
+                        checkout_api.list_plans,
+                        label=f"web_checkout_plan:{tariff_key}",
+                    ),
+                )
             except Exception as exc:
                 logger.warning("Cannot verify Adapt target before checkout %s: %s", target_adapt_uuid, exc)
                 return web.json_response(

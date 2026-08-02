@@ -1596,6 +1596,8 @@
         </div>
         {{TARIFF_EXPLANATION_HTML}}
 
+        <div class="notice-card" id="upgradeSummary" hidden></div>
+
         <div class="bonus-box" id="bonusBox">
           <div class="bonus-copy">
             <strong id="bonusTitle">На сайте есть бонус</strong>
@@ -2019,6 +2021,34 @@
     function renderTariffs() {
       const container = document.getElementById("tariffCards");
       const currentTariff = tariffs.find(t => t.adapt_plan_uuid === currentPlanUuid);
+      const upgradeSummary = document.getElementById("upgradeSummary");
+      let upgradeResidual = null;
+      if (purchaseAction === "upgrade" && currentTariff && !targetExpired && targetExpiresAt) {
+        const expiryMs = Date.parse(targetExpiresAt);
+        if (Number.isFinite(expiryMs)) {
+          const currentPrice = Number(currentTariff.price_rub);
+          const currentDays = Math.max(Number(currentTariff.days), 1);
+          const remainingDays = Math.max(0, (expiryMs - Date.now()) / 86400000);
+          upgradeResidual = Math.min(currentPrice, currentPrice / currentDays * remainingDays);
+          const used = Math.max(0, currentPrice - upgradeResidual);
+          const money = value => Number(value.toFixed(2)).toLocaleString("ru-RU", {
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 2,
+          });
+          upgradeSummary.innerHTML = `
+            <strong>Улучшение подписки</strong>
+            <p>Текущий тариф: <b>${currentTariff.label}</b><br>
+            Параметры: <b>${currentTariff.days} дн.</b><br>
+            Срок действия до: <b>${new Date(expiryMs).toLocaleDateString("ru-RU")}</b><br>
+            Стоимость: <b>${money(currentPrice)} ₽</b><br>
+            Использовано: <b>${money(used)} ₽</b><br>
+            Остаточная стоимость: <b>${money(upgradeResidual)} ₽</b></p>
+            <p>При выборе нового тарифа вы доплачиваете разницу между стоимостью нового тарифа и остаточной стоимостью текущего.</p>
+            <p>Остаточная стоимость — это сумма, которую вы заплатили по тарифу, за вычетом использованного периода.</p>
+          `;
+          upgradeSummary.hidden = false;
+        }
+      }
       const visibleTariffs = tariffs.filter(t => {
         if (purchaseAction === "renew" && currentPlanUuid) return t.adapt_plan_uuid === currentPlanUuid;
         if (purchaseAction === "upgrade" && currentTariff) {
@@ -2036,15 +2066,8 @@
       }
       visibleTariffs.forEach((t, i) => {
         let displayPrice = Number(t.price_rub);
-        if (purchaseAction === "upgrade" && currentTariff && !targetExpired && targetExpiresAt) {
-          const expiryMs = Date.parse(targetExpiresAt);
-          if (Number.isFinite(expiryMs)) {
-            const remainingDays = Math.max(0, (expiryMs - Date.now()) / 86400000);
-            const residual = Number(currentTariff.price_rub)
-              / Math.max(Number(currentTariff.days), 1)
-              * remainingDays;
-            displayPrice = Math.max({{MIN_PURCHASE_PRICE_RUB}}, Math.ceil(Number(t.price_rub) - residual - 1e-9));
-          }
+        if (purchaseAction === "upgrade" && upgradeResidual !== null) {
+          displayPrice = Math.max({{MIN_PURCHASE_PRICE_RUB}}, Math.ceil(Number(t.price_rub) - upgradeResidual - 1e-9));
         }
         const perDay = (t.price_rub / t.days).toFixed(1);
         const featured = i === visibleTariffs.length - 1;

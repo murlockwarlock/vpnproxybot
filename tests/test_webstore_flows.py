@@ -22,6 +22,8 @@ async def test_store_upgrade_price_uses_rendered_payment_minimum():
     )
 
     assert "Math.max(10," in html
+    assert "Остаточная стоимость" in html
+    assert "вы доплачиваете разницу" in html
     assert "{{MIN_PURCHASE_PRICE_RUB}}" not in html
 
 

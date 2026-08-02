@@ -199,6 +199,12 @@ async def test_upgrade_menu_hides_admin_only_tariffs(db_session_factory):
         for button in row
     ]
     assert "Public - 267₽" in button_texts
+    text = callback.message.edit_text.await_args.args[0]
+    assert "Текущий тариф: <b>Current</b>" in text
+    assert "Стоимость: <b>100 ₽</b>" in text
+    assert "Использовано:" in text
+    assert "Остаточная стоимость:" in text
+    api.list_plans.assert_not_awaited()
 
 
 async def test_expired_subscription_tariff_choice_includes_same_and_cheaper_tariff(db_session_factory):
@@ -263,7 +269,8 @@ async def test_expired_subscription_tariff_choice_includes_same_and_cheaper_tari
     ]
     assert f"tariff_{current_id}~u~{sub_id}" in callbacks
     assert f"tariff_{cheaper_id}~u~{sub_id}" in callbacks
-    assert f"tariff_{impossible_id}~u~{sub_id}" not in callbacks
+    assert f"tariff_{impossible_id}~u~{sub_id}" in callbacks
+    api.list_plans.assert_not_awaited()
 
 
 async def test_expired_paid_renew_button_opens_all_tariffs(db_session_factory):
@@ -356,7 +363,7 @@ async def test_purchase_carousel_contains_only_public_adapt_subscriptions(db_ses
     assert [target.id for target in targets] == [public_id]
 
 
-async def test_purchase_targets_refresh_stale_adapt_plan_before_showing_actions(db_session_factory):
+async def test_purchase_target_refreshes_stale_adapt_plan_during_preflight(db_session_factory):
     from bot.handlers import buy as buy_handler
 
     provider_end = datetime.utcnow() + timedelta(days=120)
@@ -402,7 +409,11 @@ async def test_purchase_targets_refresh_stale_adapt_plan_before_showing_actions(
         patch("bot.handlers.buy.settings.is_admin", return_value=False),
         patch("bot.handlers.buy.AdaptAPI", return_value=api),
     ):
-        targets = await buy_handler._purchase_targets(100501)
+        targets = await buy_handler._purchase_targets(
+            100501,
+            refresh_provider=True,
+            target_subscription_id=subscription_id,
+        )
 
     assert [target.id for target in targets] == [subscription_id]
     assert targets[0].tariff_id == tariff_3_id
@@ -773,6 +784,7 @@ async def test_trial_renewal_shows_public_paid_plans_with_upgrade_intent(db_sess
     assert f"tariff_{public_id}~u~{sub_id}" in callbacks
     assert all(str(hidden_id) not in value for value in callbacks)
     assert callback.data == f"purchase_renew_{sub_id}"
+    api.list_plans.assert_not_awaited()
 
 
 async def test_subscription_count_text_is_explicit():

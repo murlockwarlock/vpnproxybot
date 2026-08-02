@@ -10,13 +10,45 @@ from __future__ import annotations
 
 import os
 import asyncio
-from typing import Any
+import logging
+from typing import Any, Awaitable, Callable, TypeVar
 
 import aiohttp
 
 _TIMEOUT = aiohttp.ClientTimeout(total=20)
 _DEFAULT_BASE_URL = "https://network-api.adaptgroup.app"
 ADAPT_MIN_CUSTOM_RENEW_DAYS = 3
+logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
+
+
+async def retry_adapt_read(
+    operation: Callable[[], Awaitable[_T]],
+    *,
+    label: str,
+    attempts: int = 3,
+    timeout: float = 2.5,
+) -> _T:
+    """Retry a safe provider read while keeping the total client wait bounded."""
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.wait_for(operation(), timeout=timeout)
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Adapt read failed: operation=%s attempt=%s/%s error=%s: %s",
+                label,
+                attempt,
+                attempts,
+                type(exc).__name__,
+                exc,
+            )
+        if attempt < attempts:
+            await asyncio.sleep(0.4 * attempt)
+    if last_error:
+        raise last_error
+    raise AdaptAPIError(f"Adapt read failed: {label}")
 
 
 def can_upgrade_after_minimum_custom_renew(
