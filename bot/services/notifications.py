@@ -62,6 +62,35 @@ async def notify_expired(bot: Bot, user_id: int, text: str, reply_markup=None) -
     return await notify_expiring(bot, user_id, text, reply_markup=reply_markup)
 
 
+def _format_rub(value: float) -> str:
+    return f"{float(value):.2f}".rstrip("0").rstrip(".")
+
+
+def _build_admin_payment_text(
+    *,
+    telegram_id: int,
+    full_name: str,
+    username: str | None,
+    amount_rub: float,
+    tariff_label: str,
+    method: str,
+    platform: str,
+    price_rub: float | None = None,
+) -> str:
+    uname = f"@{username}" if username else "—"
+    title = "💎 <b>Оплата с баланса!</b>" if "баланс" in method.lower() else "💰 <b>Новая оплата!</b>"
+    price = float(amount_rub if price_rub is None else price_rub)
+    return (
+        f"{title}\n\n"
+        f"👤 {full_name} (<code>{telegram_id}</code>, {uname})\n"
+        f"🛒 Тариф: <b>{tariff_label}</b>\n"
+        f"💵 Стоимость: <b>{_format_rub(price)} ₽</b>\n"
+        f"💳 Оплачено: <b>{_format_rub(amount_rub)} ₽</b>\n"
+        f"💳 Способ: {method}\n"
+        f"📱 Платформа: {platform}"
+    )
+
+
 async def notify_admins_payment(
     bot: Bot,
     telegram_id: int,
@@ -71,6 +100,7 @@ async def notify_admins_payment(
     tariff_label: str,
     method: str,
     platform: str,
+    price_rub: float | None = None,
 ) -> None:
     """Notify all admins about a completed payment."""
     from bot.database import async_session
@@ -88,15 +118,15 @@ async def notify_admins_payment(
             )
             return  # disabled
 
-    uname = f"@{username}" if username else "—"
-    title = "💎 <b>Оплата с баланса!</b>" if "баланс" in method.lower() else "💰 <b>Новая оплата!</b>"
-    text = (
-        f"{title}\n\n"
-        f"👤 {full_name} (<code>{telegram_id}</code>, {uname})\n"
-        f"🛒 Тариф: <b>{tariff_label}</b>\n"
-        f"💵 Сумма: <b>{amount_rub:.0f} ₽</b>\n"
-        f"💳 Способ: {method}\n"
-        f"📱 Платформа: {platform}"
+    text = _build_admin_payment_text(
+        telegram_id=telegram_id,
+        full_name=full_name,
+        username=username,
+        amount_rub=amount_rub,
+        tariff_label=tariff_label,
+        method=method,
+        platform=platform,
+        price_rub=price_rub,
     )
     if not settings.notification_recipient_ids:
         logger.warning(

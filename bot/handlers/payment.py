@@ -1145,10 +1145,11 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
             telegram_id=callback.from_user.id,
             full_name=callback.from_user.full_name or "",
             username=callback.from_user.username,
-            amount_rub=float(tariff.price_rub),
+            amount_rub=float(purchase_price),
             tariff_label=f"{tariff.label} ({product_label})",
             method="💎 Баланс",
             platform=delivery_platform.value if not is_tg_proxy_only else "telegram",
+            price_rub=float(tariff.price_rub),
         )
 
         await callback.message.answer("✅ Оплата с баланса успешна!")
@@ -1904,6 +1905,7 @@ async def process_successful_payment(message: Message) -> None:
             tariff_label=f"{tariff.label} ({product_label})",
             method=method_str,
             platform=delivery_platform.value if not is_tg_proxy_only else "telegram",
+            price_rub=float(tariff.price_rub),
         )
         logger.info(
             "Successful payment flow finished: user_id=%s payment_id=%s vpn_delivered=%s mtproto_delivered=%s",

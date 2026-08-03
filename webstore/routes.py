@@ -139,7 +139,8 @@ async def _notify_admins_webstore(
         text = (
             f"🛒 <b>Оплата через веб-магазин</b>\n\n"
             f"Тариф: {order.tariff_label}\n"
-            f"Сумма: {order.amount_rub}₽\n"
+            f"Стоимость: {order.original_amount_rub or order.amount_rub}₽\n"
+            f"Оплачено: {order.amount_rub}₽\n"
             f"Контакт: {html.escape(order.contact or order.email or '—')}\n"
             f"Заказ: <code>{order.order_id}</code>\n"
             f"Источник: {source_line}"
@@ -156,7 +157,8 @@ async def _notify_admins_webstore(
         text = (
             f"🚨 <b>{heading} (веб-магазин)</b>\n\n"
             f"Тариф: {html.escape(order.tariff_label)}\n"
-            f"Сумма: {order.amount_rub}₽\n"
+            f"Стоимость: {order.original_amount_rub or order.amount_rub}₽\n"
+            f"Оплачено: {order.amount_rub}₽\n"
             f"Контакт: {html.escape(order.contact or order.email or '—')}\n"
             f"Заказ: <code>{order.order_id}</code>\n"
             f"Провайдер: {html.escape(issue.provider)}\n"

@@ -408,6 +408,7 @@ async def _process_and_deliver(
     tariff_id: int,
     platform_str: str,
     provisioning_payment_id: int | None = None,
+    paid_amount_rub: float | None = None,
 ) -> tuple[int | None, int | None]:
     """Create or renew the paid subscription and deliver its stable link.
 
@@ -565,6 +566,15 @@ async def _process_and_deliver(
         user_username = user.username
         tariff_label = tariff.label
         tariff_price_rub = float(tariff.price_rub)
+        actual_paid_amount_rub = (
+            float(paid_amount_rub)
+            if paid_amount_rub is not None
+            else (
+                float(provisioning_payment.amount) / 100.0
+                if provisioning_payment and provisioning_payment.currency == "RUB"
+                else tariff_price_rub
+            )
+        )
         delivery_platform_value = delivery_platform.value if hasattr(delivery_platform, "value") else str(delivery_platform)
 
         await session.commit()
@@ -636,10 +646,11 @@ async def _process_and_deliver(
         telegram_id=telegram_user_id,
         full_name=user_full_name,
         username=user_username,
-        amount_rub=tariff_price_rub,
+        amount_rub=actual_paid_amount_rub,
         tariff_label=tariff_label,
         method="💳 YooKassa / Robokassa",
         platform=delivery_platform_value if not is_tg_proxy_only else "telegram",
+        price_rub=tariff_price_rub,
     )
 
     logger.info(
@@ -857,6 +868,7 @@ async def handle_yookassa(request: web.Request) -> web.Response:
                 tariff_id=tariff_id,
                 platform_str=platform_str,
                 provisioning_payment_id=provisioning_payment_id,
+                paid_amount_rub=amount_value,
             )
         else:
             user_db_id, subscription_id = None, None
@@ -1120,6 +1132,7 @@ async def handle_robokassa_result(request: web.Request) -> web.Response:
                 tariff_id=tariff_id,
                 platform_str=platform_str,
                 provisioning_payment_id=provisioning_payment_id,
+                paid_amount_rub=float(out_sum),
             )
 
         if user_db_id is not None and subscription_id is not None and not is_balance_topup:

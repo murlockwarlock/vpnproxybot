@@ -66,8 +66,10 @@ async def test_yookassa_webhook_stores_completed_payment(monkeypatch, db_session
 
     acquire_lock = AsyncMock(return_value=True)
     monkeypatch.setattr("bot.webhooks.lease_manager.acquire_or_renew", acquire_lock)
+    monkeypatch.setattr("bot.webhooks.lease_manager.release", AsyncMock())
     monkeypatch.setattr("bot.webhooks._wait_for_completed_payment", AsyncMock(return_value=False))
-    monkeypatch.setattr("bot.webhooks._process_and_deliver", AsyncMock(return_value=(user_id, 9001)))
+    process_and_deliver = AsyncMock(return_value=(user_id, 9001))
+    monkeypatch.setattr("bot.webhooks._process_and_deliver", process_and_deliver)
     monkeypatch.setattr("bot.webhooks.credit_referral", AsyncMock())
     monkeypatch.setattr("bot.webhooks.log_referral_payment", AsyncMock())
     monkeypatch.setattr("bot.services.payment_service.credit_partner", AsyncMock())
@@ -77,7 +79,7 @@ async def test_yookassa_webhook_stores_completed_payment(monkeypatch, db_session
             "event": "payment.succeeded",
             "object": {
                 "id": "yk_bot_123",
-                "amount": {"value": "95.00"},
+                "amount": {"value": "15.00"},
                 "metadata": {
                     "user_id": "777001",
                     "chat_id": "777001",
@@ -104,9 +106,11 @@ async def test_yookassa_webhook_stores_completed_payment(monkeypatch, db_session
         assert payment.status == PaymentStatus.COMPLETED
         assert payment.user_id == user_id
         assert payment.subscription_id == 9001
-        assert payment.amount == 9500
+        assert payment.amount == 1500
         assert payment.currency == "RUB"
         assert payment.method == PaymentMethod.YOOKASSA
+
+    assert process_and_deliver.await_args.kwargs["paid_amount_rub"] == 15.0
 
 
 async def test_yookassa_balance_topup_notifies_admins_and_credits_balance(monkeypatch, db_session_factory):
@@ -123,6 +127,7 @@ async def test_yookassa_balance_topup_notifies_admins_and_credits_balance(monkey
     acquire_lock = AsyncMock(return_value=True)
     notify_admins = AsyncMock()
     monkeypatch.setattr("bot.webhooks.lease_manager.acquire_or_renew", acquire_lock)
+    monkeypatch.setattr("bot.webhooks.lease_manager.release", AsyncMock())
     monkeypatch.setattr("bot.webhooks._wait_for_completed_payment", AsyncMock(return_value=False))
     monkeypatch.setattr("bot.webhooks.notify_admins_payment", notify_admins)
 
