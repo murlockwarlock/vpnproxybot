@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ast
+import json
+import logging
 import os
 import socket
 import hashlib
@@ -15,6 +18,7 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 _BLOCKED_ADMIN_IDS = {979514796}
+logger = logging.getLogger(__name__)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -263,13 +267,41 @@ class Settings:
     def mtproto_servers(self) -> list[dict]:
         """Return list of MTProto proxy servers. Falls back to single legacy server."""
         if self.mtproto_servers_json:
-            import json
-            servers = json.loads(self.mtproto_servers_json)
-            for server in servers:
-                label = server.get("label")
-                if isinstance(label, str):
-                    server["label"] = _normalize_mtproto_label(label)
-            return servers
+            raw = self.mtproto_servers_json.strip()
+            try:
+                servers = json.loads(raw)
+            except (TypeError, ValueError) as json_error:
+                try:
+                    servers = ast.literal_eval(raw)
+                except (ValueError, SyntaxError, TypeError):
+                    logger.warning(
+                        "Invalid MTPROTO_SERVERS configuration (%s); using legacy settings",
+                        type(json_error).__name__,
+                    )
+                    servers = None
+
+            if isinstance(servers, list):
+                normalized: list[dict] = []
+                for server in servers:
+                    if not isinstance(server, dict):
+                        continue
+                    host = str(server.get("host") or "").strip()
+                    if not host:
+                        continue
+                    item = dict(server)
+                    item["host"] = host
+                    try:
+                        item["port"] = int(item.get("port", 4430))
+                    except (TypeError, ValueError):
+                        item["port"] = 4430
+                    label = item.get("label")
+                    if isinstance(label, str):
+                        item["label"] = _normalize_mtproto_label(label)
+                    normalized.append(item)
+                if normalized:
+                    return normalized
+                logger.warning("MTPROTO_SERVERS has no usable server entries; using legacy settings")
+
         if self.mtproto_host:
             return [{
                 "host": self.mtproto_host,
