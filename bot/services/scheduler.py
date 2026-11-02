@@ -1740,16 +1740,24 @@ async def check_webstore_health(bot) -> None:
     ok = False
     reason = ""
 
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as http:
-            async with http.get(health_url, allow_redirects=True) as resp:
-                if 200 <= resp.status < 400:
-                    ok = True
-                else:
-                    reason = f"HTTP {resp.status}"
-    except Exception as exc:
-        reason = f"{type(exc).__name__}: {exc}"
+    max_attempts = 3
+    timeout = aiohttp.ClientTimeout(total=15, connect=5, sock_read=10)
+
+    async with aiohttp.ClientSession(timeout=timeout) as http:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with http.get(health_url, allow_redirects=True) as resp:
+                    if 200 <= resp.status < 400:
+                        ok = True
+                        reason = ""
+                        break
+                    else:
+                        reason = f"HTTP {resp.status}"
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+
+            if attempt < max_attempts:
+                await asyncio.sleep(2)
 
     async with async_session() as session:
         key = "webstore_health_status"
@@ -1786,6 +1794,7 @@ async def check_webstore_health(bot) -> None:
             details=[
                 f"URL: {health_url}",
                 f"Причина: {reason or 'unknown'}",
+                f"Попыток: {max_attempts}",
                 f"Время UTC: {now.isoformat(timespec='seconds')}",
             ],
         )

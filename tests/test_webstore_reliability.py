@@ -141,3 +141,114 @@ def test_all_staff_recipients_are_deduplicated(monkeypatch):
     monkeypatch.setattr(notification_outbox.settings, "owner_ids", [2, 3])
     monkeypatch.setattr(notification_outbox.settings, "support_agent_ids", [3, 4])
     assert notification_outbox.all_staff_recipient_ids() == {1, 2, 3, 4}
+
+
+@pytest.mark.asyncio
+async def test_check_webstore_health_retry_recovers(monkeypatch):
+    from bot.models import Base as BotBase
+    from bot.models import BotSettings
+    from bot.services import scheduler
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(BotBase.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    notify_mock = AsyncMock()
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(scheduler, "async_session", factory)
+    monkeypatch.setattr(scheduler, "notify_admins_issue", notify_mock)
+    monkeypatch.setattr(scheduler.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(scheduler.settings, "webstore_public_enabled", True)
+    monkeypatch.setattr(scheduler.settings, "webstore_api_base_url", "https://darimiru.ru")
+
+    class FakeResponse:
+        def __init__(self, status):
+            self.status = status
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+
+    attempts = 0
+    def fake_get(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("connection timed out")
+        return FakeResponse(200)
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+        def get(self, *args, **kwargs):
+            return fake_get(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler.aiohttp, "ClientSession", FakeSession)
+
+    bot_mock = AsyncMock()
+    await scheduler.check_webstore_health(bot_mock)
+
+    assert attempts == 2
+    assert sleep_mock.await_count == 1
+    notify_mock.assert_not_awaited()
+
+    async with factory() as session:
+        status_row = await session.get(BotSettings, "webstore_health_status")
+        assert status_row is not None
+        assert status_row.value == "ok"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_check_webstore_health_alerts_after_all_retries_fail(monkeypatch):
+    from bot.models import Base as BotBase
+    from bot.models import BotSettings
+    from bot.services import scheduler
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(BotBase.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    notify_mock = AsyncMock()
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(scheduler, "async_session", factory)
+    monkeypatch.setattr(scheduler, "notify_admins_issue", notify_mock)
+    monkeypatch.setattr(scheduler.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(scheduler.settings, "webstore_public_enabled", True)
+    monkeypatch.setattr(scheduler.settings, "webstore_api_base_url", "https://darimiru.ru")
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+        def get(self, *args, **kwargs):
+            raise TimeoutError("timed out")
+
+    monkeypatch.setattr(scheduler.aiohttp, "ClientSession", FakeSession)
+
+    bot_mock = AsyncMock()
+    await scheduler.check_webstore_health(bot_mock)
+
+    assert sleep_mock.await_count == 2
+    notify_mock.assert_awaited_once()
+    call_kwargs = notify_mock.call_args.kwargs
+    assert call_kwargs["title"] == "Webstore недоступен"
+    details = " ".join(call_kwargs["details"])
+    assert "Попыток: 3" in details
+    assert "TimeoutError" in details
+
+    async with factory() as session:
+        status_row = await session.get(BotSettings, "webstore_health_status")
+        assert status_row is not None
+        assert status_row.value == "down"
+    await engine.dispose()
+
