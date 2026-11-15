@@ -44,6 +44,11 @@ async def test_web_adapt_subscription_is_imported_once_with_actual_device_limit(
     }]}
 
     assert await webstore_bridge.sync_linked_web_subscriptions(89154970647, profile)
+    original_url = f"https://network-api.adaptgroup.app/sub/{adapt_uuid}"
+    async with sessions() as session:
+        subscription = await session.scalar(select(Subscription))
+        subscription.vpn_key = original_url
+        await session.commit()
     assert await webstore_bridge.sync_linked_web_subscriptions(89154970647, profile)
 
     async with sessions() as session:
@@ -51,6 +56,7 @@ async def test_web_adapt_subscription_is_imported_once_with_actual_device_limit(
         records = (await session.execute(select(AdaptSubscription))).scalars().all()
         assert len(subscriptions) == len(records) == 1
         assert subscriptions[0].device_slots == 5
+        assert subscriptions[0].vpn_key == original_url
         assert records[0].adapt_uuid == adapt_uuid
         assert records[0].adapt_plan_uuid == plan_uuid
 

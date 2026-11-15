@@ -109,7 +109,7 @@ async def _setup_commands(bot: Bot) -> None:
     """Set bot command menu: common commands for all, /admin only for admins."""
     user_commands = [
         BotCommand(command="start",  description="Главное меню"),
-        BotCommand(command="keys",   description="Мои ключи"),
+        BotCommand(command="keys",   description="Мои подписки"),
         BotCommand(command="help",   description="Помощь"),
     ]
     if os.getenv("LEGAL_COMMANDS_ENABLED", "true").lower() not in ("0", "false", "no", "off"):
@@ -126,7 +126,10 @@ async def _setup_commands(bot: Bot) -> None:
     ]
 
     # Default scope - all users
-    await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+    try:
+        await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not set default bot commands: {e}")
 
     # Per-admin scope - extends the menu with /admin
     for admin_id in settings.admin_ids:

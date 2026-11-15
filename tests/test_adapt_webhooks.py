@@ -6,6 +6,8 @@ import base64
 import hashlib
 import hmac
 import json
+from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -56,12 +58,43 @@ async def test_adapt_notify_user_sends_message():
     bot_mock.send_message.assert_awaited_once_with(12345, "⚠️ Ваш доступ истекает завтра. Продлите его сейчас.")
 
 
-# ── handle_adapt_webhook: missing signature ──────────────────────────────────
+@pytest.mark.asyncio
+async def test_adapt_expired_notification_contains_subscription_details_and_renew_button():
+    from bot.webhooks import _adapt_notify_user
+
+    bot_mock = AsyncMock()
+    sub = SimpleNamespace(
+        id=180,
+        expires_at=datetime(2026, 8, 18),
+        tariff_days=7,
+        device_slots=5,
+        adapt_current_tariff=SimpleNamespace(label="Базовый · 14 дней", days=14),
+    )
+
+    await _adapt_notify_user(
+        event="subs.expired_24_hours_ago",
+        user=SimpleNamespace(telegram_id=12345),
+        subscription=sub,
+        adapt_record=SimpleNamespace(adapt_plan_uuid="canonical-plan"),
+        app={"bot": bot_mock},
+    )
+
+    message = bot_mock.send_message.await_args
+    assert "❌ <b>Подписка истекла</b>" in message.args[1]
+    assert "Базовый · 14 дней" in message.args[1]
+    assert "Срок тарифа: <b>14 дн.</b>" in message.args[1]
+    assert "Устройств: <b>5</b>" in message.args[1]
+    assert "Действовала до: <b>18.08.2026</b>" in message.args[1]
+    button = message.kwargs["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "↻ Продлить"
+    assert button.callback_data == "purchase_renew_180"
+
+
+# ── handle_adapt_webhook: signature verification ──────────────────────────────
 
 @pytest.mark.asyncio
-async def test_adapt_webhook_no_signature_skip_when_no_secret():
-    """If ADAPT_WEBHOOK_SECRET is empty, webhook should still be processed."""
-    from aiohttp import web
+async def test_adapt_webhook_no_secret_fails_closed_returns_403():
+    """If ADAPT_WEBHOOK_SECRET is empty, webhook must fail closed and return 403."""
     from bot.webhooks import handle_adapt_webhook
 
     body = json.dumps({
@@ -72,24 +105,32 @@ async def test_adapt_webhook_no_signature_skip_when_no_secret():
 
     req = MagicMock()
     req.read = AsyncMock(return_value=body)
-    req.headers = {}
+    req.headers = {"X-Webhook-Signature": "some-sig"}
 
-    with (
-        patch("bot.webhooks.settings") as mock_settings,
-        patch("bot.webhooks.async_session") as mock_session_cm,
-    ):
+    with patch("bot.webhooks.settings") as mock_settings:
         mock_settings.adapt_webhook_secret = ""
-        mock_settings.bot_token = "fake-token"
-
-        session_mock = AsyncMock()
-        session_mock.__aenter__ = AsyncMock(return_value=session_mock)
-        session_mock.__aexit__ = AsyncMock(return_value=False)
-        session_mock.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=None)))
-        mock_session_cm.return_value = session_mock
 
         response = await handle_adapt_webhook(req)
 
-    assert response.status == 200
+    assert response.status == 403
+
+
+@pytest.mark.asyncio
+async def test_adapt_webhook_missing_signature_returns_403():
+    """When secret is configured but X-Webhook-Signature header is missing, returns 403."""
+    from bot.webhooks import handle_adapt_webhook
+
+    body = b'{"event":"subs.expired"}'
+    req = MagicMock()
+    req.read = AsyncMock(return_value=body)
+    req.headers = {}
+
+    with patch("bot.webhooks.settings") as mock_settings:
+        mock_settings.adapt_webhook_secret = "my-secret"
+
+        response = await handle_adapt_webhook(req)
+
+    assert response.status == 403
 
 
 @pytest.mark.asyncio
@@ -151,10 +192,11 @@ async def test_adapt_webhook_correct_signature_processes():
 
 @pytest.mark.asyncio
 async def test_adapt_expired_webhook_marks_active_subscription_expired():
-    """The provider expiry event must update the local status and return 200."""
+    """The provider expiry event with valid signature must update the local status and return 200."""
     from bot.models import SubStatus
     from bot.webhooks import handle_adapt_webhook
 
+    secret = "my-secret"
     body = json.dumps({
         "event": "subs.expired",
         "data": {
@@ -162,9 +204,10 @@ async def test_adapt_expired_webhook_marks_active_subscription_expired():
             "external_user_id": "12345",
         },
     }).encode()
+    sig = _hmac_sig(secret, body)
     req = MagicMock()
     req.read = AsyncMock(return_value=body)
-    req.headers = {}
+    req.headers = {"X-Webhook-Signature": sig}
 
     adapt_record = MagicMock(subscription_id=77)
     subscription = MagicMock(status=SubStatus.ACTIVE)
@@ -182,7 +225,7 @@ async def test_adapt_expired_webhook_marks_active_subscription_expired():
         patch("bot.webhooks.settings") as mock_settings,
         patch("bot.webhooks.async_session") as mock_session_cm,
     ):
-        mock_settings.adapt_webhook_secret = ""
+        mock_settings.adapt_webhook_secret = secret
         mock_settings.webstore_bridge_secret = ""
         mock_session_cm.return_value = session_mock
 
@@ -228,3 +271,51 @@ async def test_adapt_sub_proxy_valid_uuid_fetches_upstream():
         response = await handle_adapt_subscription_proxy(req)
 
     assert response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_adapt_sub_devices_list():
+    import json
+    from bot.webhooks import handle_adapt_subscription_devices
+
+    uuid = "8c3c5da9-d89a-4d05-90da-57108d6d56c6"
+    req = MagicMock()
+    req.match_info = {"uuid": uuid}
+
+    mock_devices = [{"id": 101, "name": "Phone 1"}]
+    with patch("bot.services.adapt_api.AdaptAPI.get_devices", new=AsyncMock(return_value=mock_devices)):
+        response = await handle_adapt_subscription_devices(req)
+
+    assert response.status == 200
+    payload = json.loads(response.body.decode("utf-8"))
+    assert payload["ok"] is True
+    assert payload["devices"] == mock_devices
+
+
+@pytest.mark.asyncio
+async def test_adapt_sub_device_delete():
+    import json
+    from bot.webhooks import handle_adapt_subscription_device_delete
+
+    uuid = "8c3c5da9-d89a-4d05-90da-57108d6d56c6"
+    req = MagicMock()
+    req.match_info = {"uuid": uuid}
+    req.json = AsyncMock(return_value={"device_id": 101})
+
+    with patch("bot.services.adapt_api.AdaptAPI.delete_device", new=AsyncMock(return_value=True)):
+        response = await handle_adapt_subscription_device_delete(req)
+
+    assert response.status == 200
+    payload = json.loads(response.body.decode("utf-8"))
+    assert payload["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_adapt_sub_device_delete_invalid_uuid():
+    from bot.webhooks import handle_adapt_subscription_device_delete
+
+    req = MagicMock()
+    req.match_info = {"uuid": "invalid-uuid"}
+
+    response = await handle_adapt_subscription_device_delete(req)
+    assert response.status == 400

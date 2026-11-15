@@ -34,11 +34,11 @@ def _make_server():
     return s
 
 
-def _adapt_api_response(adapt_uuid="sub-uuid-001", days=30, devices=3):
+def _adapt_api_response(adapt_uuid="sub-uuid-001", days=30, devices=3, plan_uuid="plan-test-uuid"):
     return {
         "subscription_uuid": adapt_uuid,
         "subscription_url": f"https://network-api.adaptgroup.app/sub/{adapt_uuid}",
-        "plan_uuid": "plan-test-uuid",
+        "plan_uuid": plan_uuid,
         "end_date": (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z",
         "days": days,
         "devices": devices,
@@ -80,7 +80,7 @@ async def test_create_adapt_paid_subscription_success():
 
     with (
         patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
-        patch("bot.services.subscription_service._latest_adapt_subscription", new=AsyncMock(return_value=(None, None))),
+        patch("bot.services.subscription_service._user_adapt_subscriptions", new=AsyncMock(return_value=[])),
         patch("bot.services.subscription_service.AdaptAPI") as mock_adapt_cls,
         patch("bot.services.subscription_service.build_adapt_mirror_url", return_value="https://darimiru.ru/vpnbot/adapt-sub/sub-uuid-001"),
         patch("bot.services.subscription_service.get_included_device_slots", new=AsyncMock(return_value=3)),
@@ -136,7 +136,7 @@ async def test_create_adapt_paid_subscription_api_error():
 
     with (
         patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
-        patch("bot.services.subscription_service._latest_adapt_subscription", new=AsyncMock(return_value=(None, None))),
+        patch("bot.services.subscription_service._user_adapt_subscriptions", new=AsyncMock(return_value=[])),
         patch("bot.services.subscription_service.AdaptAPI") as mock_adapt_cls,
         patch("bot.services.subscription_service.plog"),
     ):
@@ -148,6 +148,76 @@ async def test_create_adapt_paid_subscription_api_error():
             await _create_adapt_paid_subscription(
                 session, user=user, tariff=tariff, platform=MagicMock()
             )
+
+
+@pytest.mark.asyncio
+async def test_create_adapt_paid_subscription_402_is_safe_waiting_funds():
+    from bot.services.adapt_api import AdaptAPIError
+    from bot.services.provisioning_issues import AccessProvisionError
+    from bot.services.subscription_service import _create_adapt_paid_subscription
+
+    session = AsyncMock()
+    user = _make_user()
+    tariff = _make_tariff()
+    server = _make_server()
+    payment = MagicMock(
+        id=778,
+        provisioning_operation_id=None,
+        provisioning_failure_code=None,
+    )
+
+    with (
+        patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
+        patch("bot.services.subscription_service._user_adapt_subscriptions", new=AsyncMock(return_value=[])),
+        patch("bot.services.subscription_service.AdaptAPI") as mock_adapt_cls,
+        patch("bot.services.subscription_service.plog"),
+    ):
+        mock_api = AsyncMock()
+        mock_api.create_subscription = AsyncMock(
+            side_effect=AdaptAPIError("Insufficient balance", status=402)
+        )
+        mock_adapt_cls.return_value = mock_api
+
+        with pytest.raises(AccessProvisionError) as raised:
+            await _create_adapt_paid_subscription(
+                session,
+                user=user,
+                tariff=tariff,
+                platform=MagicMock(),
+                provisioning_payment=payment,
+            )
+
+    assert raised.value.code == "adapt_api_402"
+    assert raised.value.stage == "pre_mutation"
+    assert raised.value.confirmed_rejection is True
+    assert raised.value.safe_retry_eligible is True
+    assert payment.provisioning_failure_code == "adapt_api_402"
+
+
+@pytest.mark.asyncio
+async def test_renew_adapt_subscription_propagates_confirmed_402():
+    from bot.services.adapt_api import AdaptAPIError
+    from bot.services.subscription_service import renew_adapt_subscription
+
+    session = AsyncMock()
+    adapt_record = MagicMock(adapt_uuid="adapt-renew-402", is_frozen=False)
+
+    with patch("bot.services.subscription_service.AdaptAPI") as mock_adapt_cls:
+        mock_api = AsyncMock()
+        mock_api.renew_subscription = AsyncMock(
+            side_effect=AdaptAPIError("Insufficient balance", status=402)
+        )
+        mock_adapt_cls.return_value = mock_api
+
+        with pytest.raises(AdaptAPIError) as raised:
+            await renew_adapt_subscription(
+                session,
+                adapt_record=adapt_record,
+                tariff_days=30,
+                manage_freeze=False,
+            )
+
+    assert raised.value.status == 402
 
 
 @pytest.mark.asyncio
@@ -164,7 +234,7 @@ async def test_create_adapt_paid_subscription_missing_uuid():
 
     with (
         patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
-        patch("bot.services.subscription_service._latest_adapt_subscription", new=AsyncMock(return_value=(None, None))),
+        patch("bot.services.subscription_service._user_adapt_subscriptions", new=AsyncMock(return_value=[])),
         patch("bot.services.subscription_service.AdaptAPI") as mock_adapt_cls,
         patch("bot.services.subscription_service.plog"),
     ):
@@ -189,6 +259,7 @@ async def test_create_adapt_paid_subscription_renews_existing_for_same_plan():
 
     existing = MagicMock()
     existing.id = 77
+    existing.vpn_key = "https://darimiru.ru/vpnbot/adapt-sub/sub-uuid-existing"
     existing.expires_at = datetime.utcnow() + timedelta(days=5)
     adapt_record = MagicMock()
     adapt_record.adapt_uuid = "sub-uuid-existing"
@@ -198,8 +269,8 @@ async def test_create_adapt_paid_subscription_renews_existing_for_same_plan():
     with (
         patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
         patch(
-            "bot.services.subscription_service._latest_adapt_subscription",
-            new=AsyncMock(return_value=(existing, adapt_record)),
+            "bot.services.subscription_service._user_adapt_subscriptions",
+            new=AsyncMock(return_value=[(existing, adapt_record)]),
         ),
         patch("bot.services.subscription_service.renew_adapt_subscription", new=AsyncMock(return_value=True)) as mock_renew,
         patch("bot.services.subscription_service.AdaptAPI") as mock_adapt_cls,
@@ -221,7 +292,9 @@ async def test_create_adapt_paid_subscription_renews_existing_for_same_plan():
             session, user=user, tariff=tariff, platform=MagicMock()
         )
 
-    mock_renew.assert_awaited_once_with(session, adapt_record=adapt_record, tariff_days=tariff.days)
+    mock_renew.assert_awaited_once_with(
+        session, adapt_record=adapt_record, tariff_days=tariff.days, manage_freeze=False
+    )
     mock_adapt_cls.return_value.create_subscription.assert_not_called()
     assert sub is existing
     assert key == "https://darimiru.ru/vpnbot/adapt-sub/sub-uuid-existing"
@@ -269,11 +342,19 @@ async def test_renew_adapt_subscription_unfreezes_first():
 
     unfreeze_response = {"end_date": "2026-09-01T00:00:00Z"}
     renew_response = {"end_date": "2026-10-01T00:00:00Z"}
+    freeze_response = {"success": True}
 
     with patch("bot.services.subscription_service.AdaptAPI") as mock_cls:
         mock_api = AsyncMock()
         mock_api.unfreeze_subscription = AsyncMock(return_value=unfreeze_response)
         mock_api.renew_subscription = AsyncMock(return_value=renew_response)
+        mock_api.freeze_subscription = AsyncMock(return_value=freeze_response)
+        mock_api.get_status = AsyncMock(side_effect=[
+            {"is_frozen": True},
+            {"is_frozen": False},
+            {"is_frozen": False},
+            {"is_frozen": True},
+        ])
         mock_cls.return_value = mock_api
 
         result = await renew_adapt_subscription(session, adapt_record=adapt_record, tariff_days=30)
@@ -281,8 +362,80 @@ async def test_renew_adapt_subscription_unfreezes_first():
     assert result is True
     mock_api.unfreeze_subscription.assert_awaited_once_with("sub-uuid-frozen")
     mock_api.renew_subscription.assert_awaited_once_with("sub-uuid-frozen")
+    mock_api.freeze_subscription.assert_awaited_once_with("sub-uuid-frozen")
+    assert adapt_record.is_frozen is True
+
+
+@pytest.mark.asyncio
+async def test_renew_adapt_subscription_restores_freeze_after_renew_failure():
+    from bot.services.adapt_api import AdaptAPIError
+    from bot.services.subscription_service import renew_adapt_subscription
+
+    session = AsyncMock()
+    adapt_record = MagicMock()
+    adapt_record.adapt_uuid = "sub-uuid-frozen-failed-renew"
+    adapt_record.is_frozen = True
+
+    with patch("bot.services.subscription_service.AdaptAPI") as mock_cls:
+        mock_api = AsyncMock()
+        mock_api.get_status = AsyncMock(side_effect=[
+            {"is_frozen": True},
+            {"is_frozen": False},
+            {"is_frozen": False},
+            {"is_frozen": True},
+        ])
+        mock_api.unfreeze_subscription = AsyncMock(return_value={})
+        mock_api.renew_subscription = AsyncMock(
+            side_effect=AdaptAPIError("renew failed", status=500)
+        )
+        mock_api.freeze_subscription = AsyncMock(return_value={})
+        mock_cls.return_value = mock_api
+
+        result = await renew_adapt_subscription(
+            session, adapt_record=adapt_record, tariff_days=30
+        )
+
+    assert result is False
+    mock_api.unfreeze_subscription.assert_awaited_once_with(adapt_record.adapt_uuid)
+    mock_api.renew_subscription.assert_awaited_once_with(adapt_record.adapt_uuid)
+    mock_api.freeze_subscription.assert_awaited_once_with(adapt_record.adapt_uuid)
+    assert adapt_record.is_frozen is True
+
+
+@pytest.mark.asyncio
+async def test_renew_adapt_subscription_does_not_retry_after_refreeze_failure():
+    from bot.services.adapt_api import AdaptAPIError
+    from bot.services.subscription_service import renew_adapt_subscription
+
+    session = AsyncMock()
+    adapt_record = MagicMock()
+    adapt_record.adapt_uuid = "sub-uuid-refreeze-failed"
+    adapt_record.is_frozen = True
+
+    with patch("bot.services.subscription_service.AdaptAPI") as mock_cls:
+        mock_api = AsyncMock()
+        mock_api.get_status = AsyncMock(side_effect=[
+            {"is_frozen": True},
+            {"is_frozen": False},
+            {"is_frozen": False},
+        ])
+        mock_api.unfreeze_subscription = AsyncMock(return_value={})
+        mock_api.renew_subscription = AsyncMock(return_value={
+            "end_date": "2026-10-01T00:00:00Z"
+        })
+        mock_api.freeze_subscription = AsyncMock(
+            side_effect=AdaptAPIError("freeze failed", status=500)
+        )
+        mock_cls.return_value = mock_api
+
+        result = await renew_adapt_subscription(
+            session, adapt_record=adapt_record, tariff_days=30
+        )
+
+    assert result is True
+    mock_api.renew_subscription.assert_awaited_once_with(adapt_record.adapt_uuid)
+    mock_api.freeze_subscription.assert_awaited_once_with(adapt_record.adapt_uuid)
     assert adapt_record.is_frozen is False
-    assert adapt_record.frozen_at is None
 
 
 @pytest.mark.asyncio
@@ -372,6 +525,7 @@ async def test_create_adapt_paid_subscription_upgrades_without_second_renew():
 
     existing = MagicMock()
     existing.id = 77
+    existing.vpn_key = "https://darimiru.ru/vpnbot/adapt-sub/sub-uuid-existing"
     existing.device_slots = 3
     existing.expires_at = datetime.utcnow() + timedelta(days=5)
 
@@ -423,7 +577,7 @@ async def test_expired_adapt_upgrade_reactivates_for_minimum_term_then_changes_p
     expired_end = datetime.utcnow() - timedelta(days=3)
     reactivated_end = datetime.utcnow() + timedelta(days=1)
     upgraded_end = datetime.utcnow() + timedelta(days=30)
-    existing = MagicMock(id=177, device_slots=5, expires_at=expired_end)
+    existing = MagicMock(id=177, device_slots=5, expires_at=expired_end, vpn_key="stable-key")
     adapt_record = MagicMock(
         adapt_uuid="expired-sub-uuid",
         adapt_plan_uuid="annual-plan",
@@ -564,25 +718,92 @@ async def test_adapt_upgrade_does_not_mutate_when_preflight_status_fails():
 
 
 @pytest.mark.asyncio
-async def test_explicit_new_adapt_purchase_never_reuses_existing_uuid():
+async def test_new_adapt_purchase_preserves_existing_uuid_for_demo_user():
     from bot.services.subscription_service import _create_adapt_paid_subscription
 
     session = AsyncMock()
     user = _make_user()
-    tariff = _make_tariff()
+    tariff = _make_tariff(adapt_plan_uuid="target-plan-uuid", days=30)
     server = _make_server()
+    now = datetime.utcnow()
+    existing_sub = MagicMock(
+        id=78,
+        vpn_key="https://darimiru.ru/vpnbot/adapt-sub/sub-uuid-001",
+        device_slots=1,
+        expires_at=now + timedelta(days=5),
+        billing_mode="demo",
+        tariff_id=None,
+        tariff=None,
+        tariff_days=7,
+        tariff_months=0,
+    )
+    from bot.config import settings
+    existing_adapt = MagicMock(
+        adapt_uuid="sub-uuid-001",
+        adapt_plan_uuid=settings.adapt_demo_plan_uuid,
+        end_date=now + timedelta(days=5),
+    )
     with (
         patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
-        patch("bot.services.subscription_service._latest_adapt_subscription", new=AsyncMock()) as latest,
-        patch("bot.services.subscription_service._adapt_create_new_subscription", new=AsyncMock(return_value=(MagicMock(), "new-key"))) as create_new,
+        patch("bot.services.subscription_service._user_adapt_subscriptions", new=AsyncMock(return_value=[(existing_sub, existing_adapt)])) as latest,
+        patch("bot.services.subscription_service.AdaptAPI") as mock_adapt_cls,
+        patch("bot.services.subscription_service.build_adapt_mirror_url", return_value="https://darimiru.ru/vpnbot/adapt-sub/sub-uuid-001"),
+        patch("bot.services.subscription_service.plog"),
     ):
-        _, key = await _create_adapt_paid_subscription(
+        mock_api = AsyncMock()
+        mock_api.get_status = AsyncMock(
+            side_effect=[
+                _adapt_api_response(plan_uuid="old-plan-uuid"),
+                _adapt_api_response(plan_uuid="target-plan-uuid"),
+            ]
+        )
+        mock_api.list_plans = AsyncMock(return_value=[{"uuid": "target-plan-uuid", "devices": 3, "is_active": True}])
+        mock_api.upgrade_subscription = AsyncMock(return_value={"subscription_uuid": "sub-uuid-001", "new_plan_uuid": "target-plan-uuid", "devices": 3})
+        mock_adapt_cls.return_value = mock_api
+
+        sub, key = await _create_adapt_paid_subscription(
             session, user=user, tariff=tariff, platform=MagicMock(), purchase_action="new"
         )
 
-    latest.assert_not_awaited()
+    latest.assert_awaited()
+    assert sub == existing_sub
+    assert "adapt-sub" in key
+
+
+@pytest.mark.asyncio
+async def test_explicit_new_adapt_purchase_creates_second_key_for_paid_user():
+    from bot.services.subscription_service import _create_adapt_paid_subscription
+
+    session = AsyncMock()
+    user = _make_user()
+    tariff = _make_tariff(adapt_plan_uuid="target-plan-uuid", days=30)
+    server = _make_server()
+    now = datetime.utcnow()
+    existing_paid_sub = MagicMock(
+        id=78,
+        device_slots=3,
+        expires_at=now + timedelta(days=20),
+        billing_mode="tariff",
+        tariff_id=5,
+        tariff_days=30,
+        tariff_months=1,
+    )
+    existing_adapt = MagicMock(
+        adapt_uuid="sub-uuid-001",
+        adapt_plan_uuid="plan-paid-uuid",
+        end_date=now + timedelta(days=20),
+    )
+    with (
+        patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
+        patch("bot.services.subscription_service._user_adapt_subscriptions", new=AsyncMock(return_value=[(existing_paid_sub, existing_adapt)])),
+        patch("bot.services.subscription_service._adapt_create_new_subscription", new=AsyncMock(return_value=(MagicMock(id=99), "new-key-for-mom"))) as create_new,
+    ):
+        sub, key = await _create_adapt_paid_subscription(
+            session, user=user, tariff=tariff, platform=MagicMock(), purchase_action="new"
+        )
+
     create_new.assert_awaited_once()
-    assert key == "new-key"
+    assert key == "new-key-for-mom"
 
 
 @pytest.mark.asyncio

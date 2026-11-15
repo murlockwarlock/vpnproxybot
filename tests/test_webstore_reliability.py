@@ -52,6 +52,33 @@ async def test_retryable_failure_keeps_paid_order_visible_and_schedules_retry(mo
 
 
 @pytest.mark.asyncio
+async def test_retryable_non_adapt_failure_keeps_retry_notification(monkeypatch):
+    admin_notify_mock = AsyncMock()
+    monkeypatch.setattr(routes, "_notify_admins_webstore", admin_notify_mock)
+    monkeypatch.setattr(routes, "_notify_linked_webstore_user", AsyncMock())
+    order = WebOrder(
+        order_id="retry-marzban-1",
+        tariff_key="vpn",
+        tariff_label="VPN",
+        days=30,
+        amount_rub=100,
+        status="paid",
+        fulfillment_attempts=1,
+    )
+    issue = build_internal_access_error(
+        provider="marzban",
+        code="marzban_api_503",
+        status=503,
+        admin_message="provider unavailable",
+    )
+
+    await routes._mark_order_failed(order, issue)
+
+    admin_notify_mock.assert_awaited_once()
+    assert admin_notify_mock.await_args.args[1] == "retrying"
+
+
+@pytest.mark.asyncio
 async def test_adapt_renew_retry_reconciles_without_second_mutation(monkeypatch, session_factory):
     adapt_uuid = "770fa622-a4bd-63f6-c938-668877662222"
     old_end = datetime.utcnow() + timedelta(days=5)
@@ -104,6 +131,61 @@ async def test_adapt_renew_retry_reconciles_without_second_mutation(monkeypatch,
         assert retry.status == "delivered"
         assert retry.marzban_username == f"adapt_{adapt_uuid}"
         api.renew_subscription.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_adapt_renew_direct_uuid_without_primary_or_tg_item_delivers(monkeypatch, session_factory):
+    adapt_uuid = "880fa622-b4bd-63f6-c938-668877663333"
+    old_end_date = datetime.utcnow() + timedelta(days=5)
+    end_date = old_end_date + timedelta(days=30)
+    async with session_factory() as session:
+        order = WebOrder(
+            order_id="uuid-renew",
+            profile_token="profile",
+            tariff_key="adapt-basic",
+            tariff_label="Adapt Basic",
+            days=30,
+            amount_rub=185,
+            status="paid",
+            purchase_action="renew",
+            target_order_id=f"uuid:{adapt_uuid}",
+            fulfillment_attempts=1,
+        )
+        session.add(order)
+        await session.commit()
+
+        api = AsyncMock()
+        api.get_status.side_effect = [
+            {
+                "plan_uuid": "plan-basic",
+                "end_date": old_end_date.isoformat(),
+                "devices": 5,
+            },
+            {
+                "plan_uuid": "plan-basic",
+                "end_date": end_date.isoformat(),
+                "devices": 5,
+            },
+        ]
+        api.list_plans.return_value = [{"uuid": "plan-basic", "devices": 5}]
+        api.renew_subscription.return_value = {
+            "plan_uuid": "plan-basic",
+            "end_date": end_date.isoformat(),
+            "devices": 5,
+        }
+        monkeypatch.setattr(routes, "AdaptAPI", lambda: api)
+        monkeypatch.setattr(
+            routes,
+            "get_store_tariffs_by_key",
+            lambda: {"adapt-basic": {"adapt_plan_uuid": "plan-basic", "provider": "adapt"}},
+        )
+
+        await routes._fulfill_adapt_order(session, order, "plan-basic")
+
+        assert order.status == "delivered"
+        assert order.marzban_username == f"adapt_{adapt_uuid}"
+        assert f"/adapt-sub/{adapt_uuid}" in order.subscription_url
+        api.renew_subscription.assert_awaited_once_with(adapt_uuid)
 
 
 @pytest.mark.asyncio

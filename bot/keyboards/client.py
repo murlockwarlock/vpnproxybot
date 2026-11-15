@@ -25,7 +25,7 @@ def main_menu_kb(
         InlineKeyboardButton(text=purchase_button_text, callback_data="buy"),
     )
     builder.row(
-        InlineKeyboardButton(text="🔑 Мои ключи", callback_data="my_keys"),
+        InlineKeyboardButton(text="🔑 Мои подписки", callback_data="my_keys"),
         InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
     )
     builder.row(
@@ -150,16 +150,15 @@ def tariffs_kb(
     return builder.as_markup()
 
 
-def purchase_action_kb(*, show_upgrade: bool = True) -> InlineKeyboardMarkup:
+def purchase_action_kb(*, show_upgrade: bool = True, show_new: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="↻ Продлить подписку", callback_data="purchase_action_renew")],
     ]
     if show_upgrade:
         rows.append([InlineKeyboardButton(text="↑ Улучшить подписку", callback_data="purchase_action_upgrade")])
-    rows.extend([
-        [InlineKeyboardButton(text="➕ Создать новую", callback_data="buy_new")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="profile")],
-    ])
+    if show_new:
+        rows.append([InlineKeyboardButton(text="➕ Создать новую", callback_data="buy_new")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="profile")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -176,6 +175,7 @@ def purchase_subscription_kb(
     position: int,
     total: int,
     show_upgrade: bool,
+    show_new: bool = False,
     back_callback: str = "buy",
 ) -> InlineKeyboardMarkup:
     rows = [
@@ -185,19 +185,36 @@ def purchase_subscription_kb(
         rows.append([
             InlineKeyboardButton(text="↑ Улучшить", callback_data=f"purchase_upgrade_{subscription_id}")
         ])
-    rows.append([
-        InlineKeyboardButton(
-            text="➕ Создать новую",
-            callback_data=f"buy_new_{subscription_id}",
-        )
-    ])
-    if total > 1:
+    if show_new:
         rows.append([
             InlineKeyboardButton(
-                text="Следующая",
-                callback_data=f"purchase_browse_{(position + 1) % total}",
+                text="➕ Создать новую",
+                callback_data=f"buy_new_{subscription_id}",
             )
         ])
+    if total > 1:
+        navigation = []
+        if position > 0:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="⬅️",
+                    callback_data=f"purchase_browse_{position - 1}",
+                )
+            )
+        navigation.append(
+            InlineKeyboardButton(
+                text=f"{position + 1}/{total}",
+                callback_data="ignore",
+            )
+        )
+        if position + 1 < total:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="➡️",
+                    callback_data=f"purchase_browse_{position + 1}",
+                )
+            )
+        rows.append(navigation)
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -347,7 +364,7 @@ def profile_kb(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if has_active_subs:
-        row = [InlineKeyboardButton(text="🔑 Мои ключи", callback_data="my_keys_1")]
+        row = [InlineKeyboardButton(text="🔑 Мои подписки", callback_data="my_keys_1")]
         if has_device_manageable_subs:
             row.append(InlineKeyboardButton(text="📱 Устройства", callback_data="my_devices"))
         builder.row(*row)
@@ -358,22 +375,9 @@ def profile_kb(
         builder.row(
             InlineKeyboardButton(text="💰 Пополнить баланс", callback_data="balance_menu"),
         )
-        balance_toggle_text = (
-            "🟢 Ежедневные списания включены"
-            if balance_mode_enabled and balance_autodebit_enabled
-            else "⚪️ Ежедневные списания выключены"
-        )
-        row_balance = [
-            InlineKeyboardButton(text=balance_toggle_text, callback_data="balance_toggle"),
+        builder.row(
             InlineKeyboardButton(text="📜 История баланса", callback_data="balance_history"),
-        ]
-        builder.row(*row_balance)
-        if has_daily_charge_tariff_choice:
-            builder.row(
-                InlineKeyboardButton(
-                    text="⚙️ Тариф для списаний", callback_data="daily_charge_tariff_choice"
-                )
-            )
+        )
     if has_recurring:
         if recurring_active:
             builder.row(

@@ -11,11 +11,14 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
+_BOT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 _DEFAULT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env.webstore"
 _CUSTOM_ENV_FILE = os.getenv("WEBSTORE_ENV_FILE", "").strip()
 _ENV_FILE = Path(_CUSTOM_ENV_FILE) if _CUSTOM_ENV_FILE else _DEFAULT_ENV_FILE
+if _BOT_ENV_FILE.exists():
+    load_dotenv(_BOT_ENV_FILE)
 if _ENV_FILE.exists():
-    load_dotenv(_ENV_FILE)
+    load_dotenv(_ENV_FILE, override=True)
 else:
     load_dotenv()
 
@@ -88,6 +91,10 @@ class WebStoreSettings:
     subscription_base_url: str = field(
         default_factory=lambda: os.getenv("SUBSCRIPTION_BASE_URL", "https://darimiru.ru")
     )
+    # Public webstore base URL for referral links and customer-facing site links
+    public_webstore_base_url: str = field(
+        default_factory=lambda: os.getenv("PUBLIC_WEBSTORE_BASE_URL", "https://darimiru.xyz")
+    )
     subscription_sub_path: str = field(
         default_factory=lambda: os.getenv("SUBSCRIPTION_SUB_PATH", "")
     )
@@ -149,7 +156,7 @@ class WebStoreSettings:
 
     # Admin notifications via Telegram (darimiru bot token)
     admin_bot_token: str = field(
-        default_factory=lambda: os.getenv("ADMIN_BOT_TOKEN", "")
+        default_factory=lambda: os.getenv("ADMIN_BOT_TOKEN", "").strip() or os.getenv("BOT_TOKEN", "").strip()
     )
     admin_ids: list[int] = field(default_factory=lambda: _env_admin_ids("ADMIN_IDS"))
     owner_ids: list[int] = field(
@@ -159,10 +166,10 @@ class WebStoreSettings:
         default_factory=lambda: os.getenv("TELEGRAM_PROXY", "").strip().strip('"').strip("'")
     )
     bridge_shared_secret: str = field(
-        default_factory=lambda: os.getenv("BRIDGE_SHARED_SECRET", "")
+        default_factory=lambda: os.getenv("BRIDGE_SHARED_SECRET", os.getenv("WEBSTORE_BRIDGE_SECRET", ""))
     )
     referral_bridge_url: str = field(
-        default_factory=lambda: os.getenv("REFERRAL_BRIDGE_URL", "")
+        default_factory=lambda: os.getenv("REFERRAL_BRIDGE_URL", "http://77.91.112.200:8080/vpnbot")
     )
     vhq_partner_api_url: str = field(
         default_factory=lambda: os.getenv(
@@ -175,6 +182,12 @@ class WebStoreSettings:
     )
     referral_commission_percent: float = field(
         default_factory=lambda: float(os.getenv("REFERRAL_COMMISSION_PERCENT", "40"))
+    )
+    cashback_enabled: bool = field(
+        default_factory=lambda: os.getenv("CASHBACK_ENABLED", "1") == "1"
+    )
+    cashback_percent: float = field(
+        default_factory=lambda: float(os.getenv("CASHBACK_PERCENT", "10"))
     )
     adapt_api_id: str = field(
         default_factory=lambda: os.getenv("ADAPT_API_ID", "")
@@ -224,7 +237,13 @@ class WebStoreSettings:
 
     @property
     def notification_recipient_ids(self) -> list[int]:
-        return sorted(set(self.admin_ids) | set(self.owner_ids) | set(self.support_agent_ids))
+        ids = set(self.admin_ids) | set(self.owner_ids) | set(self.support_agent_ids)
+        try:
+            from bot.config import settings as bot_settings
+            ids.update(bot_settings.notification_recipient_ids)
+        except Exception:
+            pass
+        return sorted(ids)
 
     @property
     def bot_handle(self) -> str:
@@ -447,7 +466,7 @@ def _bot_db_path() -> Path | None:
     return None
 
 
-def _load_bot_db_tariffs() -> list[dict] | None:
+def _load_bot_db_tariffs(*, include_inactive: bool = False) -> list[dict] | None:
     if not _env_bool("WEBSTORE_SYNC_TARIFFS_FROM_BOT_DB", True):
         return None
     path = _bot_db_path()
@@ -461,15 +480,18 @@ def _load_bot_db_tariffs() -> list[dict] | None:
         try:
             columns = {row[1] for row in con.execute("PRAGMA table_info(tariffs)").fetchall()}
             adapt_expr = "COALESCE(adapt_plan_uuid, '')" if "adapt_plan_uuid" in columns else "''"
+            cost_expr = "adapt_cost_price_usd" if "adapt_cost_price_usd" in columns else "NULL"
             vhq_expr = "COALESCE(vhq_tier, '')" if "vhq_tier" in columns else "''"
+            visibility_clause = "" if include_inactive else "WHERE is_active = 1 AND COALESCE(is_admin_only, 0) = 0"
             rows = con.execute(
                 f"""
                 SELECT id, label, days, price_rub, price_stars, tariff_type,
                        is_active, COALESCE(is_admin_only, 0) AS is_admin_only,
                        {adapt_expr} AS adapt_plan_uuid,
+                       {cost_expr} AS adapt_cost_price_usd,
                        {vhq_expr} AS vhq_tier
                 FROM tariffs
-                WHERE is_active = 1 AND COALESCE(is_admin_only, 0) = 0
+                {visibility_clause}
                 ORDER BY price_rub, days, id
                 """
             ).fetchall()
@@ -513,8 +535,67 @@ def _load_bot_db_tariffs() -> list[dict] | None:
             tariff["vhq_tier"] = vhq_tier
         if adapt_plan_uuid:
             tariff["adapt_plan_uuid"] = adapt_plan_uuid
+            if "adapt_cost_price_usd" in row.keys() and row["adapt_cost_price_usd"] is not None:
+                tariff["adapt_cost_price_usd"] = float(row["adapt_cost_price_usd"])
         tariffs.append(tariff)
     return tariffs or None
+
+
+def get_adapt_plan_metadata_by_uuid(plan_uuid: str) -> dict | None:
+    """Return local provider metadata for an Adapt plan UUID, including historical rows."""
+    if not plan_uuid:
+        return None
+    plan_uuid = str(plan_uuid).strip()
+    for t in get_store_tariffs():
+        if t.get("adapt_plan_uuid") == plan_uuid:
+            return t
+    path = _bot_db_path()
+    if path and path.exists():
+        try:
+            con = sqlite3.connect(str(path))
+            con.row_factory = sqlite3.Row
+            try:
+                columns = {row[1] for row in con.execute("PRAGMA table_info(tariffs)").fetchall()}
+                if {"adapt_plan_uuid", "days", "price_rub"}.issubset(columns):
+                    cost_expr = "adapt_cost_price_usd" if "adapt_cost_price_usd" in columns else "NULL"
+                    row = con.execute(
+                        f"SELECT adapt_plan_uuid, {cost_expr} AS adapt_cost_price_usd, days, price_rub FROM tariffs WHERE adapt_plan_uuid = ? ORDER BY id DESC LIMIT 1",
+                        (plan_uuid,),
+                    ).fetchone()
+                    if row:
+                        metadata = {
+                            "adapt_plan_uuid": str(row["adapt_plan_uuid"]),
+                            "days": int(row["days"] or 0),
+                            "price_rub": int(row["price_rub"] or 0),
+                        }
+                        if row["adapt_cost_price_usd"] is not None:
+                            metadata["adapt_cost_price_usd"] = float(row["adapt_cost_price_usd"])
+                            metadata["price_usd"] = float(row["adapt_cost_price_usd"])
+                        return metadata
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
+    return None
+
+
+def get_adapt_plan_metadata_by_key(tariff_key: str) -> dict | None:
+    if not tariff_key:
+        return None
+    tariff_key = str(tariff_key).strip()
+    for tariff in get_store_tariffs():
+        if (
+            tariff.get("key") == tariff_key
+            and tariff.get("adapt_plan_uuid")
+        ):
+            return tariff
+    for tariff in _load_bot_db_tariffs(include_inactive=True) or []:
+        if (
+            tariff.get("key") == tariff_key
+            and tariff.get("adapt_plan_uuid")
+        ):
+            return tariff
+    return None
 
 _adapt_basic_30_uuid = os.getenv("ADAPT_PLAN_UUID_BASIC_30", "").strip()
 _static_basic_30_provider = "adapt" if _adapt_basic_30_uuid else "vhq"

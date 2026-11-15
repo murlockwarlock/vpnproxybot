@@ -1,0 +1,18 @@
+# Minimal static check configuration to catch critical scoping, undefined names, and unbound variable bugs
+target-version = "py312"
+
+[lint]
+select = [
+    "F821", # undefined name
+    "F822", # undefined name in __all__
+    "F823", # local variable referenced before assignment
+    "B006", # mutable default argument
+    "B008", # function call in argument defaults
+]
+
+exclude = [
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    "chroma_db",
+]

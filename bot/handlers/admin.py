@@ -9,12 +9,12 @@ import html
 from datetime import datetime, timedelta
 
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import func, select, delete, text, or_
+from sqlalchemy import func, select, delete, text, or_, update
 from sqlalchemy.orm import selectinload
 
 from bot.config import settings
@@ -39,6 +39,7 @@ from bot.keyboards.admin import (
 from bot.keyboards.client import back_to_menu_kb
 from bot.models import (
     AdTrackingLink,
+    BalanceTopUp,
     BotSettings,
     MTProtoAccount,
     Payment,
@@ -58,6 +59,10 @@ from bot.models import (
     User,
     AdaptSubscription,
     AdminActionLog,
+    Feedback,
+    FeedbackMessage,
+    ManualSubscriptionOperation,
+    VhqSubscriptionFulfillment,
 )
 from bot.services.admin_audit import write_admin_audit
 from bot.services.client_names import build_client_name
@@ -65,6 +70,12 @@ from bot.services.device_slots import get_included_device_slots
 from bot.services.legal_docs import LEGAL_DOCS, get_all_legal_doc_urls
 from bot.services.tariff_utils import format_duration_days, format_subscription_duration
 from bot.services.adapt_routing import is_adapt_subscription, is_adapt_tariff, get_adapt_uuid_from_subscription
+from bot.services.purchase_intent import get_paid_adapt_upgrade_plans
+from bot.services.subscription_semantics import (
+    is_adapt_customer_upgrade_eligible,
+    is_adapt_trial_subscription,
+    is_adapt_trial_tariff,
+)
 from bot.services.vhq_routing import is_vhq_subscription, is_vhq_tariff
 from bot.services.vhq_subscription_proxy import (
     get_subscription_display_key,
@@ -78,6 +89,7 @@ from bot.utils.texts import (
     ADMIN_SERVER_INFO,
     ADMIN_SETTINGS_HEADER,
     ADMIN_STATS,
+    ADMIN_STATS_UNIFIED,
     ADMIN_TARIFF_ADDED,
     ADMIN_TARIFF_DELETED,
     ADMIN_TARIFF_TOGGLED,
@@ -271,6 +283,7 @@ def _build_manual_key_tariff_kb(
     tariffs: list[Tariff],
     *,
     back_callback: str,
+    operation_id: int | None = None,
 ) -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     type_headers = {
@@ -289,10 +302,18 @@ def _build_manual_key_tariff_kb(
                 )
             )
         duration = format_duration_days(int(tariff.days or 0))
+        import re
+        dev_match = re.search(r"(\d+)\s*📱", tariff.label or "")
+        devices_str = f" • {dev_match.group(1)}📱" if dev_match else ""
+        cb_data = (
+            f"adm_key_tariff_{operation_id}_{tariff.id}"
+            if operation_id is not None
+            else f"adm_key_tariff_{tariff.id}"
+        )
         kb.row(
             InlineKeyboardButton(
-                text=f"{_manual_key_tariff_provider_label(tariff)} | {duration} | {tariff.price_rub}₽",
-                callback_data=f"adm_key_tariff_{tariff.id}",
+                text=f"{_manual_key_tariff_provider_label(tariff)} | {duration}{devices_str} | {tariff.price_rub}₽",
+                callback_data=cb_data,
             )
         )
     kb.row(InlineKeyboardButton(text="◀️ Назад", callback_data=back_callback))
@@ -391,6 +412,7 @@ ESCAPE_COMMANDS = {"/start", "/help", "/admin", "/policy", "/agree", "/oferta"}
 # ── FSM States ────────────────────────────────────────
 
 class AdminStates(StatesGroup):
+    waiting_problem_payment_search = State()
     waiting_user_search           = State()
     waiting_user_id               = State()
     waiting_user_username         = State()
@@ -418,6 +440,9 @@ class AdminStates(StatesGroup):
     waiting_device_price_rub      = State()
     waiting_device_price_stars    = State()
     waiting_whatsapp_host         = State()
+    waiting_cashback_pct          = State()
+    waiting_cashback_notify_text  = State()
+    waiting_balance_reminder_text = State()
     waiting_legal_doc_url         = State()
     # Platform guide media
     waiting_guide_media           = State()
@@ -428,6 +453,8 @@ class AdminStates(StatesGroup):
     guide_btn_url                 = State()
     # Ad links
     waiting_ad_link_title         = State()
+    # Feedback reply
+    waiting_feedback_reply        = State()
 
 
 # ── Guard: /commands don't interrupt admin FSM flows ──
@@ -475,7 +502,7 @@ async def _admin_state_oferta(message: Message, state: FSMContext) -> None:
     await show_oferta_command(message)
 
 
-@router.message(AdminStates(), F.text.startswith("/"))
+@router.message(AdminStates(), ~StateFilter(AdminStates.waiting_problem_payment_search), F.text.startswith("/"))
 async def _guard_admin_commands(message: Message) -> None:
     """Prevent /commands from aborting ongoing admin input flows."""
     command = (message.text or "").split(maxsplit=1)[0].lower()
@@ -509,6 +536,972 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
         reply_markup=admin_menu_kb(),
         parse_mode="HTML",
     )
+
+
+@router.message(Command("reconcile_yookassa"))
+async def cmd_reconcile_yookassa(message: Message) -> None:
+    """Manually reconcile and fulfill a YooKassa payment by local ID or YooKassa UUID."""
+    if not _is_admin(message.from_user.id):
+        return
+
+    args = (message.text or "").split()[1:]
+    if not args:
+        await message.answer(
+            "<b>Использование:</b> <code>/reconcile_yookassa &lt;payment_id или provider_uuid&gt;</code>\n\n"
+            "Пример: <code>/reconcile_yookassa 306</code>\n"
+            "или: <code>/reconcile_yookassa 327a4555-000f-5001-8000-1b97ab7e9018</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    target = args[0].strip()
+    provider_payment_id = None
+
+    async with async_session() as session:
+        if target.isdigit():
+            p = await session.get(Payment, int(target))
+            if p and p.provider_payment_id:
+                provider_payment_id = p.provider_payment_id
+            else:
+                topup = await session.get(BalanceTopUp, int(target))
+                if topup and topup.provider_payment_id:
+                    provider_payment_id = topup.provider_payment_id
+        else:
+            provider_payment_id = target
+
+    if not provider_payment_id:
+        await message.answer(
+            f"❌ Не удалось найти платеж по запросу <code>{html.escape(target)}</code> в базе данных.",
+            parse_mode="HTML",
+        )
+        return
+
+    await message.answer(
+        f"⏳ Запуск аутентифицированной сверки YooKassa для <code>{html.escape(provider_payment_id)}</code>...",
+        parse_mode="HTML",
+    )
+
+    from bot.services.yookassa_reconciliation import verify_and_fulfill_yookassa_payment
+
+    try:
+        success, code = await verify_and_fulfill_yookassa_payment(
+            message.bot,
+            provider_payment_id,
+            source="admin_manual",
+        )
+        if success:
+            await message.answer(
+                f"✅ <b>Сверка YooKassa завершена успешно!</b>\n\n"
+                f"Provider ID: <code>{html.escape(provider_payment_id)}</code>\n"
+                f"Статус: <code>{code}</code>",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(
+                f"⚠️ <b>Результат сверки:</b> <code>{code}</code>\n\n"
+                f"Provider ID: <code>{html.escape(provider_payment_id)}</code>\n"
+                f"Услуга не выдана или платеж не подтвержден YooKassa.",
+                parse_mode="HTML",
+            )
+    except Exception as exc:
+        logger.exception("Manual reconciliation failed for %s: %s", provider_payment_id, exc)
+        await message.answer(f"❌ Ошибка сверки: <code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+
+
+# ── Problem Payments Dashboard ─────────────────────────
+
+
+async def _show_problem_payment_card(
+    target: Message | CallbackQuery,
+    item: Any,
+    source: str = "main",
+) -> None:
+    """Helper to render the detailed inspection card."""
+    from bot.keyboards.admin import problem_payment_detail_kb
+
+    tg = item.telegram_id or "—"
+    uname = f"@{item.username}" if item.username else "—"
+    fname = item.full_name or "—"
+
+    from bot.services.problem_payments import format_age, get_cached_live_status
+    cached = get_cached_live_status(item.item_type, item.item_id)
+    if cached:
+        c_age = format_age(cached.checked_at, datetime.utcnow())
+        yk_status_str = f"{cached.status_label} (проверено {c_age} назад)"
+    else:
+        yk_status_str = item.verified_provider_status or "не проверен"
+
+    supplier_line = f"\nПоставщик: <b>{html.escape(item.supplier_name)}</b>" if getattr(item, "supplier_name", None) else ""
+    diag_cause = getattr(item, "root_cause", None) or item.details
+    diag_action = getattr(item, "recommended_action", None) or "Проверить статус платежа и подписки."
+    retry_str = "Возможен (отказ подтверждён до мутации)" if getattr(item, "safe_retry_eligible", False) else "Требует предварительной проверки (во избежание двойной закупки)"
+    diag_code = getattr(item, "diagnostic_code", None) or item.category.value
+
+    text = (
+        f"🔍 <b>Инспекция проблемного платежа</b>\n\n"
+        f"Тип: <b>{'Платеж' if item.item_type == 'payment' else 'Пополнение баланса'} #{item.item_id}</b>\n"
+        f"Сумма: <b>{item.amount_rub:.2f} ₽</b>"
+        f"{supplier_line}\n"
+        f"Создан: <code>{item.created_at.strftime('%Y-%m-%d %H:%M:%S')}</code> ({item.age_str} назад)\n\n"
+        f"👤 <b>Клиент:</b>\n"
+        f"  Telegram ID: <code>{tg}</code>\n"
+        f"  Username: {uname}\n"
+        f"  Имя: {html.escape(fname)}\n\n"
+        f"💳 <b>Платёжный шлюз:</b>\n"
+        f"  ID: <code>{item.provider_payment_id or '—'}</code>\n"
+        f"  Статус в БД: <b>{item.local_status}</b>\n"
+        f"  Статус в YooKassa: <b>{html.escape(yk_status_str)}</b>\n\n"
+        f"⚙️ <b>Диагностика:</b>\n"
+        f"  Причина: <b>{html.escape(diag_cause)}</b>\n"
+        f"  Выдача: <b>{item.fulfillment_state}</b>\n"
+        f"  Действие: <i>{html.escape(diag_action)}</i>\n\n"
+        f"🛠 <b>Техническая информация:</b>\n"
+        f"  Категория: <code>{item.category.value}</code>\n"
+        f"  Код ошибки: <code>{html.escape(diag_code)}</code>\n"
+        f"  Безопасный повтор: <b>{retry_str}</b>"
+    )
+
+    can_force = False
+    if item.item_type == "payment":
+        async with async_session() as session:
+            p = await session.get(Payment, item.item_id)
+            if p and p.telegram_delivery_error:
+                err_str = p.telegram_delivery_error
+                if err_str.startswith("retry_failed:"):
+                    try:
+                        parts = err_str.split(":", 3)
+                        if len(parts) > 1 and parts[1].isdigit() and int(parts[1]) >= 3:
+                            can_force = True
+                    except (ValueError, IndexError):
+                        pass
+                elif err_str.startswith("delivery_in_progress:"):
+                    try:
+                        parts = err_str.split(":", 3)
+                        claimed_at = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                        attempts = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+                        now_epoch = int(datetime.utcnow().timestamp())
+                        if (now_epoch - claimed_at >= 300) and attempts >= 3:
+                            can_force = True
+                    except (ValueError, IndexError):
+                        pass
+
+    kb = problem_payment_detail_kb(
+        item_type=item.item_type,
+        item_id=item.item_id,
+        user_id=item.user_id,
+        provider_payment_id=item.provider_payment_id,
+        page=source,
+        category=item.category,
+        can_force_retry=can_force,
+    )
+
+    if hasattr(target, "message") and target.message:
+        try:
+            await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await target.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        if hasattr(target, "answer"):
+            await target.answer()
+    elif hasattr(target, "edit_text"):
+        try:
+            await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.in_({"adm_problem_payments", "adm_prob_main"}))
+@router.callback_query(F.data.startswith("adm_prob_page:"))
+async def admin_problem_payments_list(callback: CallbackQuery, state: FSMContext | None = None) -> None:
+    """Problem payments dashboard - clean summary of last 7 days (DB-only, <1s)."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    if state:
+        await state.clear()
+
+    from bot.keyboards.admin import problem_payments_main_kb
+    from bot.services.problem_payments import ProblemCategory, get_fast_dashboard_summary
+
+    summary = await get_fast_dashboard_summary(days=7)
+
+    text_lines = [
+        "⚠️ <b>Проблемные платежи</b>",
+        "<i>Актуальные · последние 7 дней</i>\n",
+        f"🚨 Оплачено, не выдано: <b>{summary.urgent_unfulfilled}</b>",
+        f"📨 Ошибка доставки в TG: <b>{summary.tg_delivery_failed}</b>",
+        f"⚙️ Ошибка выдачи Adapt/VHQ: <b>{summary.supplier_failed}</b>",
+        f"🔎 Требует проверки: <b>{summary.needs_review}</b>",
+    ]
+
+    if summary.total_active == 0:
+        text_lines.append("\n✅ <b>Новых проблемных платежей не обнаружено.</b>")
+    else:
+        text_lines.append("\n<b>Срочные записи:</b>")
+        for item in summary.urgent_items:
+            tg = item.telegram_id or "—"
+            user_label = f"@{item.username}" if item.username else f"ID {tg}"
+            cat_icon = {
+                ProblemCategory.CONFIRMED_UNFULFILLED: "🚨",
+                ProblemCategory.TELEGRAM_DELIVERY_FAILED: "📨",
+                ProblemCategory.FAILED_SUPPLIER: "⚙️",
+                ProblemCategory.DELIVERY_UNCERTAIN: "🔎",
+            }.get(item.category, "⚠️")
+            supp = f"[{item.supplier_name}] " if getattr(item, "supplier_name", None) else ""
+            text_lines.append(
+                f"• {cat_icon} <b>#{item.item_id}</b> · <b>{item.amount_rub:.0f} ₽</b> · {user_label} · {item.age_str} назад\n"
+                f"  {supp}<i>{html.escape(item.fulfillment_state)}</i>"
+            )
+
+    msg_text = "\n".join(text_lines)
+    kb = problem_payments_main_kb(summary)
+    try:
+        await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(msg_text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_prob_cat:"))
+async def admin_problem_payments_cat_view(callback: CallbackQuery, state: FSMContext | None = None) -> None:
+    """Category-filtered view of problem payments (last 7 days, DB-only)."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    if state:
+        await state.clear()
+
+    parts = callback.data.split(":")
+    cat_name = parts[1] if len(parts) > 1 else "urgent"
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+
+    from bot.keyboards.admin import problem_payments_list_kb
+    from bot.services.problem_payments import ProblemCategory, ProblemScope, get_problem_payments_page
+
+    cat_titles = {
+        "urgent": "🚨 Оплачено, не выдано",
+        "tg_delivery": "📨 Ошибка доставки в TG",
+        "supplier": "⚙️ Сбои выдачи Adapt/VHQ",
+        "review": "🔎 Требует проверки",
+    }
+    title = cat_titles.get(cat_name, "⚠️ Проблемные записи")
+
+    items, total_count, total_pages = await get_problem_payments_page(
+        category=cat_name,
+        scope=ProblemScope.ACTIVE,
+        page=page,
+        per_page=6,
+    )
+
+    text_lines = [
+        f"⚠️ <b>Проблемные платежи · {title}</b>",
+        f"<i>Актуальные · последние 7 дней (стр. {page}/{total_pages}, всего: {total_count})</i>\n",
+    ]
+    if not items:
+        text_lines.append("<i>В этой категории нет активных записей.</i>")
+    else:
+        for item in items:
+            tg = item.telegram_id or "—"
+            user_label = f"@{item.username}" if item.username else f"ID {tg}"
+            cat_icon = {
+                ProblemCategory.CONFIRMED_UNFULFILLED: "🚨",
+                ProblemCategory.TELEGRAM_DELIVERY_FAILED: "📨",
+                ProblemCategory.FAILED_SUPPLIER: "⚙️",
+                ProblemCategory.DELIVERY_UNCERTAIN: "🔎",
+            }.get(item.category, "⚠️")
+            supp = f"[{item.supplier_name}] " if getattr(item, "supplier_name", None) else ""
+            text_lines.append(
+                f"• {cat_icon} <b>#{item.item_id}</b> · <b>{item.amount_rub:.0f} ₽</b> ({item.age_str} назад)\n"
+                f"  Клиент: {user_label} | {supp}{item.fulfillment_state}"
+            )
+
+    msg_text = "\n".join(text_lines)
+    kb = problem_payments_list_kb(items, category=cat_name, scope="active", page=page, total_pages=total_pages)
+    try:
+        await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(msg_text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_prob_archive:"))
+async def admin_problem_payments_archive_view(callback: CallbackQuery, state: FSMContext | None = None) -> None:
+    """Archive view of problem payments older than 7 days (read-only, DB-only)."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    if state:
+        await state.clear()
+
+    parts = callback.data.split(":")
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+
+    from bot.keyboards.admin import problem_payments_list_kb
+    from bot.services.problem_payments import ProblemCategory, ProblemScope, get_problem_payments_page
+
+    items, total_count, total_pages = await get_problem_payments_page(
+        scope=ProblemScope.ARCHIVE,
+        page=page,
+        per_page=6,
+    )
+
+    text_lines = [
+        "🗂 <b>Архив проблемных платежей</b>",
+        f"<i>Записи старше 7 дней (стр. {page}/{total_pages}, всего: {total_count})</i>\n",
+        "<i>Исторические платежи перенесены в архив для сохранения чистоты текущей панели. "
+        "Данные доступны для просмотра и поиска по ID.</i>\n",
+    ]
+    if not items:
+        text_lines.append("<i>В архиве нет записей.</i>")
+    else:
+        for item in items:
+            tg = item.telegram_id or "—"
+            user_label = f"@{item.username}" if item.username else f"ID {tg}"
+            cat_icon = {
+                ProblemCategory.CONFIRMED_UNFULFILLED: "🚨",
+                ProblemCategory.TELEGRAM_DELIVERY_FAILED: "📨",
+                ProblemCategory.FAILED_SUPPLIER: "⚙️",
+                ProblemCategory.DELIVERY_UNCERTAIN: "🔎",
+                ProblemCategory.VERIFIED_MANUALLY_FULFILLED: "✅",
+                ProblemCategory.MANUALLY_FULFILLED: "✅",
+                ProblemCategory.PROVIDER_PENDING: "⏳",
+            }.get(item.category, "⚠️")
+            supp = f"[{item.supplier_name}] " if getattr(item, "supplier_name", None) else ""
+            text_lines.append(
+                f"• {cat_icon} <b>#{item.item_id}</b> · <b>{item.amount_rub:.0f} ₽</b> ({item.age_str} назад)\n"
+                f"  Клиент: {user_label} | {supp}{item.fulfillment_state}"
+            )
+
+    msg_text = "\n".join(text_lines)
+    kb = problem_payments_list_kb(items, scope="archive", page=page, total_pages=total_pages)
+    try:
+        await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(msg_text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm_prob_search")
+async def admin_problem_payment_search_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Prompt admin to enter payment number or provider ID."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    from bot.keyboards.admin import problem_payment_search_back_kb
+
+    await state.set_state(AdminStates.waiting_problem_payment_search)
+    prompt_text = (
+        "🔍 <b>Поиск платежа</b>\n\n"
+        "Введите номер платежа (например, <code>306</code>) или provider_payment_id из YooKassa:"
+    )
+    kb = problem_payment_search_back_kb()
+    try:
+        await callback.message.edit_text(prompt_text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(prompt_text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_problem_payment_search, F.text)
+async def admin_problem_payment_search_process(message: Message, state: FSMContext) -> None:
+    """Handle payment search input."""
+    if not _is_admin(message.from_user.id):
+        return
+
+    text = message.text.strip()
+    if text.startswith("/"):
+        await state.clear()
+        if text in ("/cancel", "/отмена"):
+            await message.answer("Поиск отменен.", parse_mode="HTML")
+            return
+        if text.startswith(("/payment", "/pay")):
+            parts = text.split(maxsplit=1)
+            query = parts[1].strip() if len(parts) > 1 else ""
+            if query:
+                from bot.services.problem_payments import find_problem_payment_by_query
+                item = await find_problem_payment_by_query(query)
+                if item:
+                    await _show_problem_payment_card(message, item, source="search")
+                    return
+                else:
+                    await message.answer(f"❌ Платёж «{html.escape(query)}» не найден в базе данных.", parse_mode="HTML")
+                    return
+            else:
+                await message.answer("Использование: <code>/payment 306</code>", parse_mode="HTML")
+                return
+        await message.answer("Поиск отменен. Выполните команду заново.", parse_mode="HTML")
+        return
+
+    query = text
+    from bot.keyboards.admin import problem_payment_search_back_kb
+    from bot.services.problem_payments import find_problem_payment_by_query
+
+    item = await find_problem_payment_by_query(query)
+    if not item:
+        await message.answer(
+            f"❌ Платёж «{html.escape(query)}» не найден в базе данных.\n"
+            f"Проверьте номер или ID и попробуйте снова:",
+            reply_markup=problem_payment_search_back_kb(),
+            parse_mode="HTML",
+        )
+        return
+
+    await state.clear()
+    await _show_problem_payment_card(message, item, source="search")
+
+
+@router.message(Command("payment", "pay"))
+async def admin_payment_command(message: Message, command: CommandObject, state: FSMContext | None = None) -> None:
+    """Direct command /payment <id> or /pay <id>."""
+    if not _is_admin(message.from_user.id):
+        return
+
+    if state:
+        await state.clear()
+
+    query = (command.args or "").strip()
+    if not query:
+        await message.answer(
+            "Использование: <code>/payment 306</code> или <code>/payment &lt;uuid&gt;</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    from bot.services.problem_payments import find_problem_payment_by_query
+
+    item = await find_problem_payment_by_query(query)
+    if not item:
+        await message.answer(
+            f"❌ Платёж «{html.escape(query)}» не найден в базе данных.",
+            parse_mode="HTML",
+        )
+        return
+
+    await _show_problem_payment_card(message, item, source="search")
+
+
+@router.callback_query(F.data.startswith("adm_prob_inspect:"))
+async def admin_problem_payment_inspect(callback: CallbackQuery) -> None:
+    """Inspect detailed diagnostics card of a single problem payment (fast, DB-only)."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    code = parts[1]
+    item_id = int(parts[2])
+    source = parts[3] if len(parts) > 3 else "main"
+
+    from bot.services.problem_payments import get_problem_payment_by_id
+
+    item = await get_problem_payment_by_id(item_id, "payment" if code == "p" else "topup")
+    if not item:
+        await callback.answer("Запись не найдена в базе данных", show_alert=True)
+        return
+
+    await _show_problem_payment_card(callback, item, source=source)
+
+
+@router.callback_query(F.data.startswith("adm_prob_refresh:"))
+async def admin_problem_payment_refresh(callback: CallbackQuery) -> None:
+    """Explicit on-demand live status verification from YooKassa API."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    code = parts[1]
+    item_id = int(parts[2])
+    source = parts[3] if len(parts) > 3 else "main"
+
+    await callback.answer("⏳ Запрос в YooKassa API...", show_alert=False)
+    from bot.services.problem_payments import verify_single_payment_live
+
+    item, msg = await verify_single_payment_live("payment" if code == "p" else "topup", item_id, force=True)
+    if not item:
+        await callback.answer(f"⚠️ {msg}", show_alert=True)
+        return
+
+    await _show_problem_payment_card(callback, item, source=source)
+    await callback.message.answer(f"ℹ️ <b>Результат проверки:</b> {html.escape(msg)}", parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("adm_prob_reconcile:"))
+async def admin_problem_payment_reconcile(callback: CallbackQuery) -> None:
+    """Prompt for explicit confirmation before triggering potentially chargeable reconciliation."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    code = parts[1]
+    item_id = int(parts[2])
+    page = parts[3] if len(parts) > 3 else "main"
+
+    provider_id = None
+    amount_str = "—"
+    client_tg = "—"
+    async with async_session() as session:
+        if code == "p":
+            p = await session.get(Payment, item_id)
+            if p:
+                provider_id = p.provider_payment_id
+                amount_str = f"{(p.amount / 100.0):.2f}"
+                u = await session.get(User, p.user_id) if p.user_id else None
+                client_tg = str(u.telegram_id if u else p.telegram_chat_id or "—")
+        else:
+            t = await session.get(BalanceTopUp, item_id)
+            if t:
+                provider_id = t.provider_payment_id
+                amount_str = f"{t.amount_rub:.2f}"
+                client_tg = str(t.telegram_id)
+
+    if not provider_id:
+        await callback.answer("У записи нет provider_payment_id", show_alert=True)
+        return
+
+    from bot.services.problem_payments import classify_and_verify_candidate, ProblemCategory
+    cand = {"type": "payment" if code == "p" else "topup", "obj": p if code == "p" else t, "user": u if code == "p" else None}
+    diag = await classify_and_verify_candidate(cand)
+    if diag and diag.category in (
+        ProblemCategory.VERIFIED_MANUALLY_FULFILLED,
+        ProblemCategory.MANUALLY_FULFILLED,
+        ProblemCategory.DELIVERY_UNCERTAIN,
+        ProblemCategory.TELEGRAM_DELIVERY_FAILED,
+        ProblemCategory.PROVIDER_PENDING,
+    ):
+        if diag.category in (ProblemCategory.VERIFIED_MANUALLY_FULFILLED, ProblemCategory.MANUALLY_FULFILLED):
+            await callback.answer(
+                "⛔️ Услуга по этому платежу уже была выдана клиенту вручную! Повторная сверка заблокирована во избежание дублирования.",
+                show_alert=True,
+            )
+        elif diag.category == ProblemCategory.DELIVERY_UNCERTAIN:
+            await callback.answer(
+                "⛔️ Статус платежа неясен (недостаточно данных). Автоматическая выдача заблокирована. Требуется ручная проверка администратором.",
+                show_alert=True,
+            )
+        elif diag.category == ProblemCategory.TELEGRAM_DELIVERY_FAILED:
+            await callback.answer(
+                "ℹ️ Подписка уже создана! Для отправки сообщения клиенту воспользуйтесь кнопкой «Отправить доступ клиенту в TG».",
+                show_alert=True,
+            )
+        else:
+            await callback.answer(
+                "⛔️ Платеж ещё не оплачен клиентом в YooKassa. Сверка невозможна.",
+                show_alert=True,
+            )
+        return
+
+    from bot.keyboards.admin import problem_payment_reconcile_confirm_kb
+    confirm_text = (
+        f"⚠️ <b>Подтверждение принудительной сверки</b>\n\n"
+        f"Тип: <b>{'Платеж' if code == 'p' else 'Пополнение баланса'} #{item_id}</b>\n"
+        f"Сумма: <b>{amount_str} ₽</b>\n"
+        f"Клиент: <code>{client_tg}</code>\n"
+        f"ID в YooKassa: <code>{provider_id}</code>\n\n"
+        f"<i>Внимание: сверка выполнит обращение к YooKassa и может вызвать повторную выдачу услуги у поставщика. Продолжить?</i>"
+    )
+    kb = problem_payment_reconcile_confirm_kb(code, item_id, page=page)
+    try:
+        await callback.message.edit_text(confirm_text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(confirm_text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_prob_rec_confirm:"))
+async def admin_problem_payment_reconcile_confirm(callback: CallbackQuery) -> None:
+    """Execute confirmed reconciliation, log admin audit, and show result."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    code = parts[1]
+    item_id = int(parts[2])
+    page = parts[3] if len(parts) > 3 else "main"
+
+    provider_id = None
+    target_tg = None
+    async with async_session() as session:
+        if code == "p":
+            p = await session.get(Payment, item_id)
+            if p:
+                provider_id = p.provider_payment_id
+                u = await session.get(User, p.user_id) if p.user_id else None
+                target_tg = u.telegram_id if u else p.telegram_chat_id
+        else:
+            t = await session.get(BalanceTopUp, item_id)
+            if t:
+                provider_id = t.provider_payment_id
+                target_tg = t.telegram_id
+
+    if not provider_id:
+        await callback.answer("У записи нет provider_payment_id", show_alert=True)
+        return
+
+    from bot.services.problem_payments import classify_and_verify_candidate, ProblemCategory
+    cand = {"type": "payment" if code == "p" else "topup", "obj": p if code == "p" else t, "user": u if code == "p" else None}
+    diag = await classify_and_verify_candidate(cand)
+    if diag and diag.category in (
+        ProblemCategory.VERIFIED_MANUALLY_FULFILLED,
+        ProblemCategory.MANUALLY_FULFILLED,
+        ProblemCategory.DELIVERY_UNCERTAIN,
+        ProblemCategory.TELEGRAM_DELIVERY_FAILED,
+        ProblemCategory.PROVIDER_PENDING,
+    ):
+        if diag.category in (ProblemCategory.VERIFIED_MANUALLY_FULFILLED, ProblemCategory.MANUALLY_FULFILLED):
+            await callback.answer(
+                "⛔️ Услуга уже была выдана клиенту вручную! Повторная выдача отменена.",
+                show_alert=True,
+            )
+        elif diag.category == ProblemCategory.DELIVERY_UNCERTAIN:
+            await callback.answer(
+                "⛔️ Статус платежа неясен (недостаточно данных). Сверка заблокирована.",
+                show_alert=True,
+            )
+        elif diag.category == ProblemCategory.TELEGRAM_DELIVERY_FAILED:
+            await callback.answer(
+                "ℹ️ Подписка уже создана! Для отправки сообщения клиенту воспользуйтесь кнопкой «Отправить доступ клиенту в TG».",
+                show_alert=True,
+            )
+        else:
+            await callback.answer(
+                "⛔️ Платеж ещё не оплачен клиентом в YooKassa. Сверка невозможна.",
+                show_alert=True,
+            )
+        return
+
+    await callback.answer("⏳ Запуск сверки...", show_alert=False)
+    from bot.services.yookassa_reconciliation import verify_and_fulfill_yookassa_payment
+    success, res_code = await verify_and_fulfill_yookassa_payment(
+        callback.bot,
+        provider_id,
+        source="admin_dashboard",
+    )
+
+    await write_admin_audit(
+        actor_telegram_id=callback.from_user.id,
+        action="problem_payment_reconcile",
+        summary=f"Ручная сверка {code}#{item_id} ({provider_id})",
+        entity_type="payment" if code == "p" else "balance_topup",
+        entity_id=str(item_id),
+        target_telegram_id=target_tg,
+        status="success" if success else "failed",
+        details=f"result={res_code}",
+    )
+
+    from bot.services.problem_payments import format_reconciliation_result
+    summary_text, action_text = format_reconciliation_result(res_code)
+
+    if success:
+        await callback.message.answer(
+            f"✅ <b>Сверка успешна!</b>\n\n"
+            f"<b>Результат:</b> {html.escape(summary_text)}\n"
+            f"ID в YooKassa: <code>{provider_id}</code>\n"
+            f"<i>Диагностический код: <code>{res_code}</code></i>",
+            parse_mode="HTML",
+        )
+    else:
+        await callback.message.answer(
+            f"⚠️ <b>Результат сверки:</b> {html.escape(summary_text)}\n\n"
+            f"<b>Рекомендуемое действие:</b> {html.escape(action_text)}\n"
+            f"ID в YooKassa: <code>{provider_id}</code>\n"
+            f"<i>Диагностический код: <code>{res_code}</code></i>",
+            parse_mode="HTML",
+        )
+
+    synthetic = callback.model_copy(update={"data": f"adm_prob_inspect:{code}:{item_id}:{page}"}) if hasattr(callback, "model_copy") else callback
+    await admin_problem_payment_inspect(synthetic)
+
+
+@router.callback_query(F.data.startswith("adm_prob_retry_tg:"))
+async def admin_problem_payment_retry_tg(callback: CallbackQuery) -> None:
+    """Safely retry delivering existing subscription info to customer in Telegram without supplier re-mutation."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    code = parts[1]
+    item_id = int(parts[2])
+    page = parts[3] if len(parts) > 3 and parts[3] != "force" else "main"
+    is_force = (len(parts) > 4 and parts[4] == "force") or (len(parts) > 3 and parts[3] == "force")
+
+    if code != "p":
+        await callback.answer("Повторная отправка доступна только для платежей за подписку", show_alert=True)
+        return
+
+    async with async_session() as session:
+        payment = await session.get(Payment, item_id)
+        if not payment:
+            await callback.answer("Платеж не найден", show_alert=True)
+            return
+
+        if payment.status != PaymentStatus.COMPLETED:
+            await callback.answer("⛔️ Платеж еще не завершен (статус не COMPLETED). Повторная отправка невозможна.", show_alert=True)
+            return
+
+        if not payment.telegram_delivery_error:
+            await callback.answer("✅ Доступ уже успешно доставлен клиенту в Telegram", show_alert=True)
+            return
+
+        if not payment.subscription_id:
+            await callback.answer("⛔️ У платежа нет привязанной подписки", show_alert=True)
+            return
+
+        sub = await session.get(Subscription, payment.subscription_id)
+        if not sub:
+            await callback.answer("Подписка не найдена в базе данных", show_alert=True)
+            return
+
+        if sub.user_id != payment.user_id:
+            logger.error(
+                "Admin retry delivery security abort: sub %s user_id (%s) != payment user_id (%s)",
+                sub.id, sub.user_id, payment.user_id,
+            )
+            await callback.answer("⛔️ Ошибка безопасности: подписка принадлежит другому пользователю!", show_alert=True)
+            return
+
+        user = await session.get(User, payment.user_id)
+        if not user or not user.telegram_id:
+            await callback.answer("Пользователь или Telegram ID не найден", show_alert=True)
+            return
+
+        prior_error = payment.telegram_delivery_error
+        is_in_progress = prior_error.startswith("delivery_in_progress")
+        is_retry_failed = prior_error.startswith("retry_failed")
+        now_epoch = int(datetime.utcnow().timestamp())
+        prior_attempts = 0
+        orig_kind = "general"
+        is_expired_recovery = False
+
+        if is_in_progress:
+            # format: delivery_in_progress:<epoch>:<attempts>:<orig_kind>
+            prog_parts = prior_error.split(":", 3)
+            claimed_at = now_epoch
+            try:
+                if len(prog_parts) > 1 and prog_parts[1].isdigit():
+                    claimed_at = int(prog_parts[1])
+                if len(prog_parts) > 2 and prog_parts[2].isdigit():
+                    prior_attempts = int(prog_parts[2])
+                if len(prog_parts) > 3:
+                    orig_kind = prog_parts[3]
+            except (ValueError, IndexError):
+                pass
+
+            # Requirement 1: Force retry must NEVER bypass an active, non-expired delivery claim.
+            if now_epoch - claimed_at < 300:
+                await callback.answer("⏳ Отправка уже выполняется другим администратором или задачей", show_alert=True)
+                return
+
+            # Claim has expired (> 300s): handle as uncertain delivery outcome with bounded recovery
+            is_expired_recovery = True
+        elif is_retry_failed:
+            # format: retry_failed:<attempts>:<orig_kind>:<err>
+            fail_parts = prior_error.split(":", 3)
+            try:
+                if len(fail_parts) > 1 and fail_parts[1].isdigit():
+                    prior_attempts = int(fail_parts[1])
+                if len(fail_parts) > 2:
+                    orig_kind = fail_parts[2]
+            except (ValueError, IndexError):
+                pass
+        else:
+            orig_kind = "proxy" if prior_error.startswith("proxy_link_failed") else "general"
+
+        if is_force:
+            # Requirement 2: Allow force reset only for an exhausted retry state
+            if prior_attempts < 3:
+                await callback.answer(
+                    "⛔️ Принудительный сброс доступен только при исчерпании лимита попыток (3). Используйте стандартную отправку.",
+                    show_alert=True,
+                )
+                return
+            next_attempt = 1
+        else:
+            next_attempt = prior_attempts + 1
+            if next_attempt > 3:
+                logger.warning("Payment %s exceeded retry attempts (%s)", payment.id, prior_attempts)
+                await callback.answer(
+                    "⛔️ Превышен лимит попыток отправки (3). Проверьте логи сервера или используйте принудительный сброс.",
+                    show_alert=True,
+                )
+                synthetic = callback.model_copy(update={"data": f"adm_prob_inspect:p:{payment.id}:{page}"}) if hasattr(callback, "model_copy") else callback
+                await admin_problem_payment_inspect(synthetic)
+                return
+
+        # Atomic Compare-And-Set (CAS) conditional claim
+        in_progress_marker = f"delivery_in_progress:{now_epoch}:{next_attempt}:{orig_kind}"
+        stmt = (
+            update(Payment)
+            .where(
+                Payment.id == payment.id,
+                Payment.telegram_delivery_error == prior_error,
+            )
+            .values(telegram_delivery_error=in_progress_marker)
+        )
+        cas_res = await session.execute(stmt)
+        await session.commit()
+
+        if cas_res.rowcount == 0:
+            # Another concurrent execution claimed or resolved the payment first!
+            await callback.answer("⏳ Отправка уже выполняется другим администратором", show_alert=True)
+            return
+
+        tariff = await session.get(Tariff, payment.tariff_id) if payment.tariff_id else None
+        proxy_link = None
+        proxy_acc = await session.scalar(
+            select(ProxyAccount).where(ProxyAccount.subscription_id == sub.id)
+        )
+        if proxy_acc:
+            proxy_link = proxy_acc.get_proxy_link()
+
+    # Requirements 3 & 4: Audit force-reset or expired recovery ONLY AFTER atomic claim succeeded
+    if is_force:
+        await write_admin_audit(
+            actor_telegram_id=callback.from_user.id,
+            action="force_reset_telegram_retry",
+            summary=f"Принудительный сброс лимита попыток отправки TG (платеж #{payment.id})",
+            entity_type="payment",
+            entity_id=str(payment.id),
+            target_telegram_id=user.telegram_id,
+            status="success",
+            details=f"prior_attempts={prior_attempts} prior_error={prior_error[:100]}",
+        )
+    elif is_expired_recovery:
+        await write_admin_audit(
+            actor_telegram_id=callback.from_user.id,
+            action="recover_expired_delivery_claim",
+            summary=f"Восстановление зависшей отправки в TG (платеж #{payment.id}, попытка {next_attempt})",
+            entity_type="payment",
+            entity_id=str(payment.id),
+            target_telegram_id=user.telegram_id,
+            status="success",
+            details=f"recovered_from={prior_error[:100]} prior_attempts={prior_attempts} next_attempt={next_attempt}",
+        )
+
+    from bot.webhooks import send_subscription_delivery_messages, _platform_from_str, _is_deferred_platform
+    delivery_plat = _platform_from_str(payment.platform or "")
+    needs_choice = bool(
+        payment.platform
+        and _is_deferred_platform(payment.platform)
+        and tariff
+        and tariff.tariff_type != TariffType.TG_PROXY
+    )
+    expires_str = sub.expires_at.strftime("%d.%m.%Y") if sub.expires_at else "N/A"
+
+    # Distinguish failed primary key delivery from auxiliary failures (e.g. proxy link)
+    is_proxy_only_failure = (orig_kind == "proxy")
+    resend_primary = not is_proxy_only_failure
+    resend_secondary = True
+
+    try:
+        success, err = await send_subscription_delivery_messages(
+            bot=callback.bot,
+            chat_id=payment.telegram_chat_id or user.telegram_id,
+            telegram_user_id=user.telegram_id,
+            subscription_id=sub.id,
+            delivery_platform=delivery_plat,
+            vpn_key_str=sub.vpn_key,
+            proxy_link=proxy_link,
+            expires_str=expires_str,
+            needs_platform_choice=needs_choice,
+            payment_id=payment.id,
+            resend_primary=resend_primary,
+            resend_secondary=resend_secondary,
+            record_db_error=False,
+        )
+    except Exception as exc:
+        success = False
+        err = f"send_failed: {exc}"
+
+    # Requirement 5: Final success/failure updates must conditionally match the exact claim marker
+    was_applied = False
+    if success:
+        async with async_session() as session:
+            stmt = (
+                update(Payment)
+                .where(
+                    Payment.id == payment.id,
+                    Payment.telegram_delivery_error == in_progress_marker,
+                )
+                .values(telegram_delivery_error=None)
+            )
+            res = await session.execute(stmt)
+            await session.commit()
+            was_applied = (res.rowcount > 0)
+    else:
+        async with async_session() as session:
+            err_clean = (err or "send_failed").replace(":", " ")[:200]
+            err_msg = f"retry_failed:{next_attempt}:{orig_kind}:{err_clean}"[:255]
+            stmt = (
+                update(Payment)
+                .where(
+                    Payment.id == payment.id,
+                    Payment.telegram_delivery_error == in_progress_marker,
+                )
+                .values(telegram_delivery_error=err_msg)
+            )
+            res = await session.execute(stmt)
+            await session.commit()
+            was_applied = (res.rowcount > 0)
+
+    if not was_applied:
+        logger.warning(
+            "Stale delivery completion ignored for payment %s; marker %s was already superseded",
+            payment.id, in_progress_marker,
+        )
+
+    audit_status = "success" if (success and was_applied) else "superseded" if not was_applied else "failed"
+    audit_details = (
+        f"attempt={next_attempt} mode={'proxy_only' if is_proxy_only_failure else 'full'} "
+        f"{'delivered' if success else f'err={err}'} was_applied={was_applied}"
+    )
+    await write_admin_audit(
+        actor_telegram_id=callback.from_user.id,
+        action="retry_telegram_delivery",
+        summary=f"Повторная отправка доступа клиенту в TG (платеж #{payment.id}, подписка #{sub.id})",
+        entity_type="payment",
+        entity_id=str(payment.id),
+        target_telegram_id=user.telegram_id,
+        status=audit_status,
+        details=audit_details,
+    )
+
+    if not was_applied:
+        await callback.answer("⚠️ Отправка завершена, но статус не обновлен: задача была вытеснена более новой попыткой", show_alert=True)
+    elif success:
+        await callback.answer("✅ Доступ успешно отправлен клиенту в Telegram!", show_alert=True)
+    else:
+        await callback.answer(f"❌ Ошибка отправки (попытка {next_attempt}/3): {err}", show_alert=True)
+
+    synthetic = callback.model_copy(update={"data": f"adm_prob_inspect:p:{payment.id}:{page}"}) if hasattr(callback, "model_copy") else callback
+    await admin_problem_payment_inspect(synthetic)
+
+
+@router.callback_query(F.data.startswith("adm_prob_user:"))
+async def admin_problem_payment_user(callback: CallbackQuery) -> None:
+    """Jump to comprehensive customer card."""
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    user_id = int(callback.data.split(":")[1])
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+
+    if not user:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+
+    await _show_user_info(callback.message, user)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_panel")
@@ -648,31 +1641,45 @@ async def admin_ad_link_toggle(callback: CallbackQuery) -> None:
     await callback.answer("Статус обновлён")
 
 
-# ── Statistics ────────────────────────────────────────
+async def _fetch_webstore_stats_dict() -> dict[str, Any] | None:
+    if not getattr(settings, "webstore_public_enabled", False) or not getattr(settings, "webstore_api_base_url", None):
+        return None
+    url = f"{settings.webstore_api_base_url.rstrip('/')}/api/store/internal/admin-stats"
+    headers = {"X-Internal-Secret": settings.webstore_bridge_secret}
+    try:
+        import aiohttp as _aiohttp
+        async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=4)) as sess:
+            async with sess.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+    except Exception as exc:
+        logger.debug("Failed to fetch webstore stats: %s", exc)
+    return None
 
-@router.callback_query(F.data == "adm_stats")
-async def admin_stats(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user.id):
-        return
-    await callback.message.edit_text(
-        "📊 <b>Статистика</b>\n\nВыберите раздел:",
-        reply_markup=stats_menu_kb(webstore=settings.webstore_public_enabled),
-        parse_mode="HTML",
-    )
-    await callback.answer()
 
-
-@router.callback_query(F.data == "adm_stats_overview")
+@router.callback_query(F.data.in_({"adm_stats", "adm_stats_overview"}))
 async def admin_stats_overview(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         return
 
+    now = datetime.utcnow()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_ago = today - timedelta(days=7)
+    month_ago = today - timedelta(days=30)
+
+    web_data = await _fetch_webstore_stats_dict()
+
     async with async_session() as session:
-        total_users = await session.scalar(select(func.count(User.id)))
-        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        total_users = await session.scalar(select(func.count(User.id))) or 0
         new_today = await session.scalar(
             select(func.count(User.id)).where(User.created_at >= today)
-        )
+        ) or 0
+        paying_users = await session.scalar(
+            select(func.count(func.distinct(Subscription.user_id))).where(
+                Subscription.status == SubStatus.ACTIVE,
+                Subscription.billing_mode != "demo",
+            )
+        ) or 0
         active_subs_res = await session.execute(
             select(Subscription).where(Subscription.status == SubStatus.ACTIVE)
         )
@@ -681,11 +1688,10 @@ async def admin_stats_overview(callback: CallbackQuery) -> None:
 
         expired_subs = await session.scalar(
             select(func.count(Subscription.id)).where(Subscription.status == SubStatus.EXPIRED)
-        )
+        ) or 0
         total_payments = await session.scalar(
             select(func.count(Payment.id)).where(Payment.status == PaymentStatus.COMPLETED)
-        )
-        server_count = await session.scalar(select(func.count(Server.id)))
+        ) or 0
 
         # Group and count active subscriptions
         marzban_paid = sum(1 for s in active_list if not is_adapt_subscription(s) and not is_vhq_subscription(s) and s.billing_mode != "demo")
@@ -695,24 +1701,202 @@ async def admin_stats_overview(callback: CallbackQuery) -> None:
         vhq_paid = sum(1 for s in active_list if is_vhq_subscription(s) and s.billing_mode != "demo")
         vhq_demo = sum(1 for s in active_list if is_vhq_subscription(s) and s.billing_mode == "demo")
 
-        details = (
-            f"├ Marzban: <b>{marzban_paid}</b> (демо: <b>{marzban_demo}</b>)\n"
-            f"├ Adapt: <b>{adapt_paid}</b> (демо: <b>{adapt_demo}</b>)\n"
-        )
-        if vhq_paid > 0 or vhq_demo > 0:
-            details += f"├ VHQ: <b>{vhq_paid}</b> (демо: <b>{vhq_demo}</b>)\n"
+        details_lines = []
+        if (adapt_paid + adapt_demo) > 0:
+            demo_suffix = f" (из них демо: <b>{adapt_demo}</b>)" if adapt_demo > 0 else ""
+            details_lines.append(f" ├ Adapt: <b>{adapt_paid + adapt_demo}</b>{demo_suffix}")
+        if (vhq_paid + vhq_demo) > 0:
+            demo_suffix = f" (из них демо: <b>{vhq_demo}</b>)" if vhq_demo > 0 else ""
+            details_lines.append(f" ├ VHQ: <b>{vhq_paid + vhq_demo}</b>{demo_suffix}")
+        if (marzban_paid + marzban_demo) > 0:
+            demo_suffix = f" (из них демо: <b>{marzban_demo}</b>)" if marzban_demo > 0 else ""
+            details_lines.append(f" ├ Marzban: <b>{marzban_paid + marzban_demo}</b>{demo_suffix}")
 
-    await callback.message.edit_text(
-        ADMIN_STATS.format(
+        if not details_lines:
+            details_lines.append(" ├ Подписок пока нет")
+
+        details = "\n".join(details_lines) + "\n"
+
+        # Demo conversion in bot
+        paid_user_ids_q = select(Payment.user_id).where(Payment.status == PaymentStatus.COMPLETED).distinct()
+        bot_demo_total = await session.scalar(select(func.count(func.distinct(Subscription.user_id))).where(Subscription.billing_mode == "demo")) or 0
+        bot_demo_paid = await session.scalar(select(func.count(func.distinct(Subscription.user_id))).where(Subscription.billing_mode == "demo", Subscription.user_id.in_(paid_user_ids_q))) or 0
+        bot_conv = round((bot_demo_paid / bot_demo_total * 100), 1) if bot_demo_total > 0 else 0.0
+
+        # Churn in bot
+        ever_paid = await session.scalar(
+            select(func.count(func.distinct(Payment.user_id))).where(
+                Payment.status == PaymentStatus.COMPLETED,
+            )
+        ) or 0
+        still_active = await session.scalar(
+            select(func.count(func.distinct(Subscription.user_id))).where(
+                Subscription.billing_mode != "demo",
+                Subscription.status == SubStatus.ACTIVE,
+                Subscription.user_id.in_(paid_user_ids_q),
+            )
+        ) or 0
+        churned = ever_paid - still_active
+        churn_rate = (churned / ever_paid * 100) if ever_paid > 0 else 0.0
+
+        # Bot revenue RUB
+        def _rub_sum(since=None):
+            q = select(func.coalesce(func.sum(Payment.amount), 0)).where(
+                Payment.status == PaymentStatus.COMPLETED,
+                Payment.currency == "RUB",
+            )
+            if since is not None:
+                q = q.where(Payment.created_at >= since)
+            return q
+
+        bot_rub_today = (await session.scalar(_rub_sum(today))) / 100
+        bot_rub_week = (await session.scalar(_rub_sum(week_ago))) / 100
+        bot_rub_month = (await session.scalar(_rub_sum(month_ago))) / 100
+        bot_rub_total = (await session.scalar(_rub_sum())) / 100
+
+        stars_total = await session.scalar(
+            select(func.coalesce(func.sum(Payment.amount), 0)).where(
+                Payment.status == PaymentStatus.COMPLETED,
+                Payment.currency == "XTR",
+            )
+        ) or 0
+
+    if web_data:
+        web_rev = web_data.get("revenue", {})
+        web_sc = web_data.get("status_counts", {})
+        web_profiles = int(web_data.get("total_profiles", 0) or 0)
+        web_paid_count = int(web_sc.get("delivered", 0) or 0)
+
+        web_active_dict = web_data.get("active", {})
+        web_active_paid = int(web_active_dict.get("paid", 0) or 0)
+        web_active_demo = int(web_active_dict.get("demo", 0) or 0)
+        web_active_total = web_active_paid + web_active_demo
+        web_expired_subs = int(web_active_dict.get("expired", 0) or 0)
+
+        web_today = float(web_rev.get("today", 0) or 0)
+        web_w7 = float(web_rev.get("w7", 0) or 0)
+        web_w30 = float(web_rev.get("w30", 0) or 0)
+        web_all = float(web_rev.get("all", 0) or 0)
+
+        # Web conversion & demo
+        web_conv_data = web_data.get("conversion", {})
+        web_demo_total = int(web_conv_data.get("demo_total", 0) or 0)
+        web_demo_converted = int(web_conv_data.get("demo_converted", 0) or 0)
+        web_demo_conv = round((web_demo_converted / web_demo_total * 100), 1) if web_demo_total > 0 else 0.0
+
+        # Web churn
+        web_churn_data = web_data.get("churn", {})
+        web_ever_paid = int(web_churn_data.get("ever_paid", 0) or 0)
+        web_still_active = int(web_churn_data.get("still_active", 0) or 0)
+        web_churned = int(web_churn_data.get("churned", 0) or 0)
+        web_churn_rate = round((web_churned / web_ever_paid * 100), 1) if web_ever_paid > 0 else 0.0
+
+        # Combinations
+        total_clients = total_users + web_profiles
+        total_active_all = active_subs + web_active_total
+        total_expired_all = expired_subs + web_expired_subs
+        total_payments_count = total_payments + web_paid_count
+
+        comb_today = bot_rub_today + web_today
+        comb_7d = bot_rub_week + web_w7
+        comb_30d = bot_rub_month + web_w30
+        comb_all = bot_rub_total + web_all
+
+        comb_demo_total = bot_demo_total + web_demo_total
+        comb_demo_paid = bot_demo_paid + web_demo_converted
+        comb_demo_conv = round((comb_demo_paid / comb_demo_total * 100), 1) if comb_demo_total > 0 else 0.0
+
+        comb_ever_paid = ever_paid + web_ever_paid
+        comb_still_active = still_active + web_still_active
+        comb_churned = churned + web_churned
+        comb_churn_rate = round((comb_churned / comb_ever_paid * 100), 1) if comb_ever_paid > 0 else 0.0
+
+        stars_text = f" + {stars_total}⭐" if stars_total > 0 else ""
+
+        def _fmt_rev_line(comb_val, bot_val, web_val):
+            if web_val > 0 and bot_val > 0:
+                return f"<b>{comb_val:,.0f} ₽</b> (ТГ: {bot_val:,.0f} ₽ · Сайт: {web_val:,.0f} ₽)"
+            elif web_val > 0:
+                return f"<b>{comb_val:,.0f} ₽</b> (Сайт: {web_val:,.0f} ₽)"
+            elif bot_val > 0:
+                return f"<b>{comb_val:,.0f} ₽</b> (ТГ: {bot_val:,.0f} ₽)"
+            return "<b>0 ₽</b>"
+
+        # Detailed breakdown of active accesses
+        details_lines = [
+            f" ├ 📱 В Telegram: <b>{active_subs}</b> (платных: <b>{marzban_paid + adapt_paid + vhq_paid}</b> · демо: <b>{marzban_demo + adapt_demo + vhq_demo}</b>)",
+            f" ├ 🌐 На Сайте: <b>{web_active_total}</b> (платных: <b>{web_active_paid}</b> · демо: <b>{web_active_demo}</b>)",
+        ]
+        proto_parts = []
+        if (adapt_paid + adapt_demo) > 0:
+            proto_parts.append(f"Adapt: <b>{adapt_paid + adapt_demo}</b>")
+        if (vhq_paid + vhq_demo) > 0:
+            proto_parts.append(f"VHQ: <b>{vhq_paid + vhq_demo}</b>")
+        if (marzban_paid + marzban_demo) > 0:
+            proto_parts.append(f"Marzban: <b>{marzban_paid + marzban_demo}</b>")
+        if proto_parts:
+            details_lines.append(f" └ В боте по протоколам: {' · '.join(proto_parts)}")
+        details = "\n".join(details_lines) + "\n"
+
+        conversion_block = (
+            f"\n\n📈 <b>Воронка и конверсия:</b>\n"
+            f" ├ 🎁 <b>Демо → Покупка: {comb_demo_conv}%</b> ({comb_demo_paid} из {comb_demo_total})\n"
+            f" │   ├ В боте: <b>{bot_conv}%</b> ({bot_demo_paid} из {bot_demo_total})\n"
+            f" │   └ На сайте: <b>{web_demo_conv}%</b> ({web_demo_converted} из {web_demo_total})\n"
+            f" └ 📉 <b>Отток клиентов: {comb_churn_rate:.1f}%</b> ({comb_churned} не продлили из {comb_ever_paid})\n"
+            f"     ├ В боте: <b>{churn_rate:.1f}%</b> ({churned} из {ever_paid})\n"
+            f"     └ На сайте: <b>{web_churn_rate:.1f}%</b> ({web_churned} из {web_ever_paid})"
+        )
+
+        msg_text = ADMIN_STATS_UNIFIED.format(
+            total_clients=total_clients,
+            total_users=total_users,
+            new_today=new_today,
+            paying_users=paying_users,
+            web_profiles=web_profiles,
+            active_subs=total_active_all,
+            bot_active_subs=active_subs,
+            web_active_subs=web_active_total,
+            details=details,
+            total_payments=total_payments_count,
+            bot_payments=total_payments,
+            web_payments=web_paid_count,
+            rev_today=_fmt_rev_line(comb_today, bot_rub_today, web_today),
+            rev_7d=_fmt_rev_line(comb_7d, bot_rub_week, web_w7),
+            rev_30d=_fmt_rev_line(comb_30d, bot_rub_month, web_w30),
+            rev_all=_fmt_rev_line(comb_all, bot_rub_total, web_all),
+            stars_text=stars_text,
+            conversion_block=conversion_block,
+            expired_subs=total_expired_all,
+            bot_expired_subs=expired_subs,
+            web_expired_subs=web_expired_subs,
+        )
+    else:
+        stars_text = f" + {stars_total}⭐" if stars_total > 0 else ""
+        conversion_block = (
+            f"\n\n📈 <b>Воронка и конверсия:</b>\n"
+            f" ├ 🎁 <b>Демо → Покупка:</b> <b>{bot_conv}%</b> ({bot_demo_paid} купили из {bot_demo_total} демо)\n"
+            f" └ 📉 <b>Отток клиентов:</b> <b>{churn_rate:.1f}%</b> ({churned} не продлили из {ever_paid} плативших)"
+        )
+        msg_text = ADMIN_STATS.format(
             total_users=total_users or 0,
             new_today=new_today or 0,
+            paying_users=paying_users or 0,
             active_subs=active_subs or 0,
             details=details,
             expired_subs=expired_subs or 0,
             total_payments=total_payments or 0,
-            server_count=server_count or 0,
-        ),
-        reply_markup=stats_back_kb(),
+            rev_today=f"<b>{bot_rub_today:,.0f} ₽</b>",
+            rev_7d=f"<b>{bot_rub_week:,.0f} ₽</b>",
+            rev_30d=f"<b>{bot_rub_month:,.0f} ₽</b>",
+            rev_all=f"<b>{bot_rub_total:,.0f} ₽</b>",
+            stars_text=stars_text,
+            conversion_block=conversion_block,
+        )
+
+    await callback.message.edit_text(
+        msg_text,
+        reply_markup=stats_menu_kb(webstore=settings.webstore_public_enabled),
         parse_mode="HTML",
     )
     await callback.answer()
@@ -727,6 +1911,8 @@ async def admin_stats_revenue(callback: CallbackQuery) -> None:
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = today - timedelta(days=7)
     month_ago = today - timedelta(days=30)
+
+    web_data = await _fetch_webstore_stats_dict()
 
     async with async_session() as session:
         # RUB revenue (amount in kopecks)
@@ -755,15 +1941,15 @@ async def admin_stats_revenue(callback: CallbackQuery) -> None:
                 Payment.created_at >= since,
             )
 
-        stars_today = await session.scalar(_stars_sum(today))
-        stars_week = await session.scalar(_stars_sum(week_ago))
-        stars_month = await session.scalar(_stars_sum(month_ago))
+        stars_today = await session.scalar(_stars_sum(today)) or 0
+        stars_week = await session.scalar(_stars_sum(week_ago)) or 0
+        stars_month = await session.scalar(_stars_sum(month_ago)) or 0
         stars_total = await session.scalar(
             select(func.coalesce(func.sum(Payment.amount), 0)).where(
                 Payment.status == PaymentStatus.COMPLETED,
                 Payment.currency == "XTR",
             )
-        )
+        ) or 0
 
         # Payment count
         cnt_today = await session.scalar(
@@ -771,31 +1957,69 @@ async def admin_stats_revenue(callback: CallbackQuery) -> None:
                 Payment.status == PaymentStatus.COMPLETED,
                 Payment.created_at >= today,
             )
-        )
+        ) or 0
         cnt_week = await session.scalar(
             select(func.count(Payment.id)).where(
                 Payment.status == PaymentStatus.COMPLETED,
                 Payment.created_at >= week_ago,
             )
-        )
+        ) or 0
         cnt_month = await session.scalar(
             select(func.count(Payment.id)).where(
                 Payment.status == PaymentStatus.COMPLETED,
                 Payment.created_at >= month_ago,
             )
-        )
+        ) or 0
+        cnt_total = await session.scalar(
+            select(func.count(Payment.id)).where(
+                Payment.status == PaymentStatus.COMPLETED,
+            )
+        ) or 0
 
-    text = (
-        "💰 <b>Выручка</b>\n\n"
-        f"<b>Сегодня:</b>\n"
-        f"  {rub_today:,.0f}₽ + {stars_today}⭐ ({cnt_today} оплат)\n\n"
-        f"<b>За 7 дней:</b>\n"
-        f"  {rub_week:,.0f}₽ + {stars_week}⭐ ({cnt_week} оплат)\n\n"
-        f"<b>За 30 дней:</b>\n"
-        f"  {rub_month:,.0f}₽ + {stars_month}⭐ ({cnt_month} оплат)\n\n"
-        f"<b>За всё время:</b>\n"
-        f"  {rub_total:,.0f}₽ + {stars_total}⭐"
-    )
+    if web_data:
+        web_rev = web_data.get("revenue", {})
+        web_sc = web_data.get("status_counts", {})
+        web_delivered = int(web_sc.get("delivered", 0) or 0)
+        web_today = float(web_rev.get("today", 0) or 0)
+        web_w7 = float(web_rev.get("w7", 0) or 0)
+        web_w30 = float(web_rev.get("w30", 0) or 0)
+        web_all = float(web_rev.get("all", 0) or 0)
+
+        comb_today = rub_today + web_today
+        comb_week = rub_week + web_w7
+        comb_month = rub_month + web_w30
+        comb_total = rub_total + web_all
+        comb_cnt_total = cnt_total + web_delivered
+
+        stars_today_text = f" + {stars_today}⭐" if stars_today > 0 else ""
+        stars_week_text = f" + {stars_week}⭐" if stars_week > 0 else ""
+        stars_month_text = f" + {stars_month}⭐" if stars_month > 0 else ""
+        stars_total_text = f" + {stars_total}⭐" if stars_total > 0 else ""
+
+        text = (
+            "💰 <b>Выручка</b>\n\n"
+            f"<b>Сегодня:</b>\n"
+            f"  <b>{comb_today:,.0f} ₽</b> (ТГ: {rub_today:,.0f} ₽ · Сайт: {web_today:,.0f} ₽){stars_today_text}\n\n"
+            f"<b>За 7 дней:</b>\n"
+            f"  <b>{comb_week:,.0f} ₽</b> (ТГ: {rub_week:,.0f} ₽ · Сайт: {web_w7:,.0f} ₽){stars_week_text}\n\n"
+            f"<b>За 30 дней:</b>\n"
+            f"  <b>{comb_month:,.0f} ₽</b> (ТГ: {rub_month:,.0f} ₽ · Сайт: {web_w30:,.0f} ₽){stars_month_text}\n\n"
+            f"<b>За всё время:</b>\n"
+            f"  <b>{comb_total:,.0f} ₽</b> (ТГ: {rub_total:,.0f} ₽ · Сайт: {web_all:,.0f} ₽){stars_total_text}\n\n"
+            f"<b>Оплат за всё время:</b> <b>{comb_cnt_total}</b> (ТГ: {cnt_total} · Сайт: {web_delivered})"
+        )
+    else:
+        text = (
+            "💰 <b>Выручка</b>\n\n"
+            f"<b>Сегодня:</b>\n"
+            f"  {rub_today:,.0f}₽ + {stars_today}⭐ ({cnt_today} оплат)\n\n"
+            f"<b>За 7 дней:</b>\n"
+            f"  {rub_week:,.0f}₽ + {stars_week}⭐ ({cnt_week} оплат)\n\n"
+            f"<b>За 30 дней:</b>\n"
+            f"  {rub_month:,.0f}₽ + {stars_month}⭐ ({cnt_month} оплат)\n\n"
+            f"<b>За всё время:</b>\n"
+            f"  {rub_total:,.0f}₽ + {stars_total}⭐ ({cnt_total} оплат)"
+        )
 
     await callback.message.edit_text(text, reply_markup=stats_back_kb(), parse_mode="HTML")
     await callback.answer()
@@ -811,17 +2035,19 @@ async def admin_stats_users(callback: CallbackQuery) -> None:
     week_ago = today - timedelta(days=7)
     month_ago = today - timedelta(days=30)
 
+    web_data = await _fetch_webstore_stats_dict()
+
     async with async_session() as session:
-        total = await session.scalar(select(func.count(User.id)))
+        total = await session.scalar(select(func.count(User.id))) or 0
         new_today = await session.scalar(
             select(func.count(User.id)).where(User.created_at >= today)
-        )
+        ) or 0
         new_week = await session.scalar(
             select(func.count(User.id)).where(User.created_at >= week_ago)
-        )
+        ) or 0
         new_month = await session.scalar(
             select(func.count(User.id)).where(User.created_at >= month_ago)
-        )
+        ) or 0
 
         # Users with at least one active paid sub
         paying_users = await session.scalar(
@@ -829,17 +2055,31 @@ async def admin_stats_users(callback: CallbackQuery) -> None:
                 Subscription.status == SubStatus.ACTIVE,
                 Subscription.billing_mode != "demo",
             )
-        )
+        ) or 0
 
-    text = (
-        "👥 <b>Пользователи</b>\n\n"
-        f"Всего: <b>{total}</b>\n"
-        f"Платящих (активная подписка): <b>{paying_users}</b>\n\n"
-        f"<b>Новых:</b>\n"
-        f"  Сегодня: <b>{new_today}</b>\n"
-        f"  За 7 дней: <b>{new_week}</b>\n"
-        f"  За 30 дней: <b>{new_month}</b>"
-    )
+    if web_data:
+        web_profiles = int(web_data.get("total_profiles", 0) or 0)
+        total_clients = total + web_profiles
+        text = (
+            "👥 <b>Пользователи</b>\n\n"
+            f"<b>Всего клиентов:</b> <b>{total_clients}</b>\n"
+            f" ├ ТГ-бот: <b>{total}</b> (активных платящих: <b>{paying_users}</b>)\n"
+            f" └ Сайт: <b>{web_profiles}</b>\n\n"
+            "<b>Новых в ТГ-боте:</b>\n"
+            f"  Сегодня: <b>{new_today}</b>\n"
+            f"  За 7 дней: <b>{new_week}</b>\n"
+            f"  За 30 дней: <b>{new_month}</b>"
+        )
+    else:
+        text = (
+            "👥 <b>Пользователи</b>\n\n"
+            f"Всего в ТГ-боте: <b>{total}</b>\n"
+            f"Активных платящих: <b>{paying_users}</b>\n\n"
+            "<b>Новых:</b>\n"
+            f"  Сегодня: <b>{new_today}</b>\n"
+            f"  За 7 дней: <b>{new_week}</b>\n"
+            f"  За 30 дней: <b>{new_month}</b>"
+        )
 
     await callback.message.edit_text(text, reply_markup=stats_back_kb(), parse_mode="HTML")
     await callback.answer()
@@ -850,22 +2090,22 @@ async def admin_stats_conversion(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         return
 
+    web_data = await _fetch_webstore_stats_dict()
+
     async with async_session() as session:
-        # Users who actually paid (have a completed Payment record)
+        # Users who actually paid in bot
         paid_user_ids_q = (
             select(Payment.user_id)
             .where(Payment.status == PaymentStatus.COMPLETED)
             .distinct()
         )
 
-        # Demo users = users who have at least one demo subscription
         demo_users = await session.scalar(
             select(func.count(func.distinct(Subscription.user_id))).where(
                 Subscription.billing_mode == "demo",
             )
         ) or 0
 
-        # Converted = demo users who also paid (have Payment record)
         converted = await session.scalar(
             select(func.count(func.distinct(Subscription.user_id))).where(
                 Subscription.billing_mode == "demo",
@@ -875,14 +2115,12 @@ async def admin_stats_conversion(callback: CallbackQuery) -> None:
 
         conversion_rate = (converted / demo_users * 100) if demo_users > 0 else 0
 
-        # Churn: users who paid but all subs expired
         ever_paid = await session.scalar(
             select(func.count(func.distinct(Payment.user_id))).where(
                 Payment.status == PaymentStatus.COMPLETED,
             )
         ) or 0
 
-        # Of those who paid, how many still have active paid subs
         still_active = await session.scalar(
             select(func.count(func.distinct(Subscription.user_id))).where(
                 Subscription.billing_mode != "demo",
@@ -894,27 +2132,45 @@ async def admin_stats_conversion(callback: CallbackQuery) -> None:
         churned = ever_paid - still_active
         churn_rate = (churned / ever_paid * 100) if ever_paid > 0 else 0
 
-        # Manual keys (no Payment record)
-        manual_users = await session.scalar(
-            select(func.count(func.distinct(Subscription.user_id))).where(
-                Subscription.billing_mode != "demo",
-                ~Subscription.user_id.in_(paid_user_ids_q),
+        manual_payments = await session.scalar(
+            select(func.count(Payment.id)).where(
+                Payment.method == PaymentMethod.MANUAL,
+                Payment.status == PaymentStatus.COMPLETED,
             )
         ) or 0
 
-    text = (
-        "📈 <b>Конверсия и отток</b>\n\n"
-        f"<b>Демо → Платный:</b>\n"
-        f"  Всего демо: {demo_users}\n"
-        f"  Купили подписку: {converted}\n"
+    text = "📈 <b>Конверсия и отток</b>\n\n"
+    text += (
+        "<b>Демо → Оплата (ТГ-бот):</b>\n"
+        f"  Взяли демо: <b>{demo_users}</b>\n"
+        f"  Купили подписку: <b>{converted}</b>\n"
         f"  Конверсия: <b>{conversion_rate:.1f}%</b>\n\n"
-        f"<b>Отток (churn):</b>\n"
-        f"  Когда-либо платили: {ever_paid}\n"
-        f"  Сейчас активны: {still_active}\n"
-        f"  Ушли (не продлили): {churned}\n"
-        f"  Отток: <b>{churn_rate:.1f}%</b>\n\n"
-        f"<b>Ручные выдачи:</b> {manual_users} чел."
     )
+
+    if web_data:
+        conv = web_data.get("conversion", {})
+        total_30d = conv.get("total_30d", 0)
+        paid_30d = conv.get("paid_30d", 0)
+        conv_pct = round(paid_30d / total_30d * 100, 1) if total_30d else 0.0
+        sc = web_data.get("status_counts", {})
+        web_demo = sc.get("demo", 0)
+        text += (
+            "<b>Сайт (Вебстор, 30 дней):</b>\n"
+            f"  Демо за всё время: <b>{web_demo}</b>\n"
+            f"  Оформлений заказа: <b>{total_30d}</b>\n"
+            f"  Оплачено: <b>{paid_30d}</b>\n"
+            f"  Конверсия чекаута: <b>{conv_pct}%</b>\n\n"
+        )
+
+    text += (
+        "<b>Отток (churn в боте):</b>\n"
+        f"  Когда-либо платили: <b>{ever_paid}</b>\n"
+        f"  Сейчас активны: <b>{still_active}</b>\n"
+        f"  Не продлили: <b>{churned}</b>\n"
+        f"  Отток: <b>{churn_rate:.1f}%</b>"
+    )
+    if manual_payments > 0:
+        text += f"\n\n<b>Ручные выдачи админа:</b> <b>{manual_payments}</b>"
 
     await callback.message.edit_text(text, reply_markup=stats_back_kb(), parse_mode="HTML")
     await callback.answer()
@@ -1459,9 +2715,14 @@ def _build_unified_search_page(results: list[dict], query: str, page: int, warni
             source = "Только сайт"
             identifier = item.get("contact") or "профиль сайта"
             callback_data = f"adm_usearch_web_{absolute_idx}"
+        profile_token = item.get("profile_token")
+        if item["kind"] == "web" and str(item.get("name") or "").strip() == str(identifier).strip():
+            subline = f"├ Профиль: <code>{html.escape(str(profile_token)[:12])}…</code>" if profile_token else f"├ {html.escape(identifier)}"
+        else:
+            subline = f"├ {html.escape(identifier)}"
         blocks.append(
             f"<b>{absolute_idx + 1}. {html.escape(str(item.get('name') or 'Клиент'))}</b>\n"
-            f"├ {html.escape(identifier)}\n"
+            f"{subline}\n"
             f"└ Источник: <b>{source}</b>"
         )
         kb.row(InlineKeyboardButton(
@@ -1874,15 +3135,117 @@ async def admin_user_make_partner(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("adm_usr_key_"))
 async def admin_user_key_start(callback: CallbackQuery, state: FSMContext) -> None:
-    """Issue key directly from user card - skip to tariff selection."""
+    """Issue key directly from user card - offer renew/upgrade if user has subscriptions."""
     if not _is_admin(callback.from_user.id):
         return
     telegram_id = int(callback.data.split("_")[-1])
 
-    await state.update_data(manual_key_user=telegram_id)
+    await state.update_data(
+        manual_key_user=telegram_id,
+        manual_key_back_callback=f"adm_usr_refresh_{telegram_id}",
+    )
 
-    # Skip server selection - go straight to tariff
     async with async_session() as session:
+        result = await session.execute(
+            select(User)
+            .options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
+            .where(User.telegram_id == telegram_id)
+        )
+        user = result.scalar_one_or_none()
+        if not user:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+
+        adapt_records = {
+            record.subscription_id: record
+            for record in (
+                await session.execute(
+                    select(AdaptSubscription)
+                    .join(Subscription, Subscription.id == AdaptSubscription.subscription_id)
+                    .where(Subscription.user_id == user.id)
+                )
+            ).scalars().all()
+        }
+        canonical_uuids = {
+            str(record.adapt_plan_uuid).strip()
+            for record in adapt_records.values()
+            if str(record.adapt_plan_uuid or "").strip()
+        }
+        adapt_tariffs = {}
+        if canonical_uuids:
+            for tariff in (
+                await session.execute(
+                    select(Tariff)
+                    .where(Tariff.adapt_plan_uuid.in_(canonical_uuids))
+                    .order_by(Tariff.id.desc())
+                )
+            ).scalars().all():
+                adapt_tariffs.setdefault(str(tariff.adapt_plan_uuid).strip(), tariff)
+        user_subscriptions = [
+            sub for sub in user.subscriptions
+            if (
+                not is_adapt_subscription(sub)
+                and sub.tariff
+            ) or (
+                is_adapt_subscription(sub)
+                and (
+                    adapt_records.get(sub.id)
+                    or (not adapt_records.get(sub.id) and sub.tariff)
+                )
+            )
+        ]
+        if user_subscriptions:
+            kb = InlineKeyboardBuilder()
+            for sub in sorted(user_subscriptions, key=lambda item: (item.expires_at, item.id), reverse=True):
+                expires = _format_dt_msk(sub.expires_at, include_time=False)
+                adapt_record = adapt_records.get(sub.id)
+                current_tariff = (
+                    adapt_tariffs.get(str(adapt_record.adapt_plan_uuid or "").strip())
+                    if adapt_record and str(adapt_record.adapt_plan_uuid or "").strip()
+                    else sub.tariff
+                )
+                is_trial = is_adapt_trial_subscription(sub, adapt_sub=adapt_record)
+                is_expired = bool(
+                    (sub.expires_at and sub.expires_at <= datetime.utcnow())
+                    or (hasattr(sub, "status") and getattr(sub.status, "value", str(sub.status)) == "expired")
+                )
+                if is_expired:
+                    kb.row(InlineKeyboardButton(
+                        text=f"↻ Продлить #{sub.id} · {current_tariff.label} (истекла)",
+                        callback_data=f"adm_key_action_renew_{sub.id}",
+                    ))
+                elif not is_trial:
+                    kb.row(InlineKeyboardButton(
+                        text=f"↻ Продлить #{sub.id} · {current_tariff.label} · до {expires}",
+                        callback_data=f"adm_key_action_renew_{sub.id}",
+                    ))
+                if is_adapt_subscription(sub) and not is_expired:
+                    label_text = (
+                        f"↑ Улучшить #{sub.id} (тестовый) · до {expires}"
+                        if is_trial
+                        else f"↑ Улучшить #{sub.id} · {current_tariff.label}"
+                    )
+                    kb.row(InlineKeyboardButton(
+                        text=label_text,
+                        callback_data=f"adm_key_action_upgrade_{sub.id}",
+                    ))
+            kb.row(InlineKeyboardButton(text="➕ Создать новую подписку", callback_data="adm_key_action_new_0"))
+            kb.row(InlineKeyboardButton(text="◀️ Назад", callback_data=f"adm_usr_refresh_{telegram_id}"))
+
+            text = f"Ключ для <code>{telegram_id}</code>\n\nВыберите действие и подписку:"
+            try:
+                await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+            except Exception:
+                await callback.message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+            await state.set_state(AdminStates.waiting_manual_key_tariff)
+            await callback.answer()
+            return
+
+        # User has no subscriptions: go straight to tariff selection for a new subscription
+        await state.update_data(
+            manual_purchase_action="new",
+            manual_target_subscription_id=None,
+        )
         result = await session.execute(
             select(Tariff).where(Tariff.is_active == True).order_by(Tariff.price_rub)  # noqa: E712
         )
@@ -1895,13 +3258,13 @@ async def admin_user_key_start(callback: CallbackQuery, state: FSMContext) -> No
 
     try:
         await callback.message.edit_text(
-            f"Выдать ключ для <code>{telegram_id}</code>\n\nВыберите тариф:",
+            f"Выдать ключ для <code>{telegram_id}</code>\n\nВыберите тариф для новой подписки:",
             reply_markup=kb.as_markup(),
             parse_mode="HTML",
         )
     except Exception:
         await callback.message.answer(
-            f"Выдать ключ для <code>{telegram_id}</code>\n\nВыберите тариф:",
+            f"Выдать ключ для <code>{telegram_id}</code>\n\nВыберите тариф для новой подписки:",
             reply_markup=kb.as_markup(),
             parse_mode="HTML",
         )
@@ -1979,6 +3342,67 @@ async def admin_user_subs(callback: CallbackQuery) -> None:
     srv_name = sub.server.name if sub.server else "?"
     srv_emoji = sub.server.country_emoji if sub.server else "🌍"
 
+    from bot.services.adapt_routing import is_adapt_subscription, get_adapt_uuid_from_subscription
+    is_adapt = is_adapt_subscription(sub)
+    adapt_uuid = get_adapt_uuid_from_subscription(sub) if is_adapt else None
+
+    extra_adapt = ""
+    if is_adapt and adapt_uuid:
+        connected_devices = "—"
+        used_traffic_gb = "—"
+        limit_traffic_gb = "—"
+        try:
+            from bot.services.adapt_api import AdaptAPI
+            devices = await AdaptAPI().get_devices(adapt_uuid)
+            connected_devices = len(devices)
+        except Exception as exc:
+            logger.error(f"Error fetching devices for adapt sub {sub.id}: {exc}")
+            connected_devices = "ошибка"
+
+        try:
+            from bot.services.adapt_api import AdaptAPI
+            status_data = await AdaptAPI().get_status(adapt_uuid)
+            used_bytes = status_data.get("used_traffic_bytes") or 0
+            limit_bytes = status_data.get("traffic_limit_bytes") or 0
+            used_traffic_gb = f"{used_bytes / (1024**3):.2f}"
+            limit_traffic_gb = f"{limit_bytes / (1024**3):.0f}"
+
+            # Self-healing: sync authoritative end_date from Adapt API to DB if different
+            adapt_end_str = status_data.get("end_date")
+            if adapt_end_str:
+                from bot.services.webstore_bridge import _parse_web_datetime
+                adapt_end_dt = _parse_web_datetime(adapt_end_str)
+                if adapt_end_dt and (not sub.expires_at or abs((sub.expires_at - adapt_end_dt).total_seconds()) > 5):
+                    old_exp = sub.expires_at
+                    sub.expires_at = adapt_end_dt
+                    sub.status = SubStatus.ACTIVE if adapt_end_dt > datetime.utcnow() else SubStatus.EXPIRED
+                    async with async_session() as write_session:
+                        db_sub = await write_session.get(Subscription, sub.id)
+                        if db_sub:
+                            db_sub.expires_at = adapt_end_dt
+                            db_sub.status = sub.status
+                        adapt_rec = await write_session.scalar(
+                            select(AdaptSubscription).where(AdaptSubscription.subscription_id == sub.id).limit(1)
+                        )
+                        if adapt_rec:
+                            adapt_rec.end_date = adapt_end_dt
+                            if limit_bytes:
+                                adapt_rec.traffic_limit_bytes = limit_bytes
+                        await write_session.commit()
+                    logger.info(
+                        "Self-healed Adapt sub %s expires_at in admin card: old=%s new=%s",
+                        sub.id, old_exp, adapt_end_dt
+                    )
+        except Exception as exc:
+            logger.error(f"Error fetching status for adapt sub {sub.id}: {exc}")
+            used_traffic_gb = "ошибка"
+            limit_traffic_gb = "ошибка"
+
+        extra_adapt = (
+            f"🖥 Подключено устройств: <b>{connected_devices}</b>\n"
+            f"⚡️Трафик: <b>{used_traffic_gb}</b> из <b>{limit_traffic_gb}</b> Гб\n"
+        )
+
     status_labels = {
         SubStatus.ACTIVE: "🟢 активна",
         SubStatus.EXPIRED: "🔴 истекла",
@@ -1988,8 +3412,7 @@ async def admin_user_subs(callback: CallbackQuery) -> None:
     billing_labels = {"tariff": "тариф", "balance": "баланс", "demo": "демо"}
     billing_text = billing_labels.get(sub.billing_mode, sub.billing_mode)
 
-    from bot.services.adapt_routing import is_adapt_subscription
-    if is_adapt_subscription(sub):
+    if is_adapt:
         device_slots = sub.device_slots or 1
     else:
         device_slots = max(sub.device_slots or 0, included_slots)
@@ -2003,37 +3426,18 @@ async def admin_user_subs(callback: CallbackQuery) -> None:
     else:
         tariff_name = sub.tariff.label if sub.tariff else "—"
 
-    extra_adapt = ""
-    if is_adapt_subscription(sub):
-        connected_devices = "—"
-        used_traffic_gb = "—"
-        limit_traffic_gb = "—"
-        adapt_uuid = get_adapt_uuid_from_subscription(sub)
-        if adapt_uuid:
-            try:
-                from bot.services.adapt_api import AdaptAPI
-                devices = await AdaptAPI().get_devices(adapt_uuid)
-                connected_devices = len(devices)
-            except Exception as exc:
-                logger.error(f"Error fetching devices for adapt sub {sub.id}: {exc}")
-                connected_devices = "ошибка"
-
-            try:
-                from bot.services.adapt_api import AdaptAPI
-                status_data = await AdaptAPI().get_status(adapt_uuid)
-                used_bytes = status_data.get("used_traffic_bytes") or 0
-                limit_bytes = status_data.get("traffic_limit_bytes") or 0
-                used_traffic_gb = f"{used_bytes / (1024**3):.2f}"
-                limit_traffic_gb = f"{limit_bytes / (1024**3):.0f}"
-            except Exception as exc:
-                logger.error(f"Error fetching status for adapt sub {sub.id}: {exc}")
-                used_traffic_gb = "ошибка"
-                limit_traffic_gb = "ошибка"
-        
-        extra_adapt = (
-            f"🖥 Подключено устройств: <b>{connected_devices}</b>\n"
-            f"⚡️Трафик: <b>{used_traffic_gb}</b> из <b>{limit_traffic_gb}</b> Гб\n"
-        )
+    if is_adapt:
+        provider_line = "Провайдер: <b>Adapt</b>\n"
+        client_line = f"ID Adapt: <code>{adapt_uuid}</code>\n" if adapt_uuid else ""
+        server_line = ""
+    elif sub.client_name and sub.client_name.startswith("vhq_"):
+        provider_line = "Провайдер: <b>VHQ</b>\n"
+        client_line = f"Клиент VHQ: <code>{html.escape(sub.client_name)}</code>\n"
+        server_line = f"Сервер: {srv_emoji} {srv_name}\n"
+    else:
+        provider_line = ""
+        client_line = f"Клиент Marzban: <code>{html.escape(sub.client_name)}</code>\n"
+        server_line = f"Сервер: {srv_emoji} {srv_name}\n"
 
     text = (
         f"📊 <b>Подписка #{sub.id}</b>  [{page}/{total_items}]\n"
@@ -2041,14 +3445,15 @@ async def admin_user_subs(callback: CallbackQuery) -> None:
         f"Статус: {status_text}\n"
         f"Тариф: <b>{tariff_name}</b>\n"
         f"Тип оплаты: <b>{billing_text}</b>\n"
+        f"{provider_line}"
         f"Платформа: {sub.platform.value if sub.platform else '—'}\n"
-        f"Сервер: {srv_emoji} {srv_name}\n"
-        f"Начало: {started} МСК\n"
-        f"Истекает: <b>{expires} МСК</b>\n"
+        f"{server_line}"
+        f"Начало: {started}\n"
+        f"Истекает: <b>{expires}</b>\n"
         f"Срок тарифа: {duration}\n"
         f"Устройств: {device_slots}\n"
         f"{extra_adapt}"
-        f"Клиент Marzban: <code>{html.escape(sub.client_name)}</code>\n\n"
+        f"{client_line}\n"
         f"{key_block}"
     )
 
@@ -2146,7 +3551,7 @@ async def admin_user_devices(
                 "🖥 <b>Управление устройствами (Админ)</b>\n"
                 f"Клиент: <code>{telegram_id}</code>\n"
                 f"Тариф: <b>{html.escape(tariff_name)}</b>\n\n"
-                f"📅 Подписка до: <b>{expires_str} МСК</b>\n\n"
+                f"📅 Подписка до: <b>{expires_str}</b>\n\n"
                 "Отдельные данные об устройствах для этой подписки недоступны."
             )
             kb = InlineKeyboardBuilder()
@@ -2194,7 +3599,7 @@ async def admin_user_devices(
                 f"🖥 <b>Управление устройствами (Админ)</b>\n"
                 f"Клиент: <code>{telegram_id}</code>\n"
                 f"Тариф: <b>{html.escape(tariff_name)}</b>\n\n"
-                f"📅 Подписка до: <b>{expires_str} МСК</b>\n"
+                f"📅 Подписка до: <b>{expires_str}</b>\n"
                 f"Подключено устройств: <b>{used_slots}</b> из <b>{limit}</b>\n"
             )
 
@@ -2243,7 +3648,7 @@ async def admin_user_devices(
             f"🖥 <b>Управление устройствами (Админ)</b>\n"
             f"Клиент: <code>{telegram_id}</code>\n"
             f"Тариф: <b>{html.escape(tariff_name)}</b>\n\n"
-            f"📅 Подписка до: <b>{expires_str} МСК</b>\n"
+            f"📅 Подписка до: <b>{expires_str}</b>\n"
             f"Доступно устройств: <b>{subscription.device_slots}</b>\n\n"
             f"Данные подключения:\n"
         )
@@ -2344,7 +3749,7 @@ async def admin_user_payments(callback: CallbackQuery) -> None:
         await callback.answer("Оплат нет", show_alert=True)
         return
 
-    page_size = 1
+    page_size = 5
     total_pages = max(1, (total + page_size - 1) // page_size)
     if page > total_pages:
         page = total_pages
@@ -2408,6 +3813,316 @@ async def admin_user_payments(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+# ── User Feedback Conversations ────────────────────────
+
+def _format_dt_thread(dt: datetime | None) -> str:
+    if not dt:
+        return "—"
+    from datetime import timezone, timedelta
+    msk = timezone(timedelta(hours=3))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(msk).strftime("%d.%m %H:%M")
+
+
+async def _is_feedback_admin(user_id: int) -> bool:
+    if _is_admin(user_id):
+        return True
+    try:
+        from bot.handlers.start import _get_feedback_admin_ids
+        admin_ids = await _get_feedback_admin_ids()
+        return user_id in admin_ids
+    except Exception:
+        return False
+
+
+@router.callback_query(F.data.regexp(r"^adm_usr_fb_(\d+)_(\d+)$"))
+async def admin_user_feedbacks(callback: CallbackQuery) -> None:
+    if not await _is_feedback_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+
+    m = re.match(r"^adm_usr_fb_(\d+)_(\d+)$", callback.data)
+    if not m:
+        await callback.answer("Некорректный запрос", show_alert=True)
+        return
+
+    telegram_id = int(m.group(1))
+    page = max(1, int(m.group(2)))
+
+    async with async_session() as session:
+        total = await session.scalar(
+            select(func.count(Feedback.id)).where(Feedback.telegram_id == telegram_id)
+        ) or 0
+
+        if total == 0:
+            await callback.answer("У пользователя нет обращений", show_alert=True)
+            return
+
+        page_size = 10
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        if page > total_pages:
+            page = total_pages
+
+        offset = (page - 1) * page_size
+        stmt = (
+            select(Feedback)
+            .where(Feedback.telegram_id == telegram_id)
+            .order_by(Feedback.created_at.desc(), Feedback.id.desc())
+            .offset(offset)
+            .limit(page_size)
+        )
+        feedbacks = (await session.scalars(stmt)).all()
+
+    kb = InlineKeyboardBuilder()
+    for fb in feedbacks:
+        dt_str = _format_dt_thread(fb.created_at)
+        media_marker = "📷 " if fb.media_type == "photo" else ("🎥 " if fb.media_type == "video" else ("📄 " if fb.media_type == "document" else ""))
+        raw_text = (fb.text or "").strip().replace("\n", " ")
+        preview = (raw_text[:20] + "…") if len(raw_text) > 20 else raw_text
+        if not preview and media_marker:
+            preview = "Медиа"
+        btn_text = f"#{fb.id} · {dt_str} · {media_marker}{preview}".strip()
+        if len(btn_text) > 55:
+            btn_text = btn_text[:54] + "…"
+        kb.row(InlineKeyboardButton(text=btn_text, callback_data=f"adm_fb_view_{fb.id}_{page}"))
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_usr_fb_{telegram_id}_{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="ignore"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_usr_fb_{telegram_id}_{page+1}"))
+    if nav:
+        kb.row(*nav)
+    kb.row(InlineKeyboardButton(text="◀️ К клиенту", callback_data=f"adm_usr_refresh_{telegram_id}"))
+
+    text = (
+        f"💬 <b>Обращения клиента</b> <code>{telegram_id}</code>  [{page}/{total_pages}]\n\n"
+        f"Всего обращений: <b>{total}</b>\n"
+        f"Выберите обращение для просмотра переписки:"
+    )
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    except Exception as e:
+        if "message is not modified" not in str(e):
+            await callback.message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm_fb_view_(\d+)(?:_(\d+))?$"))
+async def admin_feedback_view_thread(callback: CallbackQuery) -> None:
+    if not await _is_feedback_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+
+    m = re.match(r"^adm_fb_view_(\d+)(?:_(\d+))?$", callback.data)
+    if not m:
+        await callback.answer("Некорректный запрос", show_alert=True)
+        return
+
+    feedback_id = int(m.group(1))
+    page = int(m.group(2)) if m.group(2) else 1
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Feedback)
+            .options(selectinload(Feedback.messages))
+            .where(Feedback.id == feedback_id)
+        )
+        fb = result.scalar_one_or_none()
+
+    if not fb:
+        await callback.answer("Обращение не найдено", show_alert=True)
+        return
+
+    header = f"💬 <b>Обращение #{fb.id}</b> · ID: <code>{fb.telegram_id}</code>\n{'─' * 28}\n\n"
+
+    def _fmt_block(title: str, text_val: str | None, media: str | None) -> str:
+        escaped = html.escape(text_val.strip()) if text_val and text_val.strip() else ""
+        if media == "photo":
+            content = f"📷 Фото\n{escaped}" if escaped else "📷 Фото"
+        elif media == "video":
+            content = f"🎥 Видео\n{escaped}" if escaped else "🎥 Видео"
+        elif media == "document":
+            content = f"📄 Документ\n{escaped}" if escaped else "📄 Документ"
+        else:
+            content = escaped or "—"
+        return f"{title}\n{content}"
+
+    blocks = []
+    blocks.append(_fmt_block(f"👤 Клиент · {_format_dt_thread(fb.created_at)}", fb.text, fb.media_type))
+    for msg in fb.messages:
+        title = f"👤 Клиент · {_format_dt_thread(msg.created_at)}" if msg.sender_type == "user" else f"🛠 Поддержка · {_format_dt_thread(msg.created_at)}"
+        blocks.append(_fmt_block(title, msg.text, msg.media_type))
+
+    full_body = "\n\n".join(blocks)
+    max_allowed = 3800
+    if len(header) + len(full_body) <= max_allowed:
+        text = header + full_body
+    else:
+        prefix = "<i>... (показаны последние сообщения, более ранние скрыты)</i>\n\n"
+        budget = max_allowed - len(header) - len(prefix)
+        selected_blocks = []
+        accumulated_len = 0
+        for block in reversed(blocks):
+            needed = len(block) + (2 if selected_blocks else 0)
+            if accumulated_len + needed > budget and selected_blocks:
+                break
+            selected_blocks.append(block)
+            accumulated_len += needed
+        selected_blocks.reverse()
+        text = header + prefix + "\n\n".join(selected_blocks)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"feedback_admin_reply_{fb.id}")],
+        [InlineKeyboardButton(text="◀️ К обращениям", callback_data=f"adm_usr_fb_{fb.telegram_id}_{page}")],
+    ])
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        if "message is not modified" not in str(e):
+            await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("feedback_admin_reply_"))
+async def feedback_admin_reply_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await _is_feedback_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+
+    raw_id = callback.data.removeprefix("feedback_admin_reply_")
+    try:
+        feedback_id = int(raw_id)
+    except ValueError:
+        await callback.answer("Обращение не найдено", show_alert=True)
+        return
+
+    async with async_session() as session:
+        fb = await session.get(Feedback, feedback_id)
+
+    if not fb:
+        await callback.answer("Обращение не найдено", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_feedback_reply)
+    await state.update_data(admin_reply_feedback_id=feedback_id)
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀️ Отмена", callback_data="adm_feedback_reply_cancel"),
+    ]])
+    await callback.message.answer(
+        f"Введите ответ по обращению #{feedback_id}",
+        reply_markup=cancel_kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm_feedback_reply_cancel")
+async def feedback_admin_reply_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    try:
+        await callback.message.edit_text("Ответ отменён.")
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_feedback_reply)
+async def feedback_admin_reply_receive(message: Message, state: FSMContext) -> None:
+    text = message.text or message.caption or ""
+    media_file_id = None
+    media_type = None
+
+    if getattr(message, "photo", None):
+        media_file_id = message.photo[-1].file_id
+        media_type = "photo"
+    elif getattr(message, "video", None):
+        media_file_id = message.video.file_id
+        media_type = "video"
+    elif getattr(message, "document", None):
+        media_file_id = message.document.file_id
+        media_type = "document"
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀️ Отмена", callback_data="adm_feedback_reply_cancel"),
+    ]])
+
+    if not text and not media_file_id:
+        await message.answer("❌ Отправьте текст, фото, видео или скриншот файлом.", reply_markup=cancel_kb)
+        return
+
+    data = await state.get_data()
+    feedback_id = data.get("admin_reply_feedback_id")
+    if not feedback_id:
+        await message.answer("❌ Сессия ответа устарела.")
+        await state.clear()
+        return
+
+    async with async_session() as session:
+        fb = await session.get(Feedback, feedback_id)
+        if not fb:
+            await message.answer("❌ Обращение не найдено.")
+            await state.clear()
+            return
+
+        reply_msg = FeedbackMessage(
+            feedback_id=feedback_id,
+            sender_type="admin",
+            sender_telegram_id=message.from_user.id,
+            text=text or None,
+            media_file_id=media_file_id,
+            media_type=media_type,
+        )
+        session.add(reply_msg)
+        await session.commit()
+        client_telegram_id = fb.telegram_id
+
+    await state.clear()
+
+    client_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="↩️ Ответить", callback_data=f"feedback_reply_{feedback_id}"),
+    ]])
+    client_header = (
+        f"💬 <b>Ответ поддержки</b>\n"
+        f"Обращение #{feedback_id}\n\n"
+    )
+    escaped_text = html.escape(text) if text else ""
+    client_caption = f"{client_header}{escaped_text}" if escaped_text else client_header.rstrip()
+    if media_file_id and len(client_caption) > 1024:
+        client_caption = client_caption[:1020] + "..."
+
+    try:
+        if media_file_id and media_type:
+            if media_type == "photo":
+                send_fn = message.bot.send_photo
+            elif media_type == "video":
+                send_fn = message.bot.send_video
+            else:
+                send_fn = message.bot.send_document
+            await send_fn(
+                client_telegram_id,
+                media_file_id,
+                caption=client_caption,
+                reply_markup=client_kb,
+                parse_mode="HTML",
+            )
+        else:
+            await message.bot.send_message(
+                client_telegram_id,
+                client_caption,
+                reply_markup=client_kb,
+                parse_mode="HTML",
+            )
+        await message.answer(f"✅ Ответ по обращению #{feedback_id} успешно отправлен клиенту.")
+    except Exception as e:
+        logger.error("Failed to deliver admin reply for feedback %s to user %s: %s", feedback_id, client_telegram_id, e)
+        await message.answer(f"⚠️ Ошибка при отправке сообщения клиенту: {e}")
+
+
 # ── Manual Key Generation ─────────────────────────────
 
 @router.callback_query(F.data == "adm_gen_key")
@@ -2433,7 +4148,10 @@ async def admin_gen_key_user(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Введите числовой Telegram ID")
         return
 
-    await state.update_data(manual_key_user=telegram_id)
+    await state.update_data(
+        manual_key_user=telegram_id,
+        manual_key_back_callback="adm_back",
+    )
 
     async with async_session() as session:
         result = await session.execute(
@@ -2446,17 +4164,77 @@ async def admin_gen_key_user(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Пользователь не найден")
         return
 
-    paid_subscriptions = [sub for sub in user.subscriptions if sub.billing_mode != "demo" and sub.tariff]
+    async with async_session() as session:
+        adapt_records = {
+            record.subscription_id: record
+            for record in (
+                await session.execute(
+                    select(AdaptSubscription)
+                    .join(Subscription, Subscription.id == AdaptSubscription.subscription_id)
+                    .where(Subscription.user_id == user.id)
+                )
+            ).scalars().all()
+        }
+        canonical_uuids = {
+            str(record.adapt_plan_uuid).strip()
+            for record in adapt_records.values()
+            if str(record.adapt_plan_uuid or "").strip()
+        }
+        adapt_tariffs = {}
+        if canonical_uuids:
+            for tariff in (
+                await session.execute(
+                    select(Tariff)
+                    .where(Tariff.adapt_plan_uuid.in_(canonical_uuids))
+                    .order_by(Tariff.id.desc())
+                )
+            ).scalars().all():
+                adapt_tariffs.setdefault(str(tariff.adapt_plan_uuid).strip(), tariff)
+    user_subscriptions = [
+        sub for sub in user.subscriptions
+        if (
+            not is_adapt_subscription(sub)
+            and sub.tariff
+        ) or (
+            is_adapt_subscription(sub)
+            and (
+                adapt_records.get(sub.id)
+                or (not adapt_records.get(sub.id) and sub.tariff)
+            )
+        )
+    ]
     kb = InlineKeyboardBuilder()
-    for sub in sorted(paid_subscriptions, key=lambda item: (item.expires_at, item.id), reverse=True):
+    for sub in sorted(user_subscriptions, key=lambda item: (item.expires_at, item.id), reverse=True):
         expires = _format_dt_msk(sub.expires_at, include_time=False)
-        kb.row(InlineKeyboardButton(
-            text=f"↻ Продлить #{sub.id} · {sub.tariff.label} · до {expires}",
-            callback_data=f"adm_key_action_renew_{sub.id}",
-        ))
-        if is_adapt_subscription(sub):
+        adapt_record = adapt_records.get(sub.id)
+        current_tariff = (
+            adapt_tariffs.get(str(adapt_record.adapt_plan_uuid or "").strip())
+            if adapt_record and str(adapt_record.adapt_plan_uuid or "").strip()
+            else sub.tariff
+        )
+        is_trial = is_adapt_trial_subscription(sub, adapt_sub=adapt_record)
+        is_expired = bool(
+            (sub.expires_at and sub.expires_at <= datetime.utcnow())
+            or (hasattr(sub, "status") and getattr(sub.status, "value", str(sub.status)) == "expired")
+        )
+        if is_expired:
             kb.row(InlineKeyboardButton(
-                text=f"↑ Улучшить #{sub.id} · {sub.tariff.label}",
+                text=f"↻ Продлить #{sub.id} · {current_tariff.label} (истекла)",
+                callback_data=f"adm_key_action_renew_{sub.id}",
+            ))
+        elif not is_trial:
+            kb.row(InlineKeyboardButton(
+                text=f"↻ Продлить #{sub.id} · {current_tariff.label} · до {expires}",
+                callback_data=f"adm_key_action_renew_{sub.id}",
+            ))
+        if is_adapt_subscription(sub) and not is_expired:
+            label_text = (
+                f"↑ Улучшить #{sub.id} (тестовый) · до {expires}"
+                if is_trial
+                else f"↑ Улучшить #{sub.id} · {current_tariff.label}"
+            )
+            kb.row(InlineKeyboardButton(
+                text=label_text,
                 callback_data=f"adm_key_action_upgrade_{sub.id}",
             ))
     kb.row(InlineKeyboardButton(text="➕ Создать новую подписку", callback_data="adm_key_action_new_0"))
@@ -2479,6 +4257,11 @@ async def admin_gen_key_action(callback: CallbackQuery, state: FSMContext) -> No
     target_subscription_id = int(raw_subscription_id) or None
     state_data = await state.get_data()
     telegram_id = int(state_data["manual_key_user"])
+    back_callback = (
+        f"adm_usr_key_{telegram_id}"
+        if str(state_data.get("manual_key_back_callback", "")).startswith("adm_usr_")
+        else state_data.get("manual_key_back_callback", "adm_back")
+    )
 
     async with async_session() as session:
         target = await session.scalar(
@@ -2487,30 +4270,116 @@ async def admin_gen_key_action(callback: CallbackQuery, state: FSMContext) -> No
             .where(Subscription.id == target_subscription_id)
             .where(Subscription.user.has(telegram_id=telegram_id))
         ) if target_subscription_id else None
-        if action != "new" and (not target or not target.tariff):
+        target_adapt_record = await session.scalar(
+            select(AdaptSubscription)
+            .where(AdaptSubscription.subscription_id == target.id)
+            .limit(1)
+        ) if target else None
+        target_tariff = None
+        if target_adapt_record and target_adapt_record.adapt_plan_uuid:
+            target_tariff = await session.scalar(
+                select(Tariff)
+                .where(Tariff.adapt_plan_uuid == target_adapt_record.adapt_plan_uuid)
+                .order_by(Tariff.id.desc())
+                .limit(1)
+            )
+        if not str(getattr(target_adapt_record, "adapt_plan_uuid", None) or "").strip():
+            target_tariff = target.tariff if target else None
+        if action != "new" and (not target or not target_tariff):
             await callback.answer("Подписка или её тариф не найдены", show_alert=True)
             return
         query = select(Tariff).where(Tariff.is_active == True)  # noqa: E712
+        is_target_expired = bool(
+            target
+            and (
+                (target.expires_at and target.expires_at <= datetime.utcnow())
+                or (hasattr(target, "status") and getattr(target.status, "value", str(target.status)) == "expired")
+            )
+        )
         if action == "renew":
-            query = query.where(Tariff.id == target.tariff_id)
+            if is_target_expired:
+                if is_adapt_subscription(target):
+                    query = query.where(Tariff.adapt_plan_uuid.is_not(None))
+                elif is_vhq_subscription(target):
+                    query = query.where(Tariff.adapt_plan_uuid.is_(None), Tariff.vhq_tier.is_not(None))
+                else:
+                    query = query.where(Tariff.adapt_plan_uuid.is_(None), Tariff.vhq_tier.is_(None))
+                candidate_tariffs = (await session.execute(query.order_by(Tariff.price_rub))).scalars().all()
+                tariffs = [t for t in candidate_tariffs if int(t.price_rub or 0) > 0 and not is_adapt_trial_tariff(t)]
+            elif is_adapt_trial_subscription(target, adapt_sub=target_adapt_record):
+                await callback.answer(
+                    "Тестовую подписку нельзя продлить тем же тарифом. Выберите «Улучшить» для перехода на платный тариф.",
+                    show_alert=True,
+                )
+                return
+            else:
+                query = query.where(Tariff.id == target_tariff.id)
+                tariffs = (await session.execute(query.order_by(Tariff.price_rub))).scalars().all()
         elif action == "upgrade":
-            if not is_adapt_subscription(target) or not target.tariff.adapt_plan_uuid:
+            if not is_adapt_subscription(target) or not target_tariff.adapt_plan_uuid:
                 await callback.answer("Улучшение доступно только для Adapt", show_alert=True)
                 return
-            query = query.where(
-                Tariff.adapt_plan_uuid.is_not(None),
-                Tariff.price_rub > target.tariff.price_rub,
-            )
-        tariffs = (await session.execute(query.order_by(Tariff.price_rub))).scalars().all()
+            query = query.where(Tariff.adapt_plan_uuid.is_not(None))
+            is_trial = is_adapt_trial_subscription(target, adapt_sub=target_adapt_record)
+            candidate_tariffs = (await session.execute(query.order_by(Tariff.price_rub))).scalars().all()
+            tariffs = []
+            for tariff in candidate_tariffs:
+                if int(tariff.price_rub or 0) <= 0 or is_adapt_trial_tariff(tariff):
+                    continue
+                if is_trial:
+                    if is_adapt_customer_upgrade_eligible(
+                        target_tariff,
+                        tariff,
+                        expires_at=target.expires_at,
+                        is_demo=True,
+                    ):
+                        tariffs.append(tariff)
+                else:
+                    validation_plans = await get_paid_adapt_upgrade_plans(
+                        session,
+                        target_tariff,
+                        tariff,
+                    )
+                    if validation_plans and is_adapt_customer_upgrade_eligible(
+                        validation_plans[0],
+                        validation_plans[1],
+                        expires_at=target.expires_at,
+                        is_demo=False,
+                    ):
+                        tariffs.append(tariff)
+        else:
+            tariffs = (await session.execute(query.order_by(Tariff.price_rub))).scalars().all()
 
-    if not tariffs:
-        await callback.answer("Подходящих тарифов нет", show_alert=True)
-        return
+        op_id = None
+        if action == "renew" and target and is_vhq_subscription(target):
+            tariffs = [t for t in tariffs if t.vhq_tier == "basic" and t.days == 30]
+            if not tariffs:
+                await callback.answer("Подходящих тарифов нет", show_alert=True)
+                return
+            target_user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+            op = ManualSubscriptionOperation(
+                operation_uuid=str(uuid.uuid4()),
+                admin_user_id=callback.from_user.id,
+                target_user_id=target_user.id if target_user else 0,
+                subscription_id=target.id if target else None,
+                tariff_id=None,
+                action=action,
+                status="draft",
+            )
+            session.add(op)
+            await session.commit()
+            op_id = op.id
+
+        if not tariffs:
+            await callback.answer("Подходящих тарифов нет", show_alert=True)
+            return
+
     await state.update_data(
         manual_purchase_action=action,
         manual_target_subscription_id=target_subscription_id,
+        manual_operation_id=op_id,
     )
-    kb = _build_manual_key_tariff_kb(tariffs, back_callback="adm_back")
+    kb = _build_manual_key_tariff_kb(tariffs, back_callback=back_callback, operation_id=op_id)
     await callback.message.edit_text(
         "Выберите тариф для продления:" if action == "renew" else (
             "Выберите более дорогой тариф:" if action == "upgrade" else "Выберите тариф для новой подписки:"
@@ -2524,17 +4393,28 @@ async def admin_gen_key_action(callback: CallbackQuery, state: FSMContext) -> No
 async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         return
-    tariff_id = int(callback.data.split("_")[-1])
+    raw_payload = callback.data.removeprefix("adm_key_tariff_")
+    if "_" in raw_payload:
+        op_id_str, tariff_id_str = raw_payload.split("_", 1)
+        operation_id = int(op_id_str)
+        tariff_id = int(tariff_id_str)
+    else:
+        operation_id = None
+        tariff_id = int(raw_payload)
+
     data = await state.get_data()
-    telegram_id: int = data["manual_key_user"]
+    telegram_id = data.get("manual_key_user")
+    if operation_id is None:
+        operation_id = data.get("manual_operation_id")
     purchase_action = data.get("manual_purchase_action", "new")
     target_subscription_id = data.get("manual_target_subscription_id")
     await state.clear()
     logger.info(
-        "Manual key issuance requested: admin_id=%s target_telegram_id=%s tariff_id=%s",
+        "Manual key issuance requested: admin_id=%s target_telegram_id=%s tariff_id=%s op_id=%s",
         callback.from_user.id,
         telegram_id,
         tariff_id,
+        operation_id,
     )
 
     from bot.services.subscription_service import (
@@ -2545,6 +4425,69 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
     from bot.services.provisioning_issues import AccessProvisionError
 
     async with async_session() as session:
+        manual_op = None
+        if operation_id:
+            op = await session.get(ManualSubscriptionOperation, operation_id)
+            if not op:
+                await callback.answer("Операция не найдена.", show_alert=True)
+                return
+
+            if op.admin_user_id != callback.from_user.id:
+                await callback.answer("Операция принадлежит другому администратору.", show_alert=True)
+                return
+
+            if op.status != "draft":
+                await callback.answer("Операция уже выполняется или выполнена.", show_alert=True)
+                return
+
+            if op.action != "renew":
+                await callback.answer("Недопустимое действие операции.", show_alert=True)
+                return
+
+            if not op.subscription_id or not op.target_user_id:
+                await callback.answer("Некорректные параметры операции.", show_alert=True)
+                return
+
+            sub = await session.get(Subscription, op.subscription_id)
+            if not sub or sub.id != op.subscription_id or sub.user_id != op.target_user_id:
+                await callback.answer("Несоответствие целевой подписки.", show_alert=True)
+                return
+
+            is_vhq = bool(sub.client_name.startswith("vhq_") or sub.vhq_order_id)
+            if not is_vhq:
+                await callback.answer("Подписка не является VHQ.", show_alert=True)
+                return
+
+            val_tariff = await session.get(Tariff, tariff_id)
+            if not val_tariff or val_tariff.vhq_tier != "basic" or val_tariff.days != 30:
+                await callback.answer("Для продления VHQ разрешён только тариф basic на 30 дней.", show_alert=True)
+                return
+
+            cas_stmt = (
+                update(ManualSubscriptionOperation)
+                .where(
+                    ManualSubscriptionOperation.id == operation_id,
+                    ManualSubscriptionOperation.status == "draft",
+                )
+                .values(
+                    status="applied",
+                    tariff_id=tariff_id,
+                    applied_at=datetime.utcnow(),
+                )
+            )
+            cas_res = await session.execute(cas_stmt)
+            if cas_res.rowcount == 0:
+                await callback.answer("Операция уже выполняется или выполнена.", show_alert=True)
+                return
+
+            manual_op = op
+            target_subscription_id = op.subscription_id
+            purchase_action = op.action
+            if not telegram_id and manual_op and manual_op.target_user_id:
+                target_user = await session.get(User, manual_op.target_user_id)
+                if target_user:
+                    telegram_id = target_user.telegram_id
+
         tariff = await session.get(Tariff, tariff_id)
         result = await session.execute(select(User).where(User.telegram_id == telegram_id))
         user = result.scalar_one_or_none()
@@ -2571,12 +4514,45 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
         # VPN part
         if not is_tg_proxy_only:
             try:
+                if target_subscription_id and purchase_action == "renew":
+                    target_sub = await session.get(Subscription, target_subscription_id)
+                    if target_sub and is_adapt_subscription(target_sub):
+                        target_adapt = await session.scalar(
+                            select(AdaptSubscription).where(AdaptSubscription.subscription_id == target_sub.id).limit(1)
+                        )
+                        curr_plan = str(getattr(target_adapt, "adapt_plan_uuid", None) or "").strip()
+                        new_plan = str(tariff.adapt_plan_uuid or "").strip()
+                        if curr_plan and new_plan and curr_plan != new_plan:
+                            purchase_action = "upgrade"
+
                 subscription, vpn_key = await create_or_extend_paid_access(
                     session, user=user, tariff=tariff, platform=platform,
                     purchase_action=purchase_action,
                     target_subscription_id=target_subscription_id,
+                    manual_operation=manual_op,
                 )
             except AccessProvisionError as issue:
+                if issue.provider == "vhq" and issue.code == "supplier_fulfillment_pending":
+                    logger.info(
+                        "Manual key issuance VHQ fulfillment pending: admin_id=%s target_user_id=%s tariff_id=%s",
+                        callback.from_user.id,
+                        user.id,
+                        tariff.id,
+                    )
+                    if manual_op:
+                        manual_op.status = "applied"
+                        await session.commit()
+                    await callback.message.edit_text(
+                        f"⏳ <b>Продление принято. VHQ: обработка</b>\n\n"
+                        f"Пользователь: <code>{telegram_id}</code>\n"
+                        f"Тариф: {tariff.label}\n\n"
+                        f"Операция поставлена в очередь и ожидает подтверждения поставщика.",
+                        reply_markup=admin_back_kb(),
+                        parse_mode="HTML",
+                    )
+                    await callback.answer()
+                    return
+
                 logger.error(
                     "Manual key issuance VPN/VHQ failed: admin_id=%s target_user_id=%s tariff_id=%s code=%s reason=%s",
                     callback.from_user.id,
@@ -2585,6 +4561,18 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
                     issue.code,
                     issue.admin_message,
                 )
+                if manual_op:
+                    fulfillment = await session.scalar(
+                        select(VhqSubscriptionFulfillment)
+                        .where(VhqSubscriptionFulfillment.manual_operation_id == manual_op.id)
+                        .order_by(VhqSubscriptionFulfillment.id.desc())
+                        .limit(1)
+                    )
+                    if fulfillment and fulfillment.status == "manual_review":
+                        manual_op.status = "manual_review"
+                    else:
+                        manual_op.status = "failed"
+                    await session.commit()
                 await callback.message.edit_text(
                     "❌ Оплата/выдача вручную не выполнена.\n\n"
                     f"Провайдер: <code>{html.escape(issue.provider)}</code>\n"
@@ -2602,6 +4590,9 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
                     user.id,
                     tariff.id,
                 )
+                if manual_op:
+                    manual_op.status = "failed"
+                    await session.commit()
                 await callback.message.edit_text("❌ Ошибка генерации ключа.", reply_markup=admin_back_kb(), parse_mode="HTML")
                 await callback.answer()
                 return
@@ -2635,6 +4626,17 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
                 session, user=user, tariff=tariff, subscription=subscription,
             )
 
+        fulfillment = None
+        if manual_op:
+            fulfillment = await session.scalar(
+                select(VhqSubscriptionFulfillment)
+                .where(VhqSubscriptionFulfillment.manual_operation_id == manual_op.id)
+                .order_by(VhqSubscriptionFulfillment.id.desc())
+                .limit(1)
+            )
+            if not fulfillment or fulfillment.status == "completed":
+                manual_op.status = "completed"
+
         await session.commit()
         logger.info(
             "Manual key issuance committed: admin_id=%s target_user_id=%s subscription_id=%s vpn=%s mtproto=%s",
@@ -2647,14 +4649,29 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
 
         expires_str = _format_dt_msk(subscription.expires_at, include_time=False) if subscription else "N/A"
 
+    is_vhq = tariff.vhq_tier or (subscription and subscription.client_name.startswith("vhq_"))
+
     # Confirm to admin
     type_labels = {
         TariffType.VPN: "Весь интернет",
         TariffType.TG_PROXY: "TG-ускоритель",
         TariffType.BOTH: "Весь интернет + TG",
     }
+    if is_vhq and fulfillment and fulfillment.status != "completed":
+        await callback.message.edit_text(
+            f"⏳ <b>Продление отправлено провайдеру</b>\n\n"
+            f"Пользователь: <code>{telegram_id}</code>\n"
+            f"Тариф: {tariff.label}\n\n"
+            f"Операция поставлена в очередь и ожидает подтверждения поставщика.",
+            reply_markup=admin_back_kb(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    header_text = "VPN успешно продлен" if purchase_action == "renew" else "Ключ выдан"
     await callback.message.edit_text(
-        f"✅ <b>Ключ выдан</b>\n\n"
+        f"✅ <b>{header_text}</b>\n\n"
         f"Пользователь: <code>{telegram_id}</code>\n"
         f"Тип: {type_labels.get(tariff.tariff_type, '')}\n"
         f"Тариф: {tariff.label} (до {expires_str})",
@@ -2665,7 +4682,11 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
 
     # Deliver VPN key to user
     if vpn_key:
-        key_display = vpn_key if len(vpn_key) <= 200 else vpn_key[:200] + "..."
+        from bot.services.vhq_subscription_proxy import get_subscription_display_key
+        from types import SimpleNamespace
+        sub_obj = subscription or SimpleNamespace(vpn_key=vpn_key)
+        display_key = get_subscription_display_key(sub_obj) or vpn_key
+        key_display = display_key if len(display_key) <= 200 else display_key[:200] + "..."
         try:
             await callback.bot.send_message(
                 telegram_id,
@@ -2674,7 +4695,7 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
             )
             await callback.bot.send_message(
                 telegram_id,
-                f"📋 <b>Полный ключ:</b>\n\n<code>{vpn_key}</code>",
+                f"📋 <b>Полный ключ:</b>\n\n<code>{display_key}</code>",
                 parse_mode="HTML",
             )
             guides = {
@@ -2768,6 +4789,9 @@ async def _show_user_info(message: Message, user: User) -> None:
         partner = await session.scalar(
             select(Partner).where(Partner.telegram_id == u.telegram_id)
         )
+        feedback_count = await session.scalar(
+            select(func.count(Feedback.id)).where(Feedback.telegram_id == u.telegram_id)
+        ) or 0
         balance_autodebit_enabled = bool(u.balance_mode_enabled and u.balance_autodebit_enabled)
         next_daily_charge_at = u.next_daily_charge_at
 
@@ -2878,6 +4902,7 @@ async def _show_user_info(message: Message, user: User) -> None:
             u.is_blocked,
             partner_id=partner.id if partner else None,
             has_active_sub=len(active_subs) > 0,
+            feedback_count=feedback_count,
         ),
         parse_mode="HTML",
     )
@@ -3453,6 +5478,8 @@ async def admin_settings(callback: CallbackQuery) -> None:
         return
     async with async_session() as session:
         stars_val = await _get_setting(session, "stars_enabled", "1")
+        cashback_val = await _get_setting(session, "cashback_enabled", "0")
+        cashback_pct = await _get_setting(session, "cashback_percent", "10")
         max_dev = await _get_setting(session, "max_devices_per_sub", "3")
         daily_charge_rub = await _get_setting(session, "daily_charge_rub", "3.17")
         dev_price_rub = await _get_setting(session, "extra_device_price_rub", "50")
@@ -3464,11 +5491,14 @@ async def admin_settings(callback: CallbackQuery) -> None:
         legal_urls = await get_all_legal_doc_urls(session)
 
     stars_enabled = stars_val == "1"
+    cashback_enabled = cashback_val == "1"
     demo_key_enabled = demo_key_val == "1"
     wa_enabled = wa_val == "1"
     wa_status = f"ВКЛ ✅ ({wa_host})" if wa_enabled and wa_host else ("ВКЛ ✅ (адрес не задан)" if wa_enabled else "ВЫКЛ ❌")
     text = ADMIN_SETTINGS_HEADER.format(
         stars_status="ВКЛ ✅" if stars_enabled else "ВЫКЛ ❌",
+        cashback_status="ВКЛ ✅" if cashback_enabled else "ВЫКЛ ❌",
+        cashback_pct=cashback_pct,
         max_devices="без лимита" if max_dev == "0" else max_dev,
         daily_charge_rub=daily_charge_rub,
         device_price_rub=dev_price_rub,
@@ -3483,12 +5513,143 @@ async def admin_settings(callback: CallbackQuery) -> None:
     try:
         await callback.message.edit_text(
             text,
-            reply_markup=settings_kb(stars_enabled, demo_key_enabled, wa_enabled),
+            reply_markup=settings_kb(stars_enabled, demo_key_enabled, wa_enabled, cashback_enabled),
             parse_mode="HTML",
         )
     except Exception:
         pass
     await callback.answer()
+
+
+@router.callback_query(F.data == "adm_toggle_cashback")
+async def admin_toggle_cashback(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    async with async_session() as session:
+        current = await _get_setting(session, "cashback_enabled", "0")
+        new_val = "0" if current == "1" else "1"
+        await _set_setting(session, "cashback_enabled", new_val)
+        if new_val == "1":
+            pct_row = await _get_setting(session, "cashback_percent", "")
+            if not pct_row:
+                await _set_setting(session, "cashback_percent", "10")
+    status = "включён 🎁" if new_val == "1" else "отключён"
+    await callback.answer(f"Кешбэк {status}", show_alert=True)
+    await admin_settings(callback)
+
+
+@router.callback_query(F.data == "adm_set_cashback_pct")
+async def admin_set_cashback_pct_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(
+        "🎁 <b>Процент кешбэка</b>\n\n"
+        "Введите процент кешбэка, начисляемый на баланс за оплату подписки (например, <code>10</code> или <code>15</code>):",
+        reply_markup=admin_back_kb(),
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminStates.waiting_cashback_pct)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_cashback_pct, F.text)
+async def admin_set_cashback_pct_process(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    try:
+        val = float(message.text.strip().replace(",", "."))
+        assert 0 <= val <= 100
+    except (ValueError, AssertionError):
+        await message.answer("❌ Введите число от 0 до 100")
+        return
+    async with async_session() as session:
+        await _set_setting(session, "cashback_percent", str(int(val) if val.is_integer() else val))
+    await state.clear()
+    await message.answer(
+        f"✅ Процент кешбэка установлен: <b>{val:.0f}%</b>",
+        reply_markup=admin_menu_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "adm_set_cashback_text")
+async def admin_set_cashback_text_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    async with async_session() as session:
+        cur = await _get_setting(session, "cashback_notify_text", "")
+    cur_display = cur if cur else (
+        "🎁 Вам начислен кешбэк <b>+{amount} ₽</b> ({pct}% от оплаты {payment_amount} ₽) на ваш баланс!\n\n"
+        "Вы можете использовать баланс для оплаты и продления подписки."
+    )
+    await callback.message.edit_text(
+        "✏️ <b>Текст уведомления о начислении кешбэка</b>\n\n"
+        f"<b>Текущий текст:</b>\n{cur_display}\n\n"
+        "Доступные переменные:\n"
+        "• <code>{amount}</code> — сумма кешбэка\n"
+        "• <code>{pct}</code> — процент кешбэка\n"
+        "• <code>{payment_amount}</code> — сумма платежа\n\n"
+        "Отправьте новый текст сообщения (поддерживается HTML) или отправьте <code>default</code> для сброса к стандартному:",
+        reply_markup=admin_back_kb(),
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminStates.waiting_cashback_notify_text)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_cashback_notify_text, F.text)
+async def admin_set_cashback_notify_text_save(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    text_val = message.text.strip()
+    if text_val.lower() == "default":
+        text_val = ""
+    async with async_session() as session:
+        await _set_setting(session, "cashback_notify_text", text_val)
+    await state.clear()
+    await message.answer(
+        "✅ Текст уведомления о кешбэке успешно обновлён!",
+        reply_markup=admin_menu_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "adm_set_bal_remind_text")
+async def admin_set_balance_reminder_text_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        return
+    async with async_session() as session:
+        cur = await _get_setting(session, "balance_reminder_text", "")
+    cur_display = cur if cur else "💰 У вас на балансе <b>{balance} ₽</b> — вы можете использовать их для оплаты продления!"
+    await callback.message.edit_text(
+        "✏️ <b>Текст напоминания о балансе</b>\n\n"
+        "Эта строка автоматически добавляется в сообщения об окончании подписки, если у пользователя есть деньги на балансе.\n\n"
+        f"<b>Текущий текст:</b>\n{cur_display}\n\n"
+        "Доступные переменные:\n"
+        "• <code>{balance}</code> — текущий баланс пользователя в рублях\n\n"
+        "Отправьте новый текст напоминания (HTML) или отправьте <code>default</code> для сброса:",
+        reply_markup=admin_back_kb(),
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminStates.waiting_balance_reminder_text)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_balance_reminder_text, F.text)
+async def admin_set_balance_reminder_text_save(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    text_val = message.text.strip()
+    if text_val.lower() == "default":
+        text_val = ""
+    async with async_session() as session:
+        await _set_setting(session, "balance_reminder_text", text_val)
+    await state.clear()
+    await message.answer(
+        "✅ Текст напоминания о балансе успешно обновлён!",
+        reply_markup=admin_menu_kb(),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "adm_toggle_demo_key")
@@ -4186,25 +6347,33 @@ async def admin_stats_web(callback: CallbackQuery) -> None:
     paid_30d = conv.get("paid_30d", 0)
     conv_pct = round(paid_30d / total_30d * 100, 1) if total_30d else 0.0
 
-    STATUS_LABELS_RU = {"pending": "⏳ Ожидают", "delivered": "✅ Выдано", "canceled": "❌ Отменено", "demo": "🎁 Демо"}
-    statuses_text = "\n".join(f"  {STATUS_LABELS_RU.get(s, s)}: {sc.get(s, 0)}" for s in STATUS_LABELS_RU)
+    delivered = sc.get("delivered", 0)
+    demo = sc.get("demo", 0)
+    canceled = sc.get("canceled", 0)
+    pending = sc.get("pending", 0)
+
+    pending_line = f"  ⏳ В процессе оплаты: <b>{pending}</b>\n" if pending > 0 else ""
 
     text = (
         "🌐 <b>Вебстор — статистика</b>\n\n"
-        "<b>Выручка</b>\n"
-        f"  Сегодня: <b>{rev.get('today', 0)} ₽</b>\n"
-        f"  7 дней: <b>{rev.get('w7', 0)} ₽</b>\n"
-        f"  30 дней: <b>{rev.get('w30', 0)} ₽</b>\n"
-        f"  Всего: <b>{rev.get('all', 0)} ₽</b>\n\n"
-        "<b>Заказы</b>\n"
-        f"{statuses_text}\n\n"
-        "<b>Конверсия (30 дней)</b>\n"
-        f"  Создано: {total_30d} → Оплачено: {paid_30d} ({conv_pct}%)\n\n"
-        "<b>Клиенты</b>\n"
-        f"  Профилей на сайте: {d.get('total_profiles', 0)}\n\n"
-        "<b>Рефералы</b>\n"
-        f"  Оплат по реф. ссылке: {ref.get('orders', 0)}\n"
-        f"  Начислено реф. ₽: {ref.get('credited_rub', 0)}"
+        "<b>Выручка с сайта:</b>\n"
+        f"  Сегодня: <b>{rev.get('today', 0):,.0f} ₽</b>\n"
+        f"  7 дней: <b>{rev.get('w7', 0):,.0f} ₽</b>\n"
+        f"  30 дней: <b>{rev.get('w30', 0):,.0f} ₽</b>\n"
+        f"  За всё время: <b>{rev.get('all', 0):,.0f} ₽</b>\n\n"
+        "<b>Заказы и доступы:</b>\n"
+        f"  ✅ Оплачено и выдано: <b>{delivered}</b>\n"
+        f"  🎁 Демо-доступы: <b>{demo}</b>\n"
+        f"  ❌ Не завершили оплату: <b>{canceled}</b>\n"
+        f"{pending_line}\n"
+        "<b>Конверсия чекаута (30 дней):</b>\n"
+        f"  Создано заказов: <b>{total_30d}</b>\n"
+        f"  Оплачено: <b>{paid_30d}</b>\n"
+        f"  Конверсия: <b>{conv_pct}%</b>\n\n"
+        "<b>Клиенты и рефералы:</b>\n"
+        f"  👥 Профилей на сайте: <b>{d.get('total_profiles', 0)}</b>\n"
+        f"  🔗 Оплат по реф. ссылке: <b>{ref.get('orders', 0)}</b>\n"
+        f"  💰 Начислено бонусов: <b>{ref.get('credited_rub', 0):,.0f} ₽</b>"
     )
 
     back_kb = InlineKeyboardBuilder()

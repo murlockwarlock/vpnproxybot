@@ -111,3 +111,9 @@ def test_vhq_response_headers_userinfo_and_dynamic_title(monkeypatch):
     title_bytes = base64.b64decode(profile_title_encoded[7:])
     assert title_bytes.decode("utf-8") == "ДариМир Премиум"
 
+    # 3. Test default branding when tariff_label is None
+    monkeypatch.setattr("bot.config.settings.subscription_profile_title", "Даримир Базовый")
+    headers_none = build_vhq_response_headers({}, expires_at=expires, tariff_label=None)
+    title_none = base64.b64decode(headers_none["profile-title"][7:]).decode("utf-8")
+    assert title_none == "Даримир Премиум"
+

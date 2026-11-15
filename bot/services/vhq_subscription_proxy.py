@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import aiohttp
 
 from bot.config import settings
+from bot.services.subscription_payload_localizer import localize_subscription_payload
 
 _TIMEOUT = aiohttp.ClientTimeout(total=15)
 _PASSTHROUGH_HEADERS = {
@@ -36,8 +37,6 @@ _OVERRIDDEN_HEADERS = {
 _FORWARDED_REQUEST_HEADERS = {
     "user-agent",
     "accept",
-    "if-none-match",
-    "if-modified-since",
 }
 
 
@@ -119,18 +118,58 @@ def build_vhq_subscription_ref_url(
     return f"{route_base}/vhq-sub/{payload_part}.{signature}"
 
 
+def build_vhq_web_order_ref_url(
+    order_id: str,
+    *,
+    public_base_url: str | None = None,
+    path_prefix: str | None = None,
+    secret: str | None = None,
+) -> str:
+    route_base = _build_route_base(public_base_url, path_prefix)
+    signing_secret = str(secret or _default_proxy_secret()).strip()
+    if not route_base or not signing_secret:
+        return ""
+
+    payload_part = _urlsafe_b64encode(
+        json.dumps({"w": str(order_id)}, separators=(",", ":")).encode("utf-8")
+    )
+    signature = _sign_payload(payload_part, signing_secret)
+    return f"{route_base}/vhq-sub/{payload_part}.{signature}"
+
+
+def _candidate_secrets(secret: str | None = None) -> list[str]:
+    candidates: list[str] = []
+    if secret and str(secret).strip():
+        candidates.append(str(secret).strip())
+    vhq_secret = str(getattr(settings, "vhq_subscription_proxy_secret", "") or "").strip()
+    if vhq_secret and vhq_secret not in candidates:
+        candidates.append(vhq_secret)
+    bridge_secret = str(getattr(settings, "webstore_bridge_secret", "") or "").strip()
+    if bridge_secret and bridge_secret not in candidates:
+        candidates.append(bridge_secret)
+    bot_token = str(getattr(settings, "bot_token", "") or "").strip()
+    if bot_token and bot_token not in candidates:
+        candidates.append(bot_token)
+    return candidates
+
+
 def resolve_vhq_mirror_token(token: str, *, secret: str | None = None) -> dict[str, Any] | None:
     raw_token = str(token or "").strip()
     if "." not in raw_token:
         return None
 
     payload_part, signature = raw_token.rsplit(".", 1)
-    signing_secret = str(secret or _default_proxy_secret()).strip()
-    if not payload_part or not signature or not signing_secret:
+    if not payload_part or not signature:
         return None
 
-    expected = _sign_payload(payload_part, signing_secret)
-    if not hmac.compare_digest(expected, signature):
+    matched = False
+    for candidate in _candidate_secrets(secret):
+        expected = _sign_payload(payload_part, candidate)
+        if hmac.compare_digest(expected, signature):
+            matched = True
+            break
+
+    if not matched:
         return None
 
     try:
@@ -152,6 +191,10 @@ def resolve_vhq_mirror_token(token: str, *, secret: str | None = None) -> dict[s
         subscription_id = 0
     if subscription_id > 0:
         return {"kind": "subscription", "subscription_id": subscription_id}
+
+    web_order_id = str(payload.get("w") or "").strip()
+    if web_order_id:
+        return {"kind": "web_order", "web_order_id": web_order_id}
 
     return None
 
@@ -228,21 +271,23 @@ def build_vhq_response_headers(
         headers["subscription-userinfo"] = f"upload=0; download=0; total=0; expire={expire_ts}"
 
     title = _setting_str("subscription_profile_title")
-    if title and tariff_label:
+    if not title:
+        title = "Даримир Премиум"
+    else:
         title_lower = title.lower()
-        if "премиум" in tariff_label.lower():
-            if "базовый" in title_lower:
-                title = title.replace("Базовый", "Премиум").replace("базовый", "премиум")
-            else:
-                title = "ДариМир Премиум"
-        elif "лайт" in tariff_label.lower():
+        if tariff_label and "лайт" in tariff_label.lower():
             if "базовый" in title_lower:
                 title = title.replace("Базовый", "Лайт").replace("базовый", "лайт")
+            elif "премиум" in title_lower:
+                title = title.replace("Премиум", "Лайт").replace("премиум", "лайт")
             else:
-                title = "ДариМир Лайт"
-        elif "базовый" in tariff_label.lower():
-            if "базовый" not in title_lower:
-                title = "ДариМир Базовый"
+                title = "Даримир Лайт"
+        else:
+            # VHQ in Darimir is branded as Premium ("Даримир Премиум")
+            if "базовый" in title_lower:
+                title = title.replace("Базовый", "Премиум").replace("базовый", "премиум")
+            elif "премиум" not in title_lower:
+                title = "Даримир Премиум"
 
     if title:
         headers["profile-title"] = _header_text(title)
@@ -295,12 +340,20 @@ async def fetch_vhq_mirror_payload(
     async with aiohttp.ClientSession(timeout=_TIMEOUT) as http:
         async with http.get(upstream_url, headers=forwarded_headers) as response:
             body = await response.read()
+            original_body = body
+            if response.status == 200:
+                body = localize_subscription_payload(body)
             headers = build_vhq_response_headers(
                 response.headers,
                 expires_at=expires_at,
                 key_id=key_id,
                 tariff_label=tariff_label,
             )
+            if body != original_body:
+                for name in list(headers):
+                    if name.lower() in {"etag", "last-modified", "cache-control"}:
+                        headers.pop(name, None)
+                headers["cache-control"] = "no-cache"
             return response.status, body, headers
 
 
@@ -308,8 +361,25 @@ def get_subscription_display_key(subscription: Any) -> str | None:
     raw_key = getattr(subscription, "vpn_key", None)
     subscription_id = getattr(subscription, "id", None)
     client_name = str(getattr(subscription, "client_name", "") or "")
+
+    # 1. Adapt subscriptions: present preferred darimiru.xyz URL
+    from bot.services.adapt_routing import is_adapt_subscription, get_adapt_uuid_from_subscription
+    from bot.services.adapt_subscription_proxy import build_adapt_mirror_url
+
+    if is_adapt_subscription(subscription):
+        adapt_uuid = get_adapt_uuid_from_subscription(subscription)
+        if adapt_uuid:
+            return build_adapt_mirror_url(adapt_uuid)
+
     if not raw_key:
         return raw_key
+
+    # If raw_key contains an Adapt subscription URL, normalize to preferred delivery URL
+    adapt_uuid = get_adapt_uuid_from_subscription(subscription)
+    if adapt_uuid:
+        return build_adapt_mirror_url(adapt_uuid)
+
+    # 2. VHQ subscriptions: present ref / mirror URL
     if not client_name.startswith("vhq_"):
         return raw_key
     if subscription_id:

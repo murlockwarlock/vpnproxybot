@@ -174,6 +174,92 @@
     .send-btn:hover { background: var(--brand-deep); }
     .send-btn:disabled { opacity: .45; }
 
+    .attach-btn {
+      width: 42px; height: 42px; border-radius: 50%;
+      background: var(--bg); color: var(--muted);
+      border: 1px solid var(--line); cursor: pointer; font-size: 18px;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0; transition: all .2s;
+    }
+    .attach-btn:hover { background: rgba(20,34,44,0.08); color: var(--text); }
+
+    .attachment-preview-bar {
+      display: none; align-items: center; gap: 10px;
+      padding: 8px 16px; border-top: 1px solid var(--line);
+      background: rgba(20,34,44,0.03);
+    }
+    .attachment-preview-bar.active { display: flex; }
+    .attachment-thumb {
+      width: 44px; height: 44px; border-radius: 8px;
+      object-fit: cover; border: 1px solid var(--line); background: #fff;
+    }
+    .attachment-info { flex: 1; min-width: 0; font-size: 12px; }
+    .attachment-name { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+    .attachment-status { color: var(--muted); font-size: 11px; }
+    .attachment-remove-btn {
+      background: none; border: none; font-size: 18px;
+      cursor: pointer; color: var(--muted); padding: 4px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .attachment-remove-btn:hover { color: #c0392b; }
+
+    .msg-media { margin-bottom: 6px; }
+    .msg-media img {
+      max-width: 100%; max-height: 260px; border-radius: 12px;
+      display: block; cursor: pointer; object-fit: cover;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      transition: transform .15s ease-in-out;
+    }
+    .msg-media img:hover { transform: scale(1.02); }
+
+    .client-lk-panel {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+      margin-top: 5px; font-size: 11px;
+    }
+    .lk-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 8px; border-radius: 6px;
+      background: rgba(12,140,140,0.08); color: var(--brand-deep);
+      font-weight: 600; text-decoration: none;
+    }
+    .lk-badge a { color: inherit; text-decoration: none; }
+    .lk-badge a:hover { text-decoration: underline; }
+    .lk-badge.sub-active {
+      background: rgba(52,199,89,0.14); color: #1a7a3a;
+    }
+    .lk-badge.sub-expired {
+      background: rgba(239,138,37,0.14); color: #b85d08;
+    }
+    .lk-badge.balance {
+      background: rgba(20,34,44,0.06); color: var(--text);
+    }
+    .lk-link-btn {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 8px; border-radius: 6px;
+      background: var(--brand); color: #fff;
+      font-weight: 700; text-decoration: none; font-size: 11px;
+      transition: background .15s;
+    }
+    .lk-link-btn:hover { background: var(--brand-deep); }
+    .recovery-panel {
+      display: none;
+      margin-top: 10px;
+      padding: 12px;
+      border: 1px solid rgba(239,138,37,.35);
+      border-radius: 12px;
+      background: rgba(239,138,37,.08);
+      font-size: 12px;
+    }
+    .recovery-panel.active { display: block; }
+    .recovery-panel strong { display: block; margin-bottom: 6px; }
+    .recovery-panel label { display: block; margin-top: 8px; color: var(--muted); font-weight: 600; }
+    .recovery-panel select, .recovery-panel textarea { width: 100%; margin-top: 4px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font: inherit; }
+    .recovery-panel textarea { min-height: 56px; resize: vertical; }
+    .recovery-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+    .recovery-actions button { padding: 7px 10px; border: 0; border-radius: 8px; cursor: pointer; font: inherit; font-weight: 700; }
+    .recovery-approve { background: var(--brand); color: #fff; }
+    .recovery-deny { background: rgba(192,57,43,.12); color: #a93226; }
+
     /* Mobile */
     @media(max-width: 640px) {
       .sidebar { width: 100%; position: absolute; top: 0; left: 0; bottom: 0; z-index: 10; transform: translateX(0); transition: transform .2s; }
@@ -191,7 +277,7 @@
 <div id="loginScreen">
   <img class="logo" src="/api/store/logo" alt="">
   <h1>Панель поддержки</h1>
-  <p>Введите пароль для входа</p>
+  <p>Пароль — для обычной работы с обращениями.<br>Для одобрения восстановления нужен Telegram администратора.</p>
   <div class="tg-login-wrap">
     <input type="password" id="adminPassword" placeholder="Пароль"
       style="padding:10px 16px;border:1px solid #ddd;border-radius:8px;font-size:15px;width:240px;outline:none;"
@@ -203,6 +289,7 @@
     <div id="loginError" style="color:#c0392b;font-size:13px;display:none;margin-top:6px">
       Неверный пароль или нет доступа.
     </div>
+    <div id="telegramLoginWidget" style="margin-top:16px;min-height:42px;"><!--TELEGRAM_WIDGET--></div>
   </div>
 </div>
 
@@ -235,9 +322,32 @@
     <div id="activeChat" style="display:none; flex-direction:column; height:100%;">
       <div class="chat-top" id="chatTop">
         <button class="back-btn" id="backBtn" onclick="showSidebar()">← Тикеты</button>
-        <div>
+        <div style="flex:1; min-width:0;">
           <div class="chat-top h3" id="chatContactLabel" style="font-size:14px;font-weight:700;"></div>
           <div class="contact-info" id="chatContactInfo"></div>
+          <div class="client-lk-panel" id="clientLkPanel" style="display:none;"></div>
+          <div class="recovery-panel" id="recoveryPanel">
+            <strong>Восстановление доступа</strong>
+            <div id="recoverySummary"></div>
+            <label for="recoveryCandidate">Профиль и подтверждённый платёж</label>
+            <select id="recoveryCandidate"></select>
+            <label for="recoveryVerificationNote">Что проверено по платежу и обращению</label>
+            <textarea id="recoveryVerificationNote" placeholder="Например: ID, статус и сумма совпадают; дополнительно сверена история заказов"></textarea>
+            <div id="recoveryManualBasisWrap" style="display:none;">
+              <label for="recoveryManualBasis">Основание ручной проверки</label>
+              <select id="recoveryManualBasis">
+                <option value="">Выберите основание</option>
+                <option value="account_history">История заказов и подписки</option>
+                <option value="verified_customer_channel">Подтверждённый канал клиента</option>
+                <option value="trusted_external_evidence">Другое доверенное подтверждение, проверенное поддержкой</option>
+              </select>
+            </div>
+            <div class="recovery-actions">
+              <button class="recovery-approve" type="button" onclick="approveRecovery()">Подтвердить владельца</button>
+              <button class="recovery-deny" type="button" onclick="denyRecovery()">Отказать</button>
+            </div>
+            <div id="recoveryMessage" style="margin-top:7px;color:var(--muted);"></div>
+          </div>
         </div>
         <div class="client-dot" id="clientDot"></div>
         <button class="resolve-btn" id="resolveBtn" onclick="resolveTicket()">✅ Обработано</button>
@@ -248,8 +358,18 @@
         </div>
       </div>
       <div class="resolved-banner" id="resolvedBanner" style="display:none">✅ Тикет закрыт</div>
+      <div id="adminPendingAttachment" class="attachment-preview-bar">
+        <img id="adminThumb" class="attachment-thumb" src="" alt="">
+        <div class="attachment-info">
+          <div id="adminFileName" class="attachment-name"></div>
+          <div id="adminFileStatus" class="attachment-status">Загружено</div>
+        </div>
+        <button type="button" class="attachment-remove-btn" onclick="removeAdminAttachment()" title="Удалить">✕</button>
+      </div>
       <div class="input-area" id="inputArea">
-        <textarea id="replyInput" rows="1" placeholder="Ответить..." onkeydown="handleKey(event)" oninput="autoResize(this); sendTyping();"></textarea>
+        <input type="file" id="adminFileInput" accept="image/png,image/jpeg,image/webp,image/gif" style="display:none" onchange="uploadAdminFile(this.files[0])">
+        <button type="button" class="attach-btn" id="adminAttachBtn" onclick="document.getElementById('adminFileInput').click()" title="Прикрепить скриншот">📎</button>
+        <textarea id="replyInput" rows="1" placeholder="Ответить... (можно вставить скриншот Ctrl+V)" onkeydown="handleKey(event)" oninput="autoResize(this); sendTyping();"></textarea>
         <button class="send-btn" onclick="sendReply()">➤</button>
       </div>
     </div>
@@ -265,6 +385,10 @@
   let typingTimeout = null;
   let audioCtx = null;
   let ticketWsMap = {};
+  let adminMediaUrl = null;
+  let currentRecovery = null;
+  let recoveryCandidates = [];
+  let canApproveRecovery = false;
 
   function beep(freq = 880, dur = 0.25, vol = 0.08) {
     try {
@@ -290,7 +414,7 @@
   }
 
   function escapeHtml(s) {
-    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br>");
+    return String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br>");
   }
 
   async function doPasswordLogin() {
@@ -334,8 +458,8 @@
     const main = document.getElementById("mainScreen");
     main.style.display = "flex";
     document.getElementById("agentNameLabel").textContent = agentData.name || agentData.username || "Агент";
+    canApproveRecovery = Boolean(agentData.can_approve_recovery);
     await loadTickets();
-    // poll every 15s for new tickets
     setInterval(loadTickets, 15000);
   }
 
@@ -383,13 +507,225 @@
     }).join("");
   }
 
+  // Media upload for agent
+  async function doUpload(file, onProgress, onSuccess, onError) {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      alert("Пожалуйста, выберите изображение (PNG, JPEG, WebP, GIF)");
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      alert("Размер файла превышает 10 МБ");
+      return;
+    }
+    onProgress && onProgress("Загрузка...");
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const res = await fetch("/api/support/upload", {
+        method: "POST",
+        headers: agentHeaders(),
+        body: formData,
+      });
+      const data = await res.json();
+      if (res.ok && data.ok && data.url) {
+        onSuccess(data.url, file.name);
+      } else {
+        onError && onError(data.error || "Ошибка загрузки");
+      }
+    } catch (err) {
+      onError && onError("Ошибка сети");
+    }
+  }
+
+  function uploadAdminFile(file) {
+    if (!file) return;
+    const bar = document.getElementById("adminPendingAttachment");
+    const thumb = document.getElementById("adminThumb");
+    const nameEl = document.getElementById("adminFileName");
+    const statusEl = document.getElementById("adminFileStatus");
+
+    bar.classList.add("active");
+    nameEl.textContent = file.name;
+    statusEl.textContent = "Загрузка...";
+    thumb.src = URL.createObjectURL(file);
+
+    doUpload(file,
+      status => { statusEl.textContent = status; },
+      (url, name) => {
+        adminMediaUrl = url;
+        statusEl.textContent = "Прикреплено";
+      },
+      err => {
+        statusEl.textContent = err;
+        alert("Не удалось загрузить файл: " + err);
+        removeAdminAttachment();
+      }
+    );
+  }
+
+  function removeAdminAttachment() {
+    adminMediaUrl = null;
+    document.getElementById("adminFileInput").value = "";
+    document.getElementById("adminPendingAttachment").classList.remove("active");
+  }
+
+  // Paste listener for agent reply
+  document.addEventListener("paste", e => {
+    if (!currentTicketId) return;
+    if (!e.clipboardData || !e.clipboardData.items) return;
+    for (const item of e.clipboardData.items) {
+      if (item.type.indexOf("image") !== -1) {
+        const file = item.getAsFile();
+        if (!file) continue;
+        e.preventDefault();
+        uploadAdminFile(file);
+        break;
+      }
+    }
+  });
+
+  function renderClientLk(lk) {
+    const panel = document.getElementById("clientLkPanel");
+    if (!lk) {
+      panel.style.display = "none";
+      panel.innerHTML = "";
+      return;
+    }
+    const badges = [];
+    if (lk.telegram_username) {
+      badges.push(`<span class="lk-badge">👤 <a href="https://t.me/${escapeHtml(lk.telegram_username)}" target="_blank" rel="noopener noreferrer">@${escapeHtml(lk.telegram_username)}</a></span>`);
+    } else if (lk.telegram_id) {
+      badges.push(`<span class="lk-badge">👤 ID: ${escapeHtml(lk.telegram_id)}</span>`);
+    }
+    if (lk.telegram_full_name) {
+      badges.push(`<span class="lk-badge">${escapeHtml(lk.telegram_full_name)}</span>`);
+    }
+    if (lk.balance_rub !== null && lk.balance_rub !== undefined) {
+      badges.push(`<span class="lk-badge balance">💰 ${escapeHtml(lk.balance_rub)} ₽</span>`);
+    }
+    if (lk.subscription) {
+      const sub = lk.subscription;
+      const cls = sub.is_active ? "sub-active" : "sub-expired";
+      badges.push(`<span class="lk-badge ${cls}">🔑 ${escapeHtml(sub.status_label)} (${escapeHtml(sub.tariff)}) до ${escapeHtml(sub.expires_at)}</span>`);
+    }
+    if (lk.profile_url) {
+      badges.push(`<a href="${escapeHtml(lk.profile_url)}" target="_blank" rel="noopener noreferrer" class="lk-link-btn">ЛК клиента ↗</a>`);
+    }
+
+    if (badges.length > 0) {
+      panel.innerHTML = badges.join("");
+      panel.style.display = "flex";
+    } else {
+      panel.style.display = "none";
+      panel.innerHTML = "";
+    }
+  }
+
+  function renderRecovery(recovery) {
+    const panel = document.getElementById("recoveryPanel");
+    const select = document.getElementById("recoveryCandidate");
+    const summary = document.getElementById("recoverySummary");
+    const message = document.getElementById("recoveryMessage");
+    const actions = document.querySelector("#recoveryPanel .recovery-actions");
+    const approveButton = document.querySelector("#recoveryPanel .recovery-approve");
+    const manualBasisWrap = document.getElementById("recoveryManualBasisWrap");
+    currentRecovery = recovery || null;
+    recoveryCandidates = recovery && recovery.candidates ? recovery.candidates : [];
+    if (!recovery) {
+      panel.classList.remove("active");
+      select.innerHTML = "";
+      actions.style.display = "none";
+      manualBasisWrap.style.display = "none";
+      return;
+    }
+    panel.classList.add("active");
+    actions.style.display = recovery.status === "pending" ? "flex" : "none";
+    const trusted = recoveryCandidates.filter(item => item.trusted_payment);
+    select.innerHTML = trusted.length ? trusted.map((item, index) =>
+      `<option value="${index}">${escapeHtml(item.profile_token)} · заказ ${escapeHtml(item.order_id)} · ${escapeHtml(item.amount_rub)} ₽</option>`
+    ).join("") : '<option value="">Нет доверенного платёжа</option>';
+    recoveryCandidates = trusted;
+    const paymentCheck = recovery.payment_check || {};
+    const manualReview = paymentCheck.manual_review_required === true && paymentCheck.payment_core_verified === true;
+    const approvalAllowed = canApproveRecovery && trusted.length > 0 && (!paymentCheck.status || manualReview);
+    approveButton.style.display = approvalAllowed ? "inline-block" : "none";
+    approveButton.textContent = manualReview ? "Одобрить после ручной проверки" : "Подтвердить владельца";
+    manualBasisWrap.style.display = manualReview && canApproveRecovery ? "block" : "none";
+    summary.textContent = `Статус: ${recovery.status}. Новый email: ${recovery.new_email || "—"}. Проверка платежа: ${paymentCheck.status || "не выполнена"}.`;
+    message.textContent = recovery.status === "pending" && !trusted.length
+      ? "Ссылка подписки или номер заказа используются только для поиска. Нужна проверка платежа у провайдера."
+      : recovery.status === "pending" && !canApproveRecovery
+        ? "Для одобрения восстановления войдите через Telegram администратора. Пароль оставляет доступ к обычной поддержке."
+      : recovery.status === "pending" && manualReview
+        ? `${paymentCheck.reason || "Платёж подтверждён, но контакт плательщика не найден."} VPN-ссылка, номер заказа или сумма сами по себе недостаточны.`
+      : recovery.status === "pending" && paymentCheck.reason
+        ? paymentCheck.reason
+        : recovery.status === "approved" ? "Владелец подтверждён. Повторное подтверждение запрещено; клиенту доступна отправка OTP." : "";
+  }
+
+  async function approveRecovery() {
+    if (!currentTicketId || !currentRecovery || currentRecovery.status !== "pending" || !recoveryCandidates.length) return;
+    const candidate = recoveryCandidates[Number(document.getElementById("recoveryCandidate").value)];
+    const note = document.getElementById("recoveryVerificationNote").value.trim();
+    const manualReview = currentRecovery.payment_check && currentRecovery.payment_check.manual_review_required === true;
+    const manualBasis = document.getElementById("recoveryManualBasis").value;
+    if (!candidate || note.length < 10) {
+      document.getElementById("recoveryMessage").textContent = "Опишите результат проверки платежа (не менее 10 знаков).";
+      return;
+    }
+    if (manualReview && !manualBasis) {
+      document.getElementById("recoveryMessage").textContent = "Выберите основание ручной проверки.";
+      return;
+    }
+    const response = await fetch(`/api/support/admin/ticket/${currentTicketId}/recovery/approve`, {
+      method: "POST",
+      headers: agentHeaders({"Content-Type": "application/json"}),
+      body: JSON.stringify({
+        profile_token: candidate.profile_token,
+        order_id: candidate.order_id,
+        verification_source: manualReview ? "yookassa_manual" : "yookassa_api",
+        verification_note: note,
+        manual_basis: manualReview ? manualBasis : ""
+      })
+    });
+    const data = await response.json();
+    if (!response.ok && data.recovery) {
+      currentRecovery = data.recovery;
+      renderRecovery(currentRecovery);
+    }
+    document.getElementById("recoveryMessage").textContent = response.ok ? "Владелец подтверждён. Клиенту доступна отправка OTP." : (data.error || "Не удалось подтвердить запрос.");
+    if (response.ok) {
+      currentRecovery = data.recovery;
+      renderRecovery(currentRecovery);
+      loadTickets();
+    }
+  }
+
+  async function denyRecovery() {
+    if (!currentTicketId || !currentRecovery || currentRecovery.status !== "pending") return;
+    const reason = window.prompt("Причина отказа", "Недостаточно доверенных данных для подтверждения владения") || "";
+    if (reason.trim().length < 5) return;
+    const response = await fetch(`/api/support/admin/ticket/${currentTicketId}/recovery/deny`, {
+      method: "POST",
+      headers: agentHeaders({"Content-Type": "application/json"}),
+      body: JSON.stringify({reason})
+    });
+    const data = await response.json();
+    document.getElementById("recoveryMessage").textContent = response.ok ? "Запрос отклонён." : (data.error || "Не удалось обработать запрос.");
+    if (response.ok) {
+      currentRecovery = data.recovery;
+      renderRecovery(currentRecovery);
+      loadTickets();
+    }
+  }
+
   async function openTicket(id, token, contact, messenger, status) {
     currentTicketId = id;
     seenMessages.add(id);
+    removeAdminAttachment();
 
-    // Mobile: hide sidebar
     document.getElementById("sidebar").classList.add("hidden");
-
     document.getElementById("placeholder").style.display = "none";
     const chat = document.getElementById("activeChat");
     chat.style.display = "flex";
@@ -402,21 +738,26 @@
     document.getElementById("inputArea").style.display = resolved ? "none" : "flex";
     document.getElementById("resolveBtn").disabled = resolved;
 
-    // Clear
     const area = document.getElementById("messages");
     const typing = document.getElementById("typingIndicator");
     area.innerHTML = "";
     area.appendChild(typing);
     typing.className = "typing-indicator";
 
-    // Load messages
     const r = await fetch(`/api/support/admin/ticket/${id}/messages`, {
       headers: agentHeaders()
     });
     const data = await r.json();
+
+    if (data.ticket && data.ticket.client_lk) {
+      renderClientLk(data.ticket.client_lk);
+    } else {
+      renderClientLk(null);
+    }
+    renderRecovery(data.ticket && data.ticket.recovery);
+
     for (const msg of (data.messages || [])) appendMessage(msg, false);
 
-    // Close old WS
     if (ws) ws.close();
 
     const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -442,7 +783,6 @@
     };
     ws.onclose = () => {};
 
-    // re-render list to update selection
     loadTickets();
   }
 
@@ -451,7 +791,14 @@
     const typing = document.getElementById("typingIndicator");
     const el = document.createElement("div");
     el.className = `msg ${msg.sender}`;
-    el.innerHTML = `<div>${escapeHtml(msg.text)}</div><div class="msg-time">${formatTime(msg.created_at)}</div>`;
+
+    let mediaHtml = "";
+    if (msg.media_url) {
+      mediaHtml = `<div class="msg-media"><a href="${msg.media_url}" target="_blank" rel="noopener noreferrer"><img src="${msg.media_url}" alt="Скриншот" loading="lazy"></a></div>`;
+    }
+    let textHtml = msg.text ? `<div>${escapeHtml(msg.text)}</div>` : "";
+    el.innerHTML = `${mediaHtml}${textHtml}<div class="msg-time">${formatTime(msg.created_at)}</div>`;
+
     area.insertBefore(el, typing);
     if (scroll) area.scrollTop = area.scrollHeight;
   }
@@ -465,13 +812,17 @@
   async function sendReply() {
     const input = document.getElementById("replyInput");
     const text = input.value.trim();
-    if (!text || !currentTicketId) return;
+    const mediaUrl = adminMediaUrl;
+    if ((!text && !mediaUrl) || !currentTicketId) return;
+
     input.value = ""; autoResize(input);
-    appendMessage({sender:"agent", text, created_at: new Date().toISOString()}, true);
+    removeAdminAttachment();
+    appendMessage({sender:"agent", text, media_url: mediaUrl, created_at: new Date().toISOString()}, true);
+
     await fetch(`/api/support/admin/ticket/${currentTicketId}/message`, {
       method: "POST",
       headers: agentHeaders({"Content-Type": "application/json"}),
-      body: JSON.stringify({text})
+      body: JSON.stringify({text, media_url: mediaUrl})
     });
   }
 
@@ -515,6 +866,10 @@
     document.getElementById("placeholder").style.display = "";
     document.getElementById("activeChat").style.display = "none";
     currentTicketId = null;
+    currentRecovery = null;
+    recoveryCandidates = [];
+    document.getElementById("recoveryPanel").classList.remove("active");
+    removeAdminAttachment();
   }
 
   document.addEventListener("click", () => {

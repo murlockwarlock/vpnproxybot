@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
@@ -54,6 +55,16 @@ class VHQPartnerAPI:
             payload={"tier": normalized_tier, "days": days},
         )
 
+    async def renew(self, *, order_id: str) -> dict[str, Any]:
+        normalized_order_id = str(order_id or "").strip()
+        if not normalized_order_id:
+            raise VHQPartnerAPIError("Missing order_id for VHQ renew")
+        return await self._request(
+            "renew",
+            method="POST",
+            payload={"order_id": normalized_order_id},
+        )
+
     async def get_orders(self) -> dict[str, Any]:
         return await self._request("orders", method="GET")
 
@@ -72,6 +83,39 @@ class VHQPartnerAPI:
             if value:
                 return value
         return ""
+
+    @staticmethod
+    def extract_order_id(data: dict[str, Any] | None) -> str:
+        """Return the order ID from a VHQ response."""
+        if not isinstance(data, dict):
+            return ""
+        for key in ("order_id", "id", "orderId"):
+            val = str(data.get(key) or "").strip()
+            if val:
+                return val
+        return ""
+
+    @staticmethod
+    def extract_active_until(data: dict[str, Any] | None) -> datetime | None:
+        """Return the active_until timestamp parsed from a VHQ response."""
+        if not isinstance(data, dict):
+            return None
+        raw = str(data.get("active_until") or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(raw[:19], fmt)
+            except Exception:
+                pass
+        return None
 
     async def _request(
         self,

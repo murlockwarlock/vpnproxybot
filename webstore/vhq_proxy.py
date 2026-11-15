@@ -39,3 +39,23 @@ def build_vhq_mirror_url(
     payload_part = _urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     signature = _sign_payload(payload_part, signing_secret)
     return f"{route_base}/vhq-sub/{payload_part}.{signature}"
+
+
+def build_vhq_web_order_ref_url(
+    order_id: str,
+    *,
+    public_base_url: str,
+    path_prefix: str,
+    secret: str,
+) -> str:
+    base = str(public_base_url or "").strip().rstrip("/")
+    signing_secret = str(secret or "").strip()
+    if not order_id or not base or not signing_secret:
+        return ""
+
+    prefix_value = str(path_prefix or "").strip()
+    prefix = f"/{prefix_value.strip('/')}" if prefix_value else ""
+    route_base = base if (prefix and base.endswith(prefix)) else f"{base}{prefix}"
+    payload_part = _urlsafe_b64encode(json.dumps({"w": str(order_id)}, separators=(",", ":")).encode("utf-8"))
+    signature = _sign_payload(payload_part, signing_secret)
+    return f"{route_base}/vhq-sub/{payload_part}.{signature}"

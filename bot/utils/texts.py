@@ -114,6 +114,11 @@ PAYMENT_STARS_INVOICE_DESC = (
 
 # ── Key Delivery ───────────────────────────────────────
 
+YOOKASSA_PAYMENT_RECEIVED = (
+    "✅ Оплата получена. Ваш VPN-доступ готовится. "
+    "Мы автоматически отправим его сюда после активации"
+)
+
 SELECT_DEVICE_AFTER_PAYMENT = (
     "✅ <b>Оплата прошла.</b>\n\n"
     "Ваша подписка работает на всех устройствах.\n"
@@ -272,14 +277,35 @@ ADMIN_PANEL = (
 )
 
 ADMIN_STATS = (
-    "📊 <b>Статистика</b>\n\n"
-    "👥 Всего юзеров: <b>{total_users}</b>\n"
-    "👤 Новых сегодня: <b>{new_today}</b>\n"
-    "🟢 Активных подписок: <b>{active_subs}</b>\n"
+    "📊 <b>Статистика сервиса</b>\n\n"
+    "👥 <b>Пользователи:</b> <b>{total_users}</b> (новых сегодня: <b>{new_today}</b> · активных: <b>{paying_users}</b>)\n\n"
+    "🟢 <b>Активные доступы: {active_subs}</b>\n"
     "{details}"
-    "🔴 Истёкших: <b>{expired_subs}</b>\n"
-    "💰 Оплат за всё время: <b>{total_payments}</b>\n"
-    "🖥 Серверов: <b>{server_count}</b>"
+    "🔴 <b>Истёкших: {expired_subs}</b>\n\n"
+    "💰 <b>Выручка:</b>\n"
+    " ├ Сегодня: {rev_today}\n"
+    " ├ За 7 дней: {rev_7d}\n"
+    " ├ За 30 дней: {rev_30d}\n"
+    " ├ За всё время: {rev_all}{stars_text}\n"
+    " └ Успешных оплат: <b>{total_payments}</b>"
+    "{conversion_block}"
+)
+
+ADMIN_STATS_UNIFIED = (
+    "📊 <b>Статистика сервиса</b>\n\n"
+    "👥 <b>Клиенты (всего: {total_clients}):</b>\n"
+    " ├ 📱 Telegram: <b>{total_users}</b> (новых сегодня: <b>{new_today}</b> · активных: <b>{paying_users}</b>)\n"
+    " └ 🌐 Веб-сайт: <b>{web_profiles}</b> (профилей)\n\n"
+    "🟢 <b>Активные доступы: {active_subs}</b> (ТГ: <b>{bot_active_subs}</b> · Сайт: <b>{web_active_subs}</b>)\n"
+    "{details}"
+    "🔴 <b>Истёкших: {expired_subs}</b> (ТГ: <b>{bot_expired_subs}</b> · Сайт: <b>{web_expired_subs}</b>)\n\n"
+    "💰 <b>Выручка:</b>\n"
+    " ├ Сегодня: {rev_today}\n"
+    " ├ За 7 дней: {rev_7d}\n"
+    " ├ За 30 дней: {rev_30d}\n"
+    " ├ За всё время: {rev_all}{stars_text}\n"
+    " └ Успешных оплат: <b>{total_payments}</b> (ТГ: <b>{bot_payments}</b> · Сайт: <b>{web_payments}</b>)"
+    "{conversion_block}"
 )
 
 ADMIN_SERVER_INFO = (
@@ -407,6 +433,7 @@ ADMIN_TARIFF_TOGGLED = "✅ Тариф <b>{label}</b> теперь {status}."
 ADMIN_SETTINGS_HEADER = (
     "⚙️ <b>Настройки оплаты и устройств</b>\n\n"
     "⭐ Telegram Stars: <b>{stars_status}</b>\n"
+    "🎁 Кешбэк за оплату: <b>{cashback_status}</b> ({cashback_pct}%)\n"
     "📱 Макс. устройств на подписку: <b>{max_devices}</b>\n"
     "💰 Дневная ставка: <b>{daily_charge_rub} ₽</b>\n"
     "💸 Цена доп. устройства: <b>{device_price_rub}₽</b>"

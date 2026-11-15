@@ -100,11 +100,13 @@ async def test_create_vhq_paid_subscription_reuses_existing():
         vpn_key="https://sub.vhq-connect.xyz/old-key",
         expires_at=datetime.utcnow() + timedelta(days=5),
         status=SubStatus.ACTIVE,
+        vhq_order_id="old_order",
     )
 
     api_resp = {
-        "order_id": "vhq-order-222",
-        "branded_url": "https://sub.vhq-connect.xyz/new-key",
+        "order_id": "vhq_old_order",
+        "status": "scheduled",
+        "active_until": (datetime.utcnow() + timedelta(days=35)).isoformat() + "Z",
     }
 
     vhq_spec = {"tier": "basic", "days": 30}
@@ -112,6 +114,7 @@ async def test_create_vhq_paid_subscription_reuses_existing():
     # Simulate existing subscription
     mock_execute_result = MagicMock()
     mock_execute_result.scalar_one_or_none = MagicMock(return_value=existing_sub)
+    mock_execute_result.rowcount = 1
 
     with (
         patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
@@ -122,9 +125,12 @@ async def test_create_vhq_paid_subscription_reuses_existing():
     ):
         mock_api = AsyncMock()
         mock_api.buy = AsyncMock(return_value=api_resp)
+        mock_api.renew = AsyncMock(return_value=api_resp)
         mock_vhq_cls.return_value = mock_api
         mock_vhq_cls.extract_subscription_url.side_effect = lambda data: data.get("branded_url") or data.get("config_url")
         session.execute = AsyncMock(return_value=mock_execute_result)
+        session.scalar = AsyncMock(return_value=None)
+        session.get = AsyncMock(return_value=existing_sub)
 
         sub, key = await _create_vhq_paid_subscription(
             session, user=user, tariff=tariff, platform=MagicMock(), vhq_spec=vhq_spec
@@ -132,7 +138,7 @@ async def test_create_vhq_paid_subscription_reuses_existing():
 
     assert sub is existing_sub
     assert key == "https://darimiru.ru/vpnbot/vhq-sub/ref-url-99"
-    assert existing_sub.vpn_key == "https://sub.vhq-connect.xyz/new-key"
+    assert existing_sub.vpn_key == "https://sub.vhq-connect.xyz/old-key"
     assert existing_sub.status == SubStatus.ACTIVE
     
     # Verify no new Subscription was added to session

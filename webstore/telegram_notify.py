@@ -88,3 +88,66 @@ async def send_telegram_notifications(
     except Exception as exc:
         logger.warning("Telegram notification transport unavailable: %s", type(exc).__name__)
     return delivered
+
+
+async def send_telegram_photo(
+    bot_token: str,
+    recipient_ids: set[int] | list[int],
+    photo_bytes: bytes,
+    caption: str,
+    *,
+    filename: str = "screenshot.jpg",
+    parse_mode: str = "HTML",
+) -> int:
+    recipients = sorted({int(item) for item in recipient_ids if item})
+    if not bot_token or not recipients or not photo_bytes:
+        return 0
+
+    api_url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    delivered = 0
+    timeout = aiohttp.ClientTimeout(total=30)
+    try:
+        connector = _telegram_connector()
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as http:
+            for recipient_id in recipients:
+                for attempt in range(1, 4):
+                    try:
+                        form = aiohttp.FormData()
+                        form.add_field("chat_id", str(recipient_id))
+                        form.add_field("caption", caption[:1024])
+                        form.add_field("parse_mode", parse_mode)
+                        form.add_field(
+                            "photo",
+                            photo_bytes,
+                            filename=filename,
+                            content_type="application/octet-stream",
+                        )
+                        async with http.post(api_url, data=form) as response:
+                            payload = await response.json(content_type=None)
+                            if response.status == 200 and isinstance(payload, dict) and payload.get("ok"):
+                                delivered += 1
+                                break
+                            retryable = response.status == 429 or response.status >= 500
+                            logger.warning(
+                                "Telegram photo rejected recipient_id=%s status=%s attempt=%s retryable=%s payload=%s",
+                                recipient_id,
+                                response.status,
+                                attempt,
+                                retryable,
+                                payload,
+                            )
+                            if not retryable or attempt == 3:
+                                break
+                            await asyncio.sleep(min(float(attempt), 5.0))
+                    except Exception as exc:
+                        logger.warning(
+                            "Telegram photo failed recipient_id=%s attempt=%s error=%s",
+                            recipient_id,
+                            attempt,
+                            type(exc).__name__,
+                        )
+                        if attempt < 3:
+                            await asyncio.sleep(float(attempt))
+    except Exception as exc:
+        logger.warning("Telegram photo transport unavailable: %s", type(exc).__name__)
+    return delivered

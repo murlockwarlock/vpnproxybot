@@ -39,3 +39,10 @@ Live API validation rechecked on 2026-08-02: `POST /subs/renew/custom` requires
 `custom_days >= 3`, although the rendered request table does not currently show
 that lower bound. The integration keeps this provider minimum in
 `ADAPT_MIN_CUSTOM_RENEW_DAYS`.
+
+## Official OpenAPI Contract Snapshot
+
+File: `openapi-2026-08-26.json`
+Official Download URL: `https://docs.adaptgroup.pro/assets/files/vpn-dd371496488e71f744d7639abcedbaad.json`
+Retrieved At (UTC): `2026-08-26T11:13:45Z`
+SHA-256: `ffcaa6bbf4f78f3872d5fd9e13d203ff5b0a6796522925d12721d1856f95aaf5`

@@ -2,7 +2,9 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from bot.keyboards.client import (
+    main_menu_kb,
     payment_kb,
+    profile_kb,
     product_type_kb,
     purchase_intro_kb,
     purchase_subscription_kb,
@@ -122,13 +124,53 @@ def test_subscription_target_button_is_short_and_keeps_term_visible():
 def test_purchase_carousel_keyboard_has_expected_actions():
     assert _button_texts(purchase_intro_kb())[0] == "Продолжить"
 
-    texts = _button_texts(
-        purchase_subscription_kb(243, position=0, total=2, show_upgrade=True)
+    # Default / show_new=False -> '➕ Создать новую' is absent
+    texts_no_new = _button_texts(
+        purchase_subscription_kb(243, position=0, total=2, show_upgrade=True, show_new=False)
     )
-    assert texts[:4] == ["↻ Продлить", "↑ Улучшить", "➕ Создать новую", "Следующая"]
-    markup = purchase_subscription_kb(243, position=0, total=2, show_upgrade=True)
-    callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+    assert texts_no_new[:4] == ["↻ Продлить", "↑ Улучшить", "1/2", "➡️"]
+    assert "➕ Создать новую" not in texts_no_new
+    callbacks_no_new = [
+        button.callback_data
+        for row in purchase_subscription_kb(
+            243, position=0, total=2, show_upgrade=True, show_new=False
+        ).inline_keyboard
+        for button in row
+    ]
+    assert "purchase_browse_1" in callbacks_no_new
+    assert "purchase_browse_0" not in callbacks_no_new
+
+    # show_new=True -> '➕ Создать новую' is present
+    markup_with_new = purchase_subscription_kb(243, position=0, total=2, show_upgrade=True, show_new=True)
+    texts_with_new = _button_texts(markup_with_new)
+    assert texts_with_new[:5] == ["↻ Продлить", "↑ Улучшить", "➕ Создать новую", "1/2", "➡️"]
+    callbacks = [button.callback_data for row in markup_with_new.inline_keyboard for button in row]
     assert "buy_new_243" in callbacks
+
+    page_two = purchase_subscription_kb(
+        243, position=1, total=2, show_upgrade=True, show_new=False
+    )
+    assert _button_texts(page_two)[:4] == ["↻ Продлить", "↑ Улучшить", "⬅️", "2/2"]
+    page_two_callbacks = [
+        button.callback_data for row in page_two.inline_keyboard for button in row
+    ]
+    assert "purchase_browse_0" in page_two_callbacks
+    assert "purchase_browse_2" not in page_two_callbacks
+
+    page_three = purchase_subscription_kb(
+        243, position=1, total=3, show_upgrade=True, show_new=False
+    )
+    assert _button_texts(page_three)[:5] == ["↻ Продлить", "↑ Улучшить", "⬅️", "2/3", "➡️"]
+    single_page = purchase_subscription_kb(
+        243, position=0, total=1, show_upgrade=True, show_new=False
+    )
+    assert all(text not in {"Следующая", "⬅️", "➡️"} for text in _button_texts(single_page))
+
+
+def test_my_subscriptions_label_replaces_my_keys_label():
+    assert "🔑 Мои подписки" in _button_texts(main_menu_kb())
+    assert "🔑 Мои подписки" in _button_texts(profile_kb(has_active_subs=True))
+    assert "🔑 Мои ключи" not in _button_texts(main_menu_kb())
 
 
 def test_product_type_keyboard_preserves_subscription_navigation():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from datetime import datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,25 +15,34 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from webstore import routes as webstore_routes
 
 
-async def test_store_upgrade_price_uses_rendered_payment_minimum():
+async def test_store_upgrade_price_uses_server_quotes():
     html = webstore_routes._render(
         "store.html",
         tariffs=[{"key": "test", "price_rub": 100, "days": 30}],
         MIN_PURCHASE_PRICE_RUB=10,
     )
 
-    assert "Math.max(10," in html
-    assert "Остаточная стоимость" in html
-    assert "вы доплачиваете разницу" in html
+    assert "t.payable_price_rub" in html
+    assert "Остаток действующей подписки учтён" in html
+    assert "upgradeResidual" not in html
     assert "{{MIN_PURCHASE_PRICE_RUB}}" not in html
 
 
-from webstore.models import Base, WebBalanceAccount, WebOrder, WebProfileLink, WebTelegramItem
+from webstore.models import Base, WebBalanceAccount, WebBalanceTopUp, WebBalanceTransaction, WebOrder, WebProfileLink, WebTelegramItem
 
 pytestmark = pytest.mark.asyncio
 
 
 class _Request(SimpleNamespace):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if not hasattr(self, "headers") or self.headers is None:
+            self.headers = {}
+        if not hasattr(self, "cookies") or self.cookies is None:
+            self.cookies = {}
+        if not hasattr(self, "remote"):
+            self.remote = "127.0.0.1"
+
     async def json(self):
         return self._json_body
 
@@ -48,6 +58,21 @@ class _FakeYooKassaPaymentApi:
         return SimpleNamespace(
             id="yk_web_1",
             confirmation=SimpleNamespace(confirmation_url="https://pay.test/redirect"),
+        )
+
+    @classmethod
+    def find_one(cls, payment_id):
+        params = cls.last_params or {}
+        amount = params.get("amount", {"value": "0.00", "currency": "RUB"})
+        return SimpleNamespace(
+            id=payment_id,
+            status="succeeded",
+            paid=True,
+            amount=SimpleNamespace(
+                value=amount.get("value", "0.00"),
+                currency=amount.get("currency", "RUB"),
+            ),
+            metadata=params.get("metadata", {}),
         )
 
 
@@ -76,6 +101,7 @@ async def db_session_factory(db_engine):
 async def patched_webstore(monkeypatch, db_session_factory):
     monkeypatch.setattr(webstore_routes, "async_session", db_session_factory)
     monkeypatch.setattr(webstore_routes.settings, "subscription_base_url", "https://loonapie.xyz")
+    monkeypatch.setattr(webstore_routes.settings, "public_webstore_base_url", "https://loonapie.xyz")
     monkeypatch.setattr(webstore_routes.settings, "bot_url", "https://t.me/uskoritelinternetabot")
     monkeypatch.setattr(webstore_routes.settings, "site_name", "Ускоритель интернета")
     monkeypatch.setattr(webstore_routes.settings, "bridge_shared_secret", "bridge-secret")
@@ -204,9 +230,11 @@ async def test_telegram_auth_claim_and_internal_profile_flow(monkeypatch, patche
     login_response = await webstore_routes.handle_profile_page(
         _Request(_json_body={}, cookies={}, headers={}, query={"login": code}, remote="127.0.0.1")
     )
-    assert login_response.status == 302
-    assert login_response.headers["Location"] == "/profile"
-    assert login_response.cookies["webstore_profile_token"].value == profile_token
+    assert login_response.status == 200
+    assert webstore_routes._AUTH_COOKIE not in login_response.cookies
+    cookie = done_response.cookies[webstore_routes._AUTH_COOKIE].value
+    me = await webstore_routes.handle_auth_me(_Request(cookies={webstore_routes._AUTH_COOKIE: cookie}))
+    assert json.loads(me.text)["profile_token"] == profile_token
 
     sync_request = _Request(
         _json_body={
@@ -283,6 +311,20 @@ async def test_yookassa_webhook_marks_order_delivered(monkeypatch, patched_webst
     monkeypatch.setattr(webstore_routes, "_fulfill_order", _fulfill)
     monkeypatch.setattr(webstore_routes, "_apply_order_bonus_spend", apply_bonus)
     monkeypatch.setattr(webstore_routes, "_sync_referral_credit_for_order", sync_referral)
+    monkeypatch.setattr(
+        webstore_routes,
+        "fetch_yookassa_payment",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                payment_id="yk_paid_1",
+                status="succeeded",
+                paid=True,
+                amount_rub=Decimal("95.00"),
+                currency="RUB",
+                metadata={"source": "webstore", "order_id": "ord-success"},
+            )
+        ),
+    )
 
     request = _Request(
         _json_body={
@@ -310,6 +352,129 @@ async def test_yookassa_webhook_marks_order_delivered(monkeypatch, patched_webst
     assert notify_admins.await_count == 2
     apply_bonus.assert_awaited_once()
     sync_referral.assert_awaited_once_with("ord-success")
+
+
+async def test_yookassa_webhook_rejects_unverified_callback(monkeypatch, patched_webstore):
+    async with patched_webstore() as session:
+        session.add(
+            WebOrder(
+                order_id="ord-forged",
+                contact="user@example.com",
+                tariff_key="vpn_30",
+                tariff_label="Лайт (1 месяц)",
+                days=30,
+                amount_rub=95,
+                original_amount_rub=95,
+                bonus_applied_rub=0,
+                status="pending",
+                profile_token="profile-forged",
+                yookassa_payment_id="yk_forged_1",
+            )
+        )
+        await session.commit()
+
+    fulfill = AsyncMock()
+    monkeypatch.setattr(webstore_routes, "attempt_fulfill_order", fulfill)
+    monkeypatch.setattr(
+        webstore_routes,
+        "fetch_yookassa_payment",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                payment_id="yk_forged_1",
+                status="succeeded",
+                paid=True,
+                amount_rub=Decimal("1.00"),
+                currency="RUB",
+                metadata={"source": "webstore", "order_id": "ord-forged"},
+            )
+        ),
+    )
+
+    response = await webstore_routes.handle_yookassa_webhook(
+        _Request(
+            _json_body={
+                "event": "payment.succeeded",
+                "object": {
+                    "id": "yk_forged_1",
+                    "metadata": {"source": "webstore", "order_id": "ord-forged"},
+                },
+            },
+            cookies={},
+            headers={},
+            remote="127.0.0.1",
+        )
+    )
+
+    assert response.status == 200
+    fulfill.assert_not_awaited()
+    async with patched_webstore() as session:
+        order = await session.scalar(
+            select(WebOrder).where(WebOrder.order_id == "ord-forged")
+        )
+        assert order.status == "pending"
+        assert order.paid_at is None
+
+
+async def test_yookassa_topup_webhook_credits_only_verified_payment(monkeypatch, patched_webstore):
+    async with patched_webstore() as session:
+        session.add(WebBalanceAccount(
+            profile_token="topup-profile",
+            contact="user@example.com",
+            ref_code="topup-ref",
+            balance_rub=0,
+        ))
+        session.add(WebBalanceTopUp(
+            topup_id="topup-verified",
+            profile_token="topup-profile",
+            telegram_id=0,
+            amount_rub=100,
+            status="pending",
+            yookassa_payment_id="yk_topup_1",
+        ))
+        await session.commit()
+
+    monkeypatch.setattr(
+        webstore_routes,
+        "fetch_yookassa_payment",
+        AsyncMock(return_value=SimpleNamespace(
+            payment_id="yk_topup_1",
+            status="succeeded",
+            paid=True,
+            amount_rub=Decimal("100.00"),
+            currency="RUB",
+            metadata={"source": "webstore_balance_topup", "topup_id": "topup-verified"},
+        )),
+    )
+
+    response = await webstore_routes.handle_yookassa_webhook(_Request(
+        _json_body={
+            "event": "payment.succeeded",
+            "object": {
+                "id": "yk_topup_1",
+                "metadata": {"source": "webstore_balance_topup", "topup_id": "topup-verified"},
+            },
+        },
+        cookies={},
+        headers={},
+        remote="127.0.0.1",
+    ))
+
+    assert response.status == 200
+    async with patched_webstore() as session:
+        account = await session.get(WebBalanceAccount, "topup-profile")
+        topup = await session.scalar(
+            select(WebBalanceTopUp).where(WebBalanceTopUp.topup_id == "topup-verified")
+        )
+        tx = await session.scalar(
+            select(WebBalanceTransaction).where(
+                WebBalanceTransaction.source_id == "topup-verified"
+            )
+        )
+        assert account.balance_rub == 100
+        assert topup.status == "completed"
+        assert tx is not None
+        assert tx.amount_rub == 100
+
 
 async def test_device_slot_order_reuses_existing_web_subscription_key(monkeypatch, patched_webstore):
     class FailingMarzbanClient:
@@ -474,6 +639,58 @@ async def test_web_adapt_upgrade_reuses_uuid_and_does_not_renew(monkeypatch, pat
         assert upgrade.marzban_username == primary.marzban_username
         api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, "new-plan-uuid")
         api.renew_subscription.assert_not_awaited()
+
+
+async def test_web_adapt_upgrade_not_enough_days_fails_closed(
+    monkeypatch, patched_webstore
+):
+    adapt_uuid = "770fa622-a4bd-63f6-c938-668877662228"
+    expires_at = datetime.utcnow() + timedelta(minutes=10)
+    async with patched_webstore() as session:
+        primary = WebOrder(
+            order_id="adapt-almost-expired", contact="user@example.com", tariff_key="basic-old",
+            tariff_label="14 дней", days=14, amount_rub=90,
+            status="delivered", profile_token="adapt-profile-near-expire",
+            marzban_username=f"adapt_{adapt_uuid}",
+            subscription_url=f"https://darimiru.ru/vpnbot/adapt-sub/{adapt_uuid}",
+            access_expires_at=expires_at,
+            created_at=datetime.utcnow() - timedelta(days=13),
+            delivered_at=datetime.utcnow() - timedelta(days=13),
+        )
+        upgrade = WebOrder(
+            order_id="adapt-upgrade-near-expire", contact="user@example.com", tariff_key="monthly-new",
+            tariff_label="30 дней", days=30, amount_rub=155,
+            status="paid", profile_token="adapt-profile-near-expire",
+            purchase_action="upgrade",
+            target_order_id="adapt-almost-expired",
+        )
+        session.add_all([primary, upgrade])
+        await session.flush()
+
+        api = AsyncMock()
+        from bot.services.adapt_api import AdaptAPIError
+        api.upgrade_subscription = AsyncMock(
+            side_effect=AdaptAPIError("Not enough days remaining to upgrade", status=400)
+        )
+        api.renew_subscription_custom = AsyncMock(return_value={"success": True})
+        api.get_status = AsyncMock(side_effect=[
+            {"plan_uuid": "old-plan-uuid", "end_date": expires_at.isoformat(), "devices": 3},
+        ])
+        api.list_plans = AsyncMock(return_value=[{"uuid": "new-plan-uuid", "devices": 3}])
+        api.renew_subscription = AsyncMock()
+        admin_notify_mock = AsyncMock()
+        monkeypatch.setattr(webstore_routes, "_notify_admins_webstore", admin_notify_mock)
+        monkeypatch.setattr(webstore_routes, "AdaptAPI", lambda: api)
+
+        await webstore_routes._fulfill_adapt_order(session, upgrade, "new-plan-uuid")
+
+        assert upgrade.status == "failed"
+        assert upgrade.failure_code == "adapt_upgrade_reactivation_required"
+        assert upgrade.adapt_mutation_state == webstore_routes._ADAPT_MUTATION_FAILED_CLOSED
+        assert upgrade.next_fulfillment_retry_at is None
+        assert api.upgrade_subscription.await_count == 1
+        api.renew_subscription_custom.assert_not_awaited()
+        admin_notify_mock.assert_awaited_once()
 
 
 async def test_web_expired_adapt_upgrade_reactivates_then_changes_to_cheaper_plan(
@@ -666,51 +883,26 @@ async def test_web_adapt_upgrade_is_not_delivered_when_provider_keeps_old_plan(m
         api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, new_plan_uuid)
 
 
-async def test_web_profile_enriches_legacy_telegram_adapt_item(monkeypatch):
-    adapt_uuid = "770fa622-a4bd-63f6-c938-668877662224"
-    plan_uuid = "661f9511-f3ac-52e5-b827-557766552223"
-    expires_at = datetime.utcnow() + timedelta(days=20)
-    item = WebTelegramItem(
-        profile_token="legacy-profile",
-        telegram_id=123456,
-        item_type="vpn",
-        external_id="sub_9",
-        title="VPN",
-        key_value=f"https://test/adapt-sub/{adapt_uuid}",
-        status="active",
-    )
-    api = AsyncMock()
-    api.enabled = True
-    api.get_status = AsyncMock(return_value={
-        "plan_uuid": plan_uuid,
-        "devices": 5,
-        "end_date": expires_at.isoformat(),
-    })
-    monkeypatch.setattr(webstore_routes, "AdaptAPI", lambda: api)
-    session = AsyncMock()
-
-    await webstore_routes._enrich_legacy_telegram_adapt_items(session, [item])
-
-    assert item.provider == "adapt"
-    assert item.adapt_plan_uuid == plan_uuid
-    assert item.device_slots == 5
-    session.flush.assert_awaited_once()
 
 
-async def test_web_profile_marks_expired_subscription_upgradeable_to_cheaper_tariff(monkeypatch):
+async def test_web_profile_marks_expired_subscription_upgradeable_to_lower_cost_tariff(monkeypatch):
     annual = {
         "key": "annual", "adapt_plan_uuid": "annual-plan",
-        "price_rub": 995, "days": 365,
+        "price_rub": 995, "days": 365, "adapt_cost_price_usd": 12.0,  # ~0.0328/day
     }
     monthly = {
         "key": "monthly", "adapt_plan_uuid": "monthly-plan",
-        "price_rub": 155, "days": 30,
+        "price_rub": 155, "days": 30, "adapt_cost_price_usd": 2.0,
+    }
+    lower_cost = {
+        "key": "super_cheap", "adapt_plan_uuid": "cheap-plan",
+        "price_rub": 50, "days": 30, "adapt_cost_price_usd": 0.5,
     }
     monkeypatch.setattr(webstore_routes, "get_store_tariffs", lambda: [annual, monthly])
     monkeypatch.setattr(
         webstore_routes,
         "get_store_tariffs_by_key",
-        lambda: {"annual": annual, "monthly": monthly},
+        lambda: {"annual": annual, "monthly": monthly, "super_cheap": lower_cost},
     )
     order = WebOrder(
         order_id="expired-profile-order",
@@ -725,8 +917,66 @@ async def test_web_profile_marks_expired_subscription_upgradeable_to_cheaper_tar
     )
 
     payload = webstore_routes._serialize_orders([order])[0]
-
     assert payload["can_upgrade"] is True
+
+    # The lower-cost plan still has a positive provider upgrade quote.
+    monkeypatch.setattr(webstore_routes, "get_store_tariffs", lambda: [annual, lower_cost])
+    payload2 = webstore_routes._serialize_orders([order])[0]
+    assert payload2["can_upgrade"] is True
+
+
+async def test_web_upgrade_option_uses_actual_remaining_term(monkeypatch):
+    current = {
+        "key": "current",
+        "adapt_plan_uuid": "current-plan",
+        "price_rub": 100,
+        "days": 10,
+        "adapt_cost_price_usd": 1.0,
+    }
+    target = {
+        "key": "target",
+        "adapt_plan_uuid": "target-plan",
+        "price_rub": 50,
+        "days": 2,
+        "adapt_cost_price_usd": 0.35,
+    }
+    monkeypatch.setattr(webstore_routes, "get_store_tariffs", lambda: [current, target])
+    monkeypatch.setattr(
+        webstore_routes,
+        "get_store_tariffs_by_key",
+        lambda: {"current": current, "target": target},
+    )
+    monkeypatch.setattr(webstore_routes, "get_adapt_plan_metadata_by_key", lambda key: None)
+
+    active_order = WebOrder(
+        order_id="active-term-order",
+        tariff_key="current",
+        tariff_label="Текущий",
+        days=10,
+        amount_rub=100,
+        status="delivered",
+        subscription_url="https://test/adapt-sub/active-term",
+        marzban_username="adapt_active-term",
+        access_expires_at=datetime.utcnow() + timedelta(days=5),
+    )
+    expired_order = WebOrder(
+        order_id="expired-term-order",
+        tariff_key="current",
+        tariff_label="Текущий",
+        days=10,
+        amount_rub=100,
+        status="delivered",
+        subscription_url="https://test/adapt-sub/expired-term",
+        marzban_username="adapt_expired-term",
+        access_expires_at=datetime.utcnow() - timedelta(days=1),
+    )
+
+    active_payload, expired_payload = webstore_routes._serialize_orders(
+        [active_order, expired_order]
+    )
+
+    assert active_payload["can_upgrade"] is False
+    assert expired_payload["can_upgrade"] is True
 
 
 async def test_admin_client_search_finds_telegram_username_and_subscription_key(patched_webstore):
@@ -870,3 +1120,198 @@ async def test_admin_retry_keeps_delivered_access_when_notification_fails(monkey
         stored = await session.scalar(select(WebOrder).where(WebOrder.order_id == "admin-notify-failure"))
         assert stored.status == "delivered"
         assert stored.subscription_url == "https://example.test/sub/client"
+
+
+@pytest.mark.asyncio
+async def test_quick_renew_create_order_without_auth(monkeypatch, patched_webstore):
+    monkeypatch.setitem(sys.modules, "yookassa", _FakeYooKassa())
+    monkeypatch.setattr(webstore_routes.settings, "yookassa_shop_id", "test-shop")
+    monkeypatch.setattr(webstore_routes.settings, "yookassa_secret_key", "test-secret")
+    monkeypatch.setattr(
+        webstore_routes, "get_store_tariffs",
+        lambda: [
+            {"key": "1m", "label": "1 месяц", "adapt_plan_uuid": "plan-1m", "price_rub": 300, "days": 30, "devices": 1, "adapt_cost_price_usd": 1.0, "is_active": True},
+            {"key": "3m", "label": "3 месяца", "adapt_plan_uuid": "plan-3m", "price_rub": 800, "days": 90, "devices": 1, "adapt_cost_price_usd": 4.0, "is_active": True},
+        ],
+    )
+    monkeypatch.setattr(
+        webstore_routes, "get_store_tariffs_by_key",
+        lambda: {
+            "1m": {"key": "1m", "label": "1 месяц", "adapt_plan_uuid": "plan-1m", "price_rub": 300, "days": 30, "devices": 1, "adapt_cost_price_usd": 1.0, "is_active": True},
+            "3m": {"key": "3m", "label": "3 месяца", "adapt_plan_uuid": "plan-3m", "price_rub": 800, "days": 90, "devices": 1, "adapt_cost_price_usd": 4.0, "is_active": True},
+        },
+    )
+
+    class MockAdaptAPI:
+        async def get_status(self, adapt_uuid):
+            return {
+                "uuid": adapt_uuid,
+                "plan_uuid": "plan-1m",
+                "is_active": True,
+                "end_date": (datetime.utcnow() + timedelta(days=5)).isoformat(),
+            }
+
+    monkeypatch.setattr(webstore_routes, "AdaptAPI", MockAdaptAPI)
+
+    request = _Request(
+        _json_body={
+            "tariff_key": "1m",
+            "purchase_action": "renew",
+            "target_order_id": "uuid:05a19dc5-a84f-4568-9994-ad9d8fb61354",
+            "contact": "customer@example.com",
+        },
+    )
+    response = await webstore_routes.handle_create_order(request)
+    assert response.status == 200
+    payload = json.loads(response.text)
+    assert payload["redirect_url"] == "https://pay.test/redirect"
+
+    async with patched_webstore() as session:
+        created = await session.scalar(select(WebOrder).where(WebOrder.email == "customer@example.com"))
+        assert created is not None
+        assert created.target_order_id == "uuid:05a19dc5-a84f-4568-9994-ad9d8fb61354"
+        assert created.purchase_action == "renew"
+
+
+async def test_demo_upgrade_order_allows_missing_wholesale_metadata(
+    monkeypatch, patched_webstore
+):
+    monkeypatch.setitem(sys.modules, "yookassa", _FakeYooKassa())
+    monkeypatch.setattr(webstore_routes.settings, "yookassa_shop_id", "test-shop")
+    monkeypatch.setattr(webstore_routes.settings, "yookassa_secret_key", "test-secret")
+    demo_uuid = "05a19dc5-a84f-4568-9994-ad9d8fb61354"
+    demo_plan_uuid = webstore_routes.settings.adapt_demo_plan_uuid
+    tariffs = [
+        {
+            "key": "demo",
+            "label": "Тестовый доступ",
+            "adapt_plan_uuid": demo_plan_uuid,
+            "adapt_cost_price_usd": None,
+            "price_rub": 45,
+            "days": 7,
+            "provider": "adapt",
+        },
+        {
+            "key": "paid",
+            "label": "Платный тариф",
+            "adapt_plan_uuid": "paid-plan-uuid",
+            "adapt_cost_price_usd": None,
+            "price_rub": 200,
+            "days": 30,
+            "provider": "adapt",
+        },
+    ]
+    monkeypatch.setattr(webstore_routes, "get_store_tariffs", lambda: tariffs)
+    monkeypatch.setattr(
+        webstore_routes,
+        "get_store_tariffs_by_key",
+        lambda: {tariff["key"]: tariff for tariff in tariffs},
+    )
+
+    async with patched_webstore() as session:
+        session.add(
+            WebOrder(
+                order_id="demo-order",
+                contact="customer@example.com",
+                tariff_key="demo",
+                tariff_label="Тестовый доступ",
+                days=7,
+                amount_rub=45,
+                status="demo",
+                profile_token="demo-profile",
+                marzban_username=f"adapt_{demo_uuid}",
+                subscription_url=f"https://test/adapt-sub/{demo_uuid}",
+                access_expires_at=datetime.utcnow() + timedelta(days=5),
+                target_snapshot_plan_uuid=demo_plan_uuid,
+            )
+        )
+        await session.commit()
+
+    request = _Request(
+        _json_body={
+            "tariff_key": "paid",
+            "purchase_action": "upgrade",
+            "target_order_id": "order:demo-order",
+            "contact": "customer@example.com",
+        },
+        cookies={"webstore_profile_token": "demo-profile"},
+        headers={"X-Real-IP": "127.0.0.1"},
+        remote="127.0.0.1",
+    )
+    response = await webstore_routes.handle_create_order(request)
+
+    assert response.status == 200
+    payload = json.loads(response.text)
+    assert payload["redirect_url"] == "https://pay.test/redirect"
+
+    async with patched_webstore() as session:
+        created = await session.scalar(
+            select(WebOrder).where(WebOrder.order_id == payload["order_id"])
+        )
+        assert created is not None
+        assert created.purchase_action == "upgrade"
+        assert created.amount_rub == 200
+        assert created.target_order_id == f"uuid:{demo_uuid}"
+        assert created.target_snapshot_plan_uuid == demo_plan_uuid
+
+
+async def test_apply_order_cashback_credits_buyer_balance(monkeypatch, patched_webstore):
+    async with patched_webstore() as session:
+        account = WebBalanceAccount(profile_token="cb_token", ref_code="ref_cb_1", balance_rub=0)
+        session.add(account)
+        order = WebOrder(
+            order_id="cb_order_1",
+            contact="user@test.com",
+            tariff_key="basic",
+            tariff_label="Базовый",
+            days=30,
+            amount_rub=155,
+            status="delivered",
+            profile_token="cb_token",
+        )
+        session.add(order)
+        await session.commit()
+
+        cashback = await webstore_routes._apply_order_cashback(session, order)
+        assert cashback == 16  # 10% of 155 = 15.5 -> 16
+        await session.commit()
+
+        await session.refresh(account)
+        assert account.balance_rub == 16
+
+        tx = await session.scalar(
+            select(WebBalanceTransaction).where(
+                WebBalanceTransaction.profile_token == "cb_token",
+                WebBalanceTransaction.kind == "cashback",
+            )
+        )
+        assert tx is not None
+        assert tx.amount_rub == 16
+        assert tx.source_id == "cb_order_1"
+        assert "Кешбэк 10%" in tx.description
+
+
+async def test_apply_order_cashback_skips_when_no_real_money_paid(monkeypatch, patched_webstore):
+    async with patched_webstore() as session:
+        account = WebBalanceAccount(profile_token="cb_token2", ref_code="ref_cb_2", balance_rub=100)
+        session.add(account)
+        order = WebOrder(
+            order_id="cb_order_2",
+            contact="user2@test.com",
+            tariff_key="basic",
+            tariff_label="Базовый",
+            days=30,
+            amount_rub=0,
+            status="delivered",
+            profile_token="cb_token2",
+        )
+        session.add(order)
+        await session.commit()
+
+        cashback = await webstore_routes._apply_order_cashback(session, order)
+        assert cashback == 0
+        await session.commit()
+
+        await session.refresh(account)
+        assert account.balance_rub == 100
+

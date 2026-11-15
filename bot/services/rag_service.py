@@ -20,7 +20,11 @@ except ImportError:
     UnstructuredWordDocumentLoader = None
 
 try:
+    os.environ["ANONYMIZED_TELEMETRY"] = "False"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
     import chromadb
+    from chromadb.config import Settings
     from chromadb.utils import embedding_functions
 except ImportError:
     chromadb = None
@@ -37,7 +41,7 @@ try:
     if chromadb is None or embedding_functions is None:
         raise RuntimeError("RAG dependencies are not installed")
 
-    chroma_client = chromadb.PersistentClient(path="./chroma_db")
+    chroma_client = chromadb.PersistentClient(path="./chroma_db", settings=Settings(anonymized_telemetry=False))
     # Using a fast, local embedding model from sentence-transformers
     sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="all-MiniLM-L6-v2"

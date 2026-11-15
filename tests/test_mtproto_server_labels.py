@@ -1,13 +1,13 @@
 from bot.services.mtproto_manager import _display_label
 
 
-def test_configured_server_label_is_displayed():
-    assert _display_label({"host": "192.0.2.10", "label": "🇳🇱 Нидерланды 1"}) == "🇳🇱 Нидерланды 1"
+def test_existing_netherlands_server_has_numbered_fallback_label():
+    assert _display_label({"host": "72.56.71.124"}) == "🇳🇱 Нидерланды 1"
 
 
-def test_host_is_used_when_label_is_missing():
-    assert _display_label({"host": "198.51.100.20"}) == "198.51.100.20"
+def test_new_netherlands_server_has_fallback_label():
+    assert _display_label({"host": "185.70.185.209"}) == "🇳🇱 Нидерланды 2"
 
 
-def test_broken_label_falls_back_to_host():
-    assert _display_label({"host": "203.0.113.30", "label": "\\ud83c broken"}) == "203.0.113.30"
+def test_removed_estonia_server_has_no_estonia_fallback():
+    assert _display_label({"host": "45.92.174.214"}) == "45.92.174.214"

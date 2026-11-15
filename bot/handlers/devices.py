@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+from datetime import datetime, timedelta
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, LabeledPrice
@@ -12,9 +13,10 @@ from sqlalchemy.orm import selectinload
 from bot.config import settings
 from bot.database import async_session
 from bot.keyboards.devices import buy_device_pay_kb, devices_kb, adapt_devices_kb, device_subscriptions_kb
-from bot.models import BotSettings, ProxyAccount, Subscription
+from bot.models import BotSettings, Payment, PaymentMethod, PaymentStatus, ProxyAccount, Subscription
 from bot.services import vpn_manager
 from bot.services.device_slots import get_included_device_slots, get_max_device_slots
+from bot.services.money import rub_to_kopecks
 from bot.services.payment_service import (
     create_yookassa_payment,
 )
@@ -124,11 +126,21 @@ async def show_my_devices(
                 return
             
             api = AdaptAPI()
-            devices_result, status_result = await asyncio.gather(
-                api.get_devices(adapt_uuid),
-                api.get_status(adapt_uuid),
-                return_exceptions=True,
-            )
+            try:
+                devices_result, status_result = await asyncio.wait_for(
+                    asyncio.gather(
+                        api.get_devices(adapt_uuid),
+                        api.get_status(adapt_uuid),
+                        return_exceptions=True,
+                    ),
+                    timeout=8.0,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning("Timed out loading Adapt devices for sub %s", subscription.id)
+                await callback.message.answer(
+                    "Время ожидания ответа от сервера истекло. Пожалуйста, попробуйте позже или напишите в поддержку."
+                )
+                return
             if isinstance(devices_result, Exception):
                 exc = devices_result
                 logger.error("Failed to get device list for sub %s: %s", subscription.id, exc)
@@ -299,11 +311,14 @@ async def delete_adapt_device(callback: CallbackQuery) -> None:
             return
 
     try:
-        success = await AdaptAPI().delete_device(adapt_uuid, device_id)
+        success = await asyncio.wait_for(AdaptAPI().delete_device(adapt_uuid, device_id), timeout=8.0)
         if success:
             await callback.message.answer("✅ Устройство успешно удалено!")
         else:
             await callback.message.answer("Не удалось удалить устройство. Попробуйте позже или напишите в поддержку.")
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning("Timed out deleting adapt device %s for sub %s", device_id, sub_id)
+        await callback.message.answer("Время ожидания ответа от сервера истекло. Попробуйте позже или напишите в поддержку.")
     except AdaptAPIError as exc:
         logger.error(f"Failed to delete adapt device {device_id} for sub {sub_id}: {exc}")
         await callback.message.answer("Не удалось удалить устройство. Попробуйте позже или напишите в поддержку.")
@@ -421,7 +436,7 @@ async def bot_send_stars_invoice(callback: CallbackQuery, title: str, descriptio
     )
 
 async def bot_send_telegram_invoice(callback: CallbackQuery, title: str, description: str, payload: str, price: int):
-    prices = [LabeledPrice(label=title, amount=price * 100)]
+    prices = [LabeledPrice(label=title, amount=rub_to_kopecks(price))]
     await callback.bot.send_invoice(
         chat_id=callback.message.chat.id,
         title=title,
@@ -432,14 +447,131 @@ async def bot_send_telegram_invoice(callback: CallbackQuery, title: str, descrip
         prices=prices,
     )
 
-async def bot_send_yookassa(callback: CallbackQuery, title: str, description: str, payload: str, price: int, user_id: int, sub_id: int):
+async def bot_send_yookassa(
+    callback: CallbackQuery,
+    title: str,
+    description: str,
+    payload: str,
+    price: int,
+    user_id: int,
+    sub_id: int,
+) -> None:
+    if not settings.yookassa_shop_id or not settings.yookassa_secret_key:
+        await callback.answer("Оплата через YooKassa временно недоступна", show_alert=True)
+        return
+
+    async with async_session() as session:
+        price_kopecks = rub_to_kopecks(price)
+        payment = await session.scalar(
+            select(Payment)
+            .where(
+                Payment.user_id == user_id,
+                Payment.subscription_id == sub_id,
+                Payment.currency == "RUB",
+                Payment.method == PaymentMethod.YOOKASSA,
+                Payment.status == PaymentStatus.PENDING,
+                Payment.platform == "device",
+            )
+            .order_by(Payment.id.desc())
+            .limit(1)
+        )
+        if not payment:
+            payment = Payment(
+                user_id=user_id,
+                subscription_id=sub_id,
+                amount=price_kopecks,
+                currency="RUB",
+                method=PaymentMethod.YOOKASSA,
+                status=PaymentStatus.PENDING,
+                telegram_chat_id=callback.message.chat.id,
+                platform="device",
+                purchase_kopecks=price_kopecks,
+                discount_kopecks=0,
+            )
+            session.add(payment)
+            await session.flush()
+        elif payment.created_at and datetime.utcnow() - payment.created_at >= timedelta(hours=24):
+            if payment.provider_status == "canceled" and payment.provider_paid is False:
+                payment.status = PaymentStatus.FAILED
+                payment.provisioning_failure_code = "payment_canceled_at_provider"
+                await session.flush()
+                payment = Payment(
+                    user_id=user_id,
+                    subscription_id=sub_id,
+                    amount=price_kopecks,
+                    currency="RUB",
+                    method=PaymentMethod.YOOKASSA,
+                    status=PaymentStatus.PENDING,
+                    telegram_chat_id=callback.message.chat.id,
+                    platform="device",
+                    purchase_kopecks=price_kopecks,
+                    discount_kopecks=0,
+                )
+                session.add(payment)
+                await session.flush()
+            else:
+                payment.provisioning_failure_code = "yookassa_create_ambiguous_manual_review"
+                await session.commit()
+                await callback.answer("Предыдущая попытка платежа требует проверки поддержки.", show_alert=True)
+                return
+        elif not payment.provider_idempotence_key:
+            payment.provisioning_failure_code = "yookassa_create_ambiguous_manual_review"
+            await session.commit()
+            await callback.answer("Предыдущая попытка платежа требует проверки поддержки.", show_alert=True)
+            return
+        elif payment.provider_status == "succeeded" and payment.provider_paid is True:
+            await callback.answer("Этот платёж уже принят и ожидает завершения выдачи.", show_alert=True)
+            return
+        else:
+            price_kopecks = payment.amount
+        payment.provider_idempotence_key = payment.provider_idempotence_key or f"bot-payment-{payment.id}"
+        payment_db_id = payment.id
+        operation_idempotence_key = payment.provider_idempotence_key
+        await session.commit()
+
+    return_url = settings.base_webhook_url or "https://t.me/"
     metadata = {
         "is_device": "1",
-        "sub_id": sub_id,
-        "user_id": callback.from_user.id,
-        "chat_id": callback.message.chat.id,
+        "sub_id": str(sub_id),
+        "user_id": str(callback.from_user.id),
+        "chat_id": str(callback.message.chat.id),
+        "payment_id": str(payment_db_id),
     }
-    url, payment_id = await create_yookassa_payment(price, title, metadata)
+
+    try:
+        url, payment_id = await create_yookassa_payment(
+            user_id=callback.from_user.id,
+            tariff_id=0,
+            platform="device",
+            chat_id=callback.message.chat.id,
+            return_url=return_url,
+            tariff_label=title,
+            price_kopecks=price_kopecks,
+            local_payment_id=payment_db_id,
+            metadata=metadata,
+            description=description,
+            idempotence_key=operation_idempotence_key,
+        )
+    except Exception as exc:
+        logger.error(f"Failed to create YooKassa payment for device slot: {exc}")
+        async with async_session() as session:
+            payment_record = await session.get(Payment, payment_db_id)
+            if payment_record and not payment_record.provider_payment_id:
+                payment_record.provider_idempotence_key = payment_record.provider_idempotence_key or f"bot-payment-{payment_db_id}"
+                payment_record.provisioning_failure_code = "yookassa_create_ambiguous"
+                await session.commit()
+        await callback.message.answer("Не удалось создать платёж. Попробуйте ещё раз или напишите в поддержку.")
+        return
+
+    if payment_id:
+        async with async_session() as session:
+            payment_record = await session.get(Payment, payment_db_id)
+            if payment_record:
+                payment_record.provider_payment_id = payment_id
+                payment_record.provider_idempotence_key = f"bot-payment-{payment_db_id}"
+                payment_record.provisioning_failure_code = None
+                await session.commit()
+
     if url:
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Оплатить", url=url)]])

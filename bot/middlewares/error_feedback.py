@@ -29,6 +29,32 @@ def _is_message_not_modified_error(exc: Exception) -> bool:
     return "message is not modified" in str(exc).lower()
 
 
+def _is_network_transport_error(exc: Exception) -> bool:
+    """Detect transient Telegram network transport errors (connection reset, timeouts, drops)."""
+    from aiogram.exceptions import (
+        TelegramForbiddenError,
+        TelegramNetworkError,
+        TelegramRetryAfter,
+        TelegramServerError,
+    )
+    if isinstance(exc, (TelegramNetworkError, TelegramServerError, TelegramRetryAfter, TelegramForbiddenError)):
+        return True
+    text = str(exc).lower()
+    network_keywords = (
+        "connection reset by peer",
+        "clientoserror",
+        "serverdisconnectederror",
+        "clientconnectorerror",
+        "timeout",
+        "cannot connect to host",
+        "event loop is closed",
+        "bot was blocked by the user",
+        "user is deactivated",
+        "chat not found",
+    )
+    return any(kw in text for kw in network_keywords)
+
+
 class ErrorFeedbackMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -52,6 +78,14 @@ class ErrorFeedbackMiddleware(BaseMiddleware):
                     await callback.answer()
                 except Exception:
                     pass
+                return None
+            if _is_network_transport_error(exc):
+                logger.warning("Transient network/Telegram transport error during update: %s", exc)
+                if callback is not None:
+                    try:
+                        await callback.answer()
+                    except Exception:
+                        pass
                 return None
             logger.exception("Unhandled Telegram update error")
             message = getattr(event, "message", None)

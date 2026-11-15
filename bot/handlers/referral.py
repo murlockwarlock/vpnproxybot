@@ -187,7 +187,11 @@ async def show_referral_info(callback: CallbackQuery) -> None:
 
     web_link = None
     if settings.webstore_public_enabled:
-        web_link = f"{settings.webstore_api_base_url.rstrip('/')}/buy?ref={callback.from_user.id}"
+        ref_base = (
+            getattr(settings, "public_webstore_base_url", None)
+            or "https://darimiru.xyz"
+        ).strip().rstrip("/")
+        web_link = f"{ref_base}/buy?ref={callback.from_user.id}"
 
     back_cb = "back_main" if callback.data == "ref_link_main" else "profile"
     text = (

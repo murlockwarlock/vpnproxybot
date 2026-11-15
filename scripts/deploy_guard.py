@@ -8,9 +8,24 @@ ignored by git.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+
+CANDIDATE_SAFETY_CONTRACT = {
+    "bot/database.py": ("uq_active_vhq_renewal_per_sub_v2",),
+    "scripts/darimiru_deploy_safety.py": (
+        "uq_active_vhq_renewal_per_sub_v2",
+        "require_indexes",
+    ),
+    "scripts/darimiru_deploy_runner.py": (
+        "ready_for_approval",
+        "require_indexes=True",
+        "automatic_database_restore_allowed",
+    ),
+}
 
 
 def load_local_env(root: str | os.PathLike[str]) -> None:
@@ -65,4 +80,21 @@ def ensure_clean_git(root: str | os.PathLike[str]) -> str:
         sys.exit(2)
     if status:
         print("WARNING: ALLOW_DIRTY_DEPLOY=1 set; deploying uncommitted changes.", file=sys.stderr)
+    return revision
+
+
+def ensure_candidate_safety_contract(root: str | os.PathLike[str], revision: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        print("ERROR: candidate revision must be a full commit SHA.", file=sys.stderr)
+        sys.exit(2)
+
+    for path, markers in CANDIDATE_SAFETY_CONTRACT.items():
+        result = _git(root, "show", f"{revision}:{path}", check=False)
+        if result.returncode != 0:
+            print(f"ERROR: candidate is missing required safety file: {path}.", file=sys.stderr)
+            sys.exit(2)
+        missing = [marker for marker in markers if marker not in result.stdout]
+        if missing:
+            print(f"ERROR: candidate failed safety contract in {path}.", file=sys.stderr)
+            sys.exit(2)
     return revision

@@ -3,22 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import hashlib
 import hmac
 import ipaddress
 import logging
 from datetime import datetime, timedelta
+from html import escape
+from typing import Any
 
 import aiohttp
 from aiohttp import web
+from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 
 from bot.config import settings
 from bot.database import async_session
 from bot.keyboards.client import back_to_menu_kb
 from bot.models import (
+    AdaptSubscription,
     BalanceTransactionKind,
     BalanceTopUp,
     BalanceTransaction,
@@ -43,13 +48,14 @@ from bot.models import (
     WebReferralEarning,
 )
 from bot.services import vpn_manager
-from bot.services.adapt_routing import is_adapt_subscription
+from bot.services.adapt_routing import build_adapt_client_name, is_adapt_subscription
 from bot.services.adapt_subscription_proxy import fetch_adapt_mirror_payload
 from bot.services.client_names import build_client_name
 from bot.services.cluster import LeaseManager
 from bot.services.device_slots import get_included_device_slots, get_max_device_slots
-from bot.services.balance_service import credit_user_balance, debit_user_balance, get_daily_charge_rub, get_user_balance
+from bot.services.balance_service import async_credit_user_balance, credit_user_balance, debit_user_balance, get_daily_charge_rub, get_user_balance
 from bot.services.balance_mode_service import disable_balance_mode, enable_balance_mode
+from bot.services.money import kopecks_to_rub_float, rub_to_kopecks
 from bot.services.notifications import notify_admins_issue, notify_admins_payment, notify_expiring
 from bot.services.payment_logger import plog
 from bot.services.payment_service import credit_referral, log_referral_payment
@@ -134,13 +140,39 @@ async def _notify_unexpected_payment_failure(
     exc: Exception,
 ) -> None:
     """Ensure both the customer and every staff role hear about a webhook failure."""
-    support = f" {settings.support_username}" if settings.support_username else ""
-    await notify_expiring(
-        bot,
-        chat_id,
-        "⚠️ Оплата получена, но выдача доступа задержалась. "
-        f"Мы повторим автоматически. Если доступ нужен срочно, напишите в поддержку{support}.",
-    )
+    if provider == "YooKassa":
+        from bot.services.yookassa_reconciliation import queue_customer_payment_ack_for_provider
+
+        queued = await queue_customer_payment_ack_for_provider(
+            bot,
+            provider_payment_id=payment_ref,
+            recipient_telegram_id=chat_id,
+        )
+        if not queued:
+            # There is no local payment row to attach an outbox record to yet.
+            # Keep the fallback customer-safe; the durable path is used whenever
+            # the verified payment has reached the local database.
+            try:
+                await notify_expiring(
+                    bot,
+                    chat_id,
+                    "✅ Оплата получена. Ваш VPN-доступ готовится. "
+                    "Мы автоматически отправим его сюда после активации",
+                )
+            except Exception as delivery_exc:
+                logger.warning(
+                    "Fallback YooKassa acknowledgement failed for %s: %s",
+                    payment_ref,
+                    delivery_exc,
+                )
+    else:
+        support = f" {settings.support_username}" if settings.support_username else ""
+        await notify_expiring(
+            bot,
+            chat_id,
+            "⚠️ Оплата получена, но выдача доступа задержалась. "
+            f"Мы повторим автоматически. Если доступ нужен срочно, напишите в поддержку{support}.",
+        )
     await notify_admins_issue(
         bot,
         title=f"Неожиданная ошибка выдачи после оплаты ({provider})",
@@ -288,6 +320,8 @@ async def _complete_balance_topup(
     provider: str,
     provider_payment_id: str,
 ) -> tuple[int | None, float]:
+    amount_kopecks = rub_to_kopecks(amount_rub)
+    amount_rub = kopecks_to_rub_float(amount_kopecks)
     async with async_session() as session:
         result = await session.execute(
             select(User).where(User.telegram_id == telegram_user_id)
@@ -307,7 +341,7 @@ async def _complete_balance_topup(
             payment = Payment(
                 user_id=user.id,
                 subscription_id=None,
-                amount=int(round(amount_rub * 100)),
+                amount=amount_kopecks,
                 currency="RUB",
                 method={
                     "telegram": PaymentMethod.TELEGRAM,
@@ -316,6 +350,8 @@ async def _complete_balance_topup(
                 }.get(provider, PaymentMethod.YOOKASSA),
                 status=PaymentStatus.COMPLETED,
                 provider_payment_id=provider_payment_id,
+                purchase_kopecks=amount_kopecks,
+                discount_kopecks=0,
             )
             session.add(payment)
         else:
@@ -330,13 +366,14 @@ async def _complete_balance_topup(
                 user_id=user.id,
                 telegram_id=telegram_user_id,
                 amount_rub=amount_rub,
+                amount_kopecks=amount_kopecks,
                 provider=provider,
                 status="completed",
                 provider_payment_id=provider_payment_id,
                 completed_at=datetime.utcnow(),
             )
             session.add(topup)
-            credit_user_balance(
+            await async_credit_user_balance(
                 session,
                 user,
                 amount_rub,
@@ -348,7 +385,7 @@ async def _complete_balance_topup(
         elif topup.status != "completed":
             topup.status = "completed"
             topup.completed_at = datetime.utcnow()
-            credit_user_balance(
+            await async_credit_user_balance(
                 session,
                 user,
                 amount_rub,
@@ -372,6 +409,8 @@ async def _ensure_paid_webhook_payment(
     platform: str,
 ) -> int:
     """Persist the paid operation before calling a non-idempotent VPN API."""
+    amount_kopecks = rub_to_kopecks(amount_rub)
+    amount_rub = kopecks_to_rub_float(amount_kopecks)
     async with async_session() as session:
         payment = await session.scalar(
             select(Payment).where(Payment.provider_payment_id == provider_payment_id)
@@ -380,19 +419,31 @@ async def _ensure_paid_webhook_payment(
             payment = Payment(
                 user_id=user_id,
                 subscription_id=None,
-                amount=int(round(amount_rub * 100)),
+                amount=amount_kopecks,
                 currency="RUB",
                 method=method,
-                status=PaymentStatus.COMPLETED,
+                status=PaymentStatus.PENDING,
                 provider_payment_id=provider_payment_id,
                 tariff_id=tariff_id,
                 platform=platform,
+                purchase_kopecks=amount_kopecks,
+                discount_kopecks=0,
+                provider_status="succeeded",
+                provider_paid=True,
+                provider_amount_kopecks=amount_kopecks,
+                provider_currency="RUB",
+                provider_verified_at=datetime.utcnow(),
             )
             session.add(payment)
         else:
-            payment.status = PaymentStatus.COMPLETED
+            payment.status = PaymentStatus.PENDING
             payment.tariff_id = tariff_id
             payment.platform = platform
+            payment.provider_status = "succeeded"
+            payment.provider_paid = True
+            payment.provider_amount_kopecks = amount_kopecks
+            payment.provider_currency = "RUB"
+            payment.provider_verified_at = datetime.utcnow()
         await session.commit()
         await session.refresh(payment)
         return payment.id
@@ -401,20 +452,125 @@ async def _ensure_paid_webhook_payment(
 # ── Shared key-delivery helper ────────────────────────
 
 
+async def send_subscription_delivery_messages(
+    bot: Bot,
+    chat_id: int,
+    telegram_user_id: int,
+    subscription_id: int,
+    delivery_platform: Any,
+    vpn_key_str: str | None,
+    proxy_link: str | None,
+    expires_str: str,
+    needs_platform_choice: bool,
+    payment_id: int | None = None,
+    resend_primary: bool = True,
+    resend_secondary: bool = True,
+    record_db_error: bool = True,
+) -> tuple[bool, str | None]:
+    """Deliver subscription access messages (VPN key, platform selector, MTProto link, WhatsApp bonus).
+
+    Returns (success, error_message).
+    """
+    delivery_err: str | None = None
+    key_delivered = False
+    if resend_primary and vpn_key_str and subscription_id:
+        try:
+            from bot.handlers.payment import _send_subscription_key_for_platform
+            delivered = await _send_subscription_key_for_platform(
+                bot=bot,
+                chat_id=chat_id,
+                telegram_id=telegram_user_id,
+                subscription_id=subscription_id,
+                platform=delivery_platform,
+            )
+            if not delivered:
+                delivery_err = "key_send_failed: handler returned false"
+                logger.error("Webhook could not deliver subscription ID=%s", subscription_id)
+            else:
+                key_delivered = True
+        except Exception as exc:
+            delivery_err = f"key_send_failed: {exc}"
+            logger.error(f"Failed to send key to chat {chat_id}: {exc}")
+
+    # The picker is only an auxiliary instruction. It must never replace the
+    # directly usable key, and a picker failure must not cause a key resend.
+    if key_delivered and needs_platform_choice:
+        try:
+            await bot.send_message(
+                chat_id,
+                SELECT_DEVICE_AFTER_PAYMENT,
+                parse_mode="HTML",
+                reply_markup=_delivery_platform_kb(subscription_id),
+            )
+        except Exception as exc:
+            logger.warning("Failed to send auxiliary platform picker to chat %s: %s", chat_id, exc)
+
+    if resend_secondary and proxy_link:
+        try:
+            await bot.send_message(
+                chat_id,
+                MTPROTO_KEY_DELIVERED.format(proxy_links=proxy_link, expires=expires_str),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:
+            if not delivery_err:
+                delivery_err = f"proxy_link_failed: {exc}"
+            logger.error(f"Failed to send MTProto link to chat {chat_id}: {exc}")
+
+    if resend_secondary:
+        try:
+            async with async_session() as wa_session:
+                wa_enabled_row = await wa_session.get(BotSettings, "whatsapp_proxy_enabled")
+                wa_host_row = await wa_session.get(BotSettings, "whatsapp_proxy_host")
+            if wa_enabled_row and wa_enabled_row.value == "1" and wa_host_row and wa_host_row.value:
+                from bot.utils.texts import WHATSAPP_PROXY_BONUS
+                await bot.send_message(
+                    chat_id,
+                    WHATSAPP_PROXY_BONUS.format(proxy_host=wa_host_row.value),
+                    parse_mode="HTML",
+                )
+        except Exception as exc:
+            logger.warning(f"Failed to send WhatsApp bonus to {chat_id}: {exc}")
+
+    if payment_id and record_db_error:
+        try:
+            async with async_session() as session:
+                p = await session.get(Payment, payment_id)
+                if p:
+                    cur_err = p.telegram_delivery_error or ""
+                    # Do not overwrite if delivery is in progress or in retry state
+                    if not cur_err.startswith("delivery_in_progress") and not cur_err.startswith("retry_failed"):
+                        if delivery_err:
+                            p.telegram_delivery_error = str(delivery_err)[:255]
+                        else:
+                            p.telegram_delivery_error = None
+                        await session.commit()
+        except Exception as p_exc:
+            logger.error("Failed to persist telegram_delivery_error for payment %s: %s", payment_id, p_exc)
+
+    return (delivery_err is None, delivery_err)
+
+
 async def _process_and_deliver(
-    app: web.Application,
+    app: web.Application | Bot | Any,
     telegram_user_id: int,
     chat_id: int,
     tariff_id: int,
     platform_str: str,
     provisioning_payment_id: int | None = None,
     paid_amount_rub: float | None = None,
+    notify_admin: bool = True,
+    deliver_customer_messages: bool = True,
 ) -> tuple[int | None, int | None]:
     """Create or renew the paid subscription and deliver its stable link.
 
     Returns (user_db_id, subscription_id) or (None, None) on failure.
     """
-    bot = app["bot"]
+    if hasattr(app, "__getitem__") and "bot" in app:
+        bot = app["bot"]
+    else:
+        bot = app
     platform = _platform_from_str(platform_str)
     logger.info(
         "Webhook delivery started: telegram_user_id=%s chat_id=%s tariff_id=%s platform=%s",
@@ -448,8 +604,18 @@ async def _process_and_deliver(
         is_both = tariff.tariff_type == TariffType.BOTH
 
         saved_platform = user.platform if _is_deferred_platform(platform_str) and user.platform and not is_tg_proxy_only else None
-        needs_platform_choice = _is_deferred_platform(platform_str) and not is_tg_proxy_only
-        delivery_platform = saved_platform or platform
+        _, plat_action, target_sub_id = decode_intent(platform_str)
+        needs_platform_choice = (
+            _is_deferred_platform(platform_str)
+            and plat_action not in {"renew", "upgrade"}
+            and not is_tg_proxy_only
+        )
+        if plat_action in {"renew", "upgrade"} and _is_deferred_platform(platform_str):
+            target_sub = await session.get(Subscription, target_sub_id) if target_sub_id else None
+            sub_plat = target_sub.platform if (target_sub and target_sub.platform) else None
+            delivery_platform = sub_plat or saved_platform or platform
+        else:
+            delivery_platform = saved_platform or platform
 
         if user.platform is None and not is_tg_proxy_only and not _is_deferred_platform(platform_str):
             user.platform = platform
@@ -475,6 +641,19 @@ async def _process_and_deliver(
                     **_purchase_access_kwargs(platform_str),
                 )
             except AccessProvisionError as issue:
+                if not deliver_customer_messages:
+                    raise
+                if issue.provider == "vhq" and issue.code == "supplier_fulfillment_pending":
+                    logger.info("VHQ renewal pending background completion for user=%s", telegram_user_id)
+                    try:
+                        await bot.send_message(
+                            chat_id,
+                            f"⏳ {issue.client_message}",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                    return user.id, None
                 plog(
                     "ОШИБКА_ВЫДАЧИ",
                     provider=issue.provider.upper(),
@@ -560,6 +739,12 @@ async def _process_and_deliver(
 
         subscription_id = subscription.id if subscription else None
         user_db_id = user.id
+        if provisioning_payment is not None and subscription_id is not None:
+            provisioning_payment.subscription_id = subscription_id
+            if provisioning_payment.method == PaymentMethod.YOOKASSA:
+                provisioning_payment.provisioning_failure_code = "financial_finalization_pending"
+            else:
+                provisioning_payment.provisioning_failure_code = None
         expires_str = subscription.expires_at.strftime("%d.%m.%Y") if subscription else "N/A"
         vpn_key_str = str(vpn_key) if vpn_key else None
         user_full_name = user.full_name or ""
@@ -567,10 +752,10 @@ async def _process_and_deliver(
         tariff_label = tariff.label
         tariff_price_rub = float(tariff.price_rub)
         actual_paid_amount_rub = (
-            float(paid_amount_rub)
+            kopecks_to_rub_float(rub_to_kopecks(paid_amount_rub))
             if paid_amount_rub is not None
             else (
-                float(provisioning_payment.amount) / 100.0
+                kopecks_to_rub_float(provisioning_payment.amount)
                 if provisioning_payment and provisioning_payment.currency == "RUB"
                 else tariff_price_rub
             )
@@ -587,71 +772,40 @@ async def _process_and_deliver(
             bool(proxy_link),
         )
 
-    # Deliver VPN key. New purchases choose the platform after payment.
-    if vpn_key_str and subscription_id and needs_platform_choice:
-        try:
-            await bot.send_message(
-                chat_id,
-                SELECT_DEVICE_AFTER_PAYMENT,
-                parse_mode="HTML",
-                reply_markup=_delivery_platform_kb(subscription_id),
+    if deliver_customer_messages:
+        delivery_ok, delivery_err = await send_subscription_delivery_messages(
+            bot=bot,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            subscription_id=subscription_id,
+            delivery_platform=delivery_platform,
+            vpn_key_str=vpn_key_str,
+            proxy_link=proxy_link,
+            expires_str=expires_str,
+            needs_platform_choice=needs_platform_choice,
+            payment_id=provisioning_payment_id,
+        )
+        if not delivery_ok:
+            logger.warning(
+                "Subscription %s provisioned but Telegram delivery failed to user %s: %s",
+                subscription_id,
+                telegram_user_id,
+                delivery_err,
             )
-        except Exception as exc:
-            logger.error(f"Failed to send platform picker to chat {chat_id}: {exc}")
-    elif vpn_key_str and subscription_id:
-        try:
-            from bot.handlers.payment import _send_subscription_key_for_platform
-            delivered = await _send_subscription_key_for_platform(
-                bot=bot,
-                chat_id=chat_id,
-                telegram_id=telegram_user_id,
-                subscription_id=subscription_id,
-                platform=delivery_platform,
-            )
-            if not delivered:
-                logger.error("Webhook could not deliver subscription ID=%s", subscription_id)
-        except Exception as exc:
-            logger.error(f"Failed to send key to chat {chat_id}: {exc}")
 
-    # Deliver MTProto proxy link
-    if proxy_link:
-        try:
-            await bot.send_message(
-                chat_id,
-                MTPROTO_KEY_DELIVERED.format(proxy_links=proxy_link, expires=expires_str),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        except Exception as exc:
-            logger.error(f"Failed to send MTProto link to chat {chat_id}: {exc}")
-
-    # WhatsApp proxy bonus
-    try:
-        async with async_session() as wa_session:
-            wa_enabled_row = await wa_session.get(BotSettings, "whatsapp_proxy_enabled")
-            wa_host_row = await wa_session.get(BotSettings, "whatsapp_proxy_host")
-        if wa_enabled_row and wa_enabled_row.value == "1" and wa_host_row and wa_host_row.value:
-            from bot.utils.texts import WHATSAPP_PROXY_BONUS
-            await bot.send_message(
-                chat_id,
-                WHATSAPP_PROXY_BONUS.format(proxy_host=wa_host_row.value),
-                parse_mode="HTML",
-            )
-    except Exception as exc:
-        logger.warning(f"Failed to send WhatsApp bonus to {chat_id}: {exc}")
-
-    from bot.services.notifications import notify_admins_payment
-    await notify_admins_payment(
-        bot,
-        telegram_id=telegram_user_id,
-        full_name=user_full_name,
-        username=user_username,
-        amount_rub=actual_paid_amount_rub,
-        tariff_label=tariff_label,
-        method="💳 YooKassa / Robokassa",
-        platform=delivery_platform_value if not is_tg_proxy_only else "telegram",
-        price_rub=tariff_price_rub,
-    )
+    if notify_admin:
+        from bot.services.notifications import notify_admins_payment
+        await notify_admins_payment(
+            bot,
+            telegram_id=telegram_user_id,
+            full_name=user_full_name,
+            username=user_username,
+            amount_rub=actual_paid_amount_rub,
+            tariff_label=tariff_label,
+            method="💳 YooKassa / Robokassa",
+            platform=delivery_platform_value if not is_tg_proxy_only else "telegram",
+            price_rub=tariff_price_rub,
+        )
 
     logger.info(
         f"Key delivered via webhook: telegram_id={telegram_user_id}, subscription_id={subscription_id}, "
@@ -661,23 +815,68 @@ async def _process_and_deliver(
 
 
 async def _process_device_deliver(
-    app: web.Application,
+    app: web.Application | Bot | Any,
     telegram_user_id: int,
     chat_id: int,
     sub_id: int,
+    payment_id: int | None = None,
+    provider_payment_id: str | None = None,
 ) -> tuple[int | None, int | None]:
     """Add an extra device slot to an existing subscription without creating a new key.
 
     Returns (user_db_id, subscription_id) or (None, None) on failure.
     """
-    bot = app["bot"]
+    if hasattr(app, "__getitem__") and "bot" in app:
+        bot = app["bot"]
+    else:
+        bot = app
 
     async with async_session() as session:
+        # Check idempotency via durable payment status
+        payment = None
+        if payment_id is not None:
+            payment = await session.get(Payment, payment_id)
+        elif provider_payment_id:
+            payment = await session.scalar(
+                select(Payment).where(Payment.provider_payment_id == provider_payment_id)
+            )
+
+        if not payment:
+            logger.error(
+                "Device delivery failed: durable Payment record missing (payment_id=%s, provider_id=%s)",
+                payment_id,
+                provider_payment_id,
+            )
+            return None, None
+
         sub = await session.get(Subscription, sub_id)
         owner = await session.get(User, sub.user_id) if sub else None
         if not sub or not owner or owner.telegram_id != telegram_user_id:
             logger.error(f"Subscription {sub_id} not found or user mismatch.")
             return None, None
+
+        if payment.user_id != owner.id:
+            logger.error(
+                "Device delivery failed: payment owner %s does not match subscription owner %s",
+                payment.user_id,
+                owner.id,
+            )
+            return None, None
+
+        if payment.subscription_id and payment.subscription_id != sub.id:
+            logger.error(
+                "Device delivery failed: payment target sub %s does not match requested sub %s",
+                payment.subscription_id,
+                sub.id,
+            )
+            return None, None
+
+        if payment.provider_payment_id is None and provider_payment_id:
+            payment.provider_payment_id = provider_payment_id
+
+        if payment.status == PaymentStatus.COMPLETED:
+            logger.info("Device slot already delivered for payment %s / %s", payment.id, provider_payment_id)
+            return sub.user_id, sub.id
 
         max_slots = await get_max_device_slots(session)
         if max_slots is not None and sub.device_slots >= max_slots:
@@ -704,22 +903,42 @@ async def _process_device_deliver(
         # accounting/UI state; Marzban keeps the same user/key.
         sub.device_slots += 1
         new_slot = sub.device_slots
-        vpn_key = sub.vpn_key
+
+        payment.status = PaymentStatus.COMPLETED
+        payment.subscription_id = sub.id
+        payment.telegram_chat_id = payment.telegram_chat_id or int(chat_id)
+
+        from bot.services.payment_notification_outbox import enqueue_subscription_delivery
+
+        delivery_platform = sub.platform.value if hasattr(sub.platform, "value") else str(sub.platform)
+        await enqueue_subscription_delivery(
+            session,
+            payment_id=payment.id,
+            recipient_telegram_id=int(chat_id),
+            telegram_user_id=int(telegram_user_id),
+            subscription_id=sub.id,
+            delivery_platform=delivery_platform,
+            needs_platform_choice=False,
+        )
 
         user_db_id = sub.user_id
         await session.commit()
 
-    try:
-        await bot.send_message(
-            chat_id,
-            "✅ <b>Слот успешно добавлен!</b>\n\n"
-            "Вы приобрели дополнительное устройство для вашей подписки.\n"
-            "Используйте тот же ключ на новом устройстве.\n\n"
-            f"📋 <b>Ваш ключ:</b>\n\n<code>{vpn_key}</code>",
-            parse_mode="HTML"
+    from bot.services.payment_notification_outbox import process_payment_notification_outbox
+
+    delivery_stats = await process_payment_notification_outbox(
+        bot,
+        payment_id=payment.id,
+        limit=10,
+        session_factory=async_session,
+    )
+    if delivery_stats.get("sent", 0) < 1:
+        logger.warning(
+            "Device key delivery remains in durable outbox for payment %s: %s",
+            payment.id,
+            delivery_stats,
         )
-    except Exception as exc:
-        logger.error(f"Failed to send device key to chat {chat_id}: {exc}")
+        return None, None
 
     logger.info(
         f"Device key delivered via webhook: telegram_id={telegram_user_id}, slot={new_slot}"
@@ -732,9 +951,6 @@ async def _process_device_deliver(
 
 async def handle_yookassa(request: web.Request) -> web.Response:
     """Handle YooKassa payment.succeeded notification."""
-    # Note: IP check is advisory only — behind Xray SNI + nginx proxy chain,
-    # the original sender IP is lost. Security ensured by metadata validation
-    # (user_id, chat_id, tariff_id) and YooKassa payment ID verification.
     remote_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote
     if not _is_yookassa_ip(remote_ip):
         logger.info("YooKassa webhook from non-standard IP %s (proxy chain expected)", remote_ip)
@@ -749,242 +965,45 @@ async def handle_yookassa(request: web.Request) -> web.Response:
         return web.Response(text="OK")
 
     obj = data.get("object", {})
-    metadata = obj.get("metadata", {})
+    yookassa_payment_id = obj.get("id")
+    if not yookassa_payment_id:
+        return web.Response(status=400, text="Missing payment id")
+
+    from bot.services.yookassa_reconciliation import verify_and_fulfill_yookassa_payment
 
     try:
-        telegram_user_id = int(metadata["user_id"])
-        chat_id = int(metadata["chat_id"])
-        amount_value = float(obj["amount"]["value"])
-        yookassa_payment_id = obj["id"]
-        purpose = metadata.get("purpose", "")
-        
-        is_device = metadata.get("is_device") == "1"
-        is_balance_topup = purpose == "balance_topup"
-        if is_balance_topup:
-            sub_id = None
-            tariff_id = None
-            platform_str = None
-        elif is_device:
-            sub_id = int(metadata["sub_id"])
-            tariff_id = None
-            platform_str = None
-        else:
-            tariff_id = int(metadata["tariff_id"])
-            platform_str = metadata["platform"]
-            sub_id = None
-            
-    except (KeyError, ValueError) as exc:
-        logger.error(f"Invalid Yookassa metadata: {exc}, data={data}")
-        return web.Response(text="OK")  # Return 200 to prevent retries
-
-    logger.info(
-        f"Yookassa payment.succeeded: user={telegram_user_id}, "
-        f"is_device={is_device}, amount={amount_value}, purpose={purpose or 'tariff'}"
-    )
-
-    lock_name = f"payment:yookassa:{yookassa_payment_id}"
-    acquired = await lease_manager.acquire_or_renew(
-        lock_name,
-        settings.webhook_lock_ttl_seconds,
-    )
-    if not acquired:
-        if await _wait_for_completed_payment(yookassa_payment_id, settings.webhook_lock_wait_seconds):
-            logger.info("Yookassa webhook already processed by another instance: %s", yookassa_payment_id)
-            return web.Response(text="OK")
-        return web.Response(status=409, text="Processing in progress")
-
-    try:
-        async with async_session() as session:
-            result = await session.execute(
-                select(Payment).where(
-                    Payment.provider_payment_id == yookassa_payment_id,
-                    Payment.status == PaymentStatus.COMPLETED,
-                )
-            )
-            if result.scalar_one_or_none():
-                logger.info(f"Duplicate Yookassa webhook: {yookassa_payment_id}")
-                return web.Response(text="OK")
-
-        if is_balance_topup:
-            user_db_id, new_balance = await _complete_balance_topup(
-                telegram_user_id=telegram_user_id,
-                amount_rub=amount_value,
-                provider="yookassa",
-                provider_payment_id=yookassa_payment_id,
-            )
-            subscription_id = None
-            if user_db_id is not None:
-                async with async_session() as session:
-                    user_rec = await session.get(User, user_db_id)
-                try:
-                    await request.app["bot"].send_message(
-                        chat_id,
-                        f"✅ <b>Баланс пополнен</b>\n\n"
-                        f"Зачислено: <b>{amount_value:.2f} ₽</b>\n"
-                        f"Сейчас на балансе: <b>{new_balance:.2f} ₽</b>",
-                        parse_mode="HTML",
-                        reply_markup=back_to_menu_kb(),
-                    )
-                except Exception:
-                    pass
-                if user_rec:
-                    await notify_admins_payment(
-                        request.app["bot"],
-                        telegram_id=telegram_user_id,
-                        full_name=user_rec.full_name or "",
-                        username=user_rec.username,
-                        amount_rub=amount_value,
-                        tariff_label="Пополнение баланса",
-                        method="💳 YooKassa",
-                        platform="Баланс",
-                    )
-        elif is_device and sub_id is not None:
-            user_db_id, subscription_id = await _process_device_deliver(
-                request.app,
-                telegram_user_id=telegram_user_id,
-                chat_id=chat_id,
-                sub_id=sub_id,
-            )
-        elif tariff_id is not None and platform_str is not None:
-            async with async_session() as session:
-                user_row = await session.scalar(
-                    select(User).where(User.telegram_id == telegram_user_id)
-                )
-            if not user_row:
-                logger.error("YooKassa paid user not found: telegram_id=%s", telegram_user_id)
-                return web.Response(status=503, text="User not found")
-            provisioning_payment_id = await _ensure_paid_webhook_payment(
-                user_id=user_row.id,
-                provider_payment_id=yookassa_payment_id,
-                amount_rub=amount_value,
-                method=PaymentMethod.YOOKASSA,
-                tariff_id=tariff_id,
-                platform=platform_str,
-            )
-            user_db_id, subscription_id = await _process_and_deliver(
-                request.app,
-                telegram_user_id=telegram_user_id,
-                chat_id=chat_id,
-                tariff_id=tariff_id,
-                platform_str=platform_str,
-                provisioning_payment_id=provisioning_payment_id,
-                paid_amount_rub=amount_value,
-            )
-        else:
-            user_db_id, subscription_id = None, None
-
-        if user_db_id is not None and subscription_id is not None and not is_balance_topup:
-            async with async_session() as session:
-                result = await session.execute(
-                    select(Payment).where(
-                        Payment.provider_payment_id == yookassa_payment_id
-                    )
-                )
-                payment = result.scalar_one_or_none()
-
-                if payment:
-                    payment.status = PaymentStatus.COMPLETED
-                    payment.subscription_id = subscription_id
-                    payment.tariff_id = tariff_id
-                    payment.platform = platform_str
-                    discount = payment.discount_applied
-                else:
-                    payment = Payment(
-                        user_id=user_db_id,
-                        subscription_id=subscription_id,
-                        amount=int(amount_value * 100),  # rubles → kopecks
-                        currency="RUB",
-                        method=PaymentMethod.YOOKASSA,
-                        status=PaymentStatus.COMPLETED,
-                        provider_payment_id=yookassa_payment_id,
-                        tariff_id=tariff_id,
-                        platform=platform_str,
-                    )
-                    session.add(payment)
-                    discount = 0.0
-
-                if discount > 0:
-                    user_rec = await session.get(User, user_db_id)
-                    if user_rec:
-                        actual_discount = min(discount, max(0.0, get_user_balance(user_rec)))
-                        if actual_discount > 0:
-                            debit_user_balance(
-                                session,
-                                user_rec,
-                                actual_discount,
-                                BalanceTransactionKind.TOPUP,
-                                "Списание с баланса при оплате тарифа",
-                                source_type="payment_discount",
-                                source_id=yookassa_payment_id,
-                            )
-
-                await session.flush()
-                plog("ОПЛАТА", provider="Yookassa", user_id=telegram_user_id,
-                     amount=f"{amount_value:.2f}", tariff_id=tariff_id or "",
-                     PayId=yookassa_payment_id)
-                await credit_referral(session, user_db_id, payment.id, amount_value)
-                await log_referral_payment(session, user_db_id, amount_value, bot=request.app["bot"])
-                from bot.services.payment_service import credit_partner
-                await credit_partner(session, user_db_id, payment.id, amount_value, bot=request.app["bot"])
-
-                # Save payment method for recurring charges
-                pm = obj.get("payment_method", {})
-                if settings.recurring_payments_enabled and pm.get("saved") and pm.get("id") and subscription_id and tariff_id:
-                    pm_id = pm["id"]
-                    card_info = pm.get("card", {})
-                    last4 = card_info.get("last4", "")
-                    card_type = card_info.get("card_type", pm.get("type", "card"))
-                    label = f"{card_type} *{last4}" if last4 else card_type
-
-                    existing_profile = await session.scalar(
-                        select(RecurringPaymentProfile).where(
-                            RecurringPaymentProfile.user_id == user_db_id,
-                        ).order_by(RecurringPaymentProfile.id.desc()).limit(1)
-                    )
-
-                    sub_for_date = await session.get(Subscription, subscription_id)
-                    next_charge = sub_for_date.expires_at if sub_for_date else None
-
-                    if existing_profile:
-                        existing_profile.provider_payment_method_id = pm_id
-                        existing_profile.payment_method_label = label
-                        existing_profile.subscription_id = subscription_id
-                        existing_profile.tariff_id = tariff_id
-                        existing_profile.is_active = True
-                        existing_profile.consent_granted = True
-                        existing_profile.next_charge_at = next_charge
-                        existing_profile.payment_attempt_count = 0
-                        existing_profile.last_payment_attempt = None
-                    else:
-                        session.add(RecurringPaymentProfile(
-                            user_id=user_db_id,
-                            subscription_id=subscription_id,
-                            tariff_id=tariff_id,
-                            provider="yookassa",
-                            provider_payment_method_id=pm_id,
-                            payment_method_label=label,
-                            is_active=True,
-                            consent_granted=True,
-                            next_charge_at=next_charge,
-                        ))
-                    logger.info(
-                        "Saved payment method %s for user %s (sub=%s)",
-                        pm_id, user_db_id, subscription_id,
-                    )
-
-                await session.commit()
+        success, code = await verify_and_fulfill_yookassa_payment(
+            request.app,
+            yookassa_payment_id,
+            source="webhook",
+            unverified_webhook_payload=data,
+        )
     except Exception as exc:
         logger.exception("Unexpected YooKassa fulfillment failure: %s", yookassa_payment_id)
-        await _notify_unexpected_payment_failure(
-            request.app["bot"],
-            chat_id=chat_id,
-            provider="YooKassa",
-            payment_ref=yookassa_payment_id,
-            exc=exc,
-        )
+        chat_id = None
+        try:
+            chat_id = int(obj.get("metadata", {}).get("chat_id", 0)) or None
+        except (ValueError, TypeError):
+            pass
+        if chat_id:
+            await _notify_unexpected_payment_failure(
+                request.app["bot"],
+                chat_id=chat_id,
+                provider="YooKassa",
+                payment_ref=yookassa_payment_id,
+                exc=exc,
+            )
         return web.Response(status=503, text="Fulfillment will be retried")
-    finally:
-        await lease_manager.release(lock_name)
+
+    if success:
+        return web.Response(text="OK")
+
+    if code in ("already_completed", "payment_canceled") or code.startswith("payment_canceled"):
+        return web.Response(text="OK")
+    if code == "locked_by_another_execution":
+        return web.Response(status=409, text="Processing in progress")
+    if code in ("provider_unavailable", "lease_expired") or code.startswith("delivery_failed"):
+        return web.Response(status=503, text="Fulfillment will be retried")
 
     return web.Response(text="OK")
 
@@ -1143,7 +1162,9 @@ async def handle_robokassa_result(request: web.Request) -> web.Response:
                 if not payment:
                     logger.error("Robokassa payment record disappeared: InvId=%s", inv_id)
                     return web.Response(status=503, text="Payment record missing")
+                payment.status = PaymentStatus.COMPLETED
                 payment.subscription_id = subscription_id
+                payment.provisioning_failure_code = None
 
                 robokassa_payment = await session.get(RobokassaPayment, inv_id)
                 discount = 0.0
@@ -1171,8 +1192,9 @@ async def handle_robokassa_result(request: web.Request) -> web.Response:
                 await log_referral_payment(session, user_db_id_for_payment, float(out_sum), bot=request.app["bot"])
                 plog("ОПЛАТА", provider="Robokassa", user_id=telegram_user_id,
                      amount=f"{float(out_sum):.2f}", inv_id=inv_id)
-                from bot.services.payment_service import credit_partner
+                from bot.services.payment_service import credit_cashback, credit_partner
                 await credit_partner(session, user_db_id_for_payment, payment.id, float(out_sum), bot=request.app["bot"])
+                await credit_cashback(session, user_db_id_for_payment, payment.id, float(out_sum), bot=request.app["bot"])
                 await session.commit()
     except Exception as exc:
         logger.exception("Unexpected Robokassa fulfillment failure: InvId=%s", inv_id)
@@ -1336,6 +1358,8 @@ async def handle_internal_web_referral_credit(request: web.Request) -> web.Respo
                     tariff_label=tariff_label,
                     payment_amount_rub=amount_rub,
                     earning_amount_rub=earning,
+                    depth=1,
+                    commission_percent=commission_percent,
                 )
             )
             partner.partner_balance = round((partner.partner_balance or 0.0) + earning, 2)
@@ -1359,6 +1383,33 @@ async def handle_internal_web_referral_credit(request: web.Request) -> web.Respo
                 source_type="web_order",
                 source_id=order_id,
             )
+            # Credit multi-tier partner commission if referrer belongs to a partner chain
+            if referrer.referral_root_partner_id:
+                root_partner = await session.get(Partner, referrer.referral_root_partner_id)
+                if root_partner and root_partner.is_active:
+                    ref_depth = (referrer.referral_depth or 1) + 1
+                    if ref_depth == 2:
+                        p_pct = float(root_partner.commission_l2_percent or 0.0)
+                    else:
+                        p_pct = float(root_partner.commission_l3_percent or 0.0)
+                    if p_pct > 0:
+                        p_earn = round(amount_rub * p_pct / 100, 2)
+                        if p_earn > 0:
+                            session.add(
+                                WebPartnerEarning(
+                                    partner_id=root_partner.id,
+                                    partner_link_id=None,
+                                    web_order_id=f"{order_id}_p{root_partner.id}",
+                                    ref_code=normalized_ref,
+                                    buyer_contact=buyer_contact,
+                                    tariff_label=tariff_label,
+                                    payment_amount_rub=amount_rub,
+                                    earning_amount_rub=p_earn,
+                                    depth=ref_depth,
+                                    commission_percent=p_pct,
+                                )
+                            )
+                            root_partner.partner_balance = round((root_partner.partner_balance or 0.0) + p_earn, 2)
 
         try:
             await session.commit()
@@ -1484,10 +1535,19 @@ async def handle_internal_balance_config(request: web.Request) -> web.Response:
     async with async_session() as session:
         daily_rate = await get_daily_charge_rub(session)
         config = await session.get(ReferralConfig, 1)
+        cb_enabled_row = await session.get(BotSettings, "cashback_enabled")
+        cb_pct_row = await session.get(BotSettings, "cashback_percent")
+        cb_enabled = cb_enabled_row.value == "1" if cb_enabled_row else False
+        try:
+            cb_pct = float(cb_pct_row.value) if (cb_pct_row and cb_pct_row.value) else 10.0
+        except (ValueError, TypeError):
+            cb_pct = 10.0
 
     return web.json_response({
         "daily_charge_rub": daily_rate,
         "referral_commission_percent": float(config.commission_percent) if config else 0.0,
+        "cashback_enabled": cb_enabled,
+        "cashback_percent": cb_pct,
     })
 
 
@@ -1525,16 +1585,35 @@ async def handle_internal_balance_credit(request: web.Request) -> web.Response:
             existing = await session.execute(
                 select(BalanceTopUp).where(BalanceTopUp.provider_payment_id == source_id)
             )
-            topup = existing.scalar_one_or_none()
-            if topup and topup.status == "completed":
+            topup_rows = existing.scalars().all()
+            if topup_rows:
+                topup = topup_rows[0]
+                same_tg = (topup.telegram_id == telegram_id)
+                same_amt = (abs(float(topup.amount_rub or 0.0) - amount_rub) < 0.01)
+                same_provider = (topup.provider == source_type[:32])
+                is_completed = (topup.status == "completed")
+                if len(topup_rows) != 1 or not (same_tg and same_amt and same_provider and is_completed):
+                    logger.warning(
+                        "Conflicting topup parameters for source_id=%s: existing tg=%s amt=%s prov=%s stat=%s vs requested tg=%s amt=%s prov=%s",
+                        source_id,
+                        topup.telegram_id,
+                        topup.amount_rub,
+                        topup.provider,
+                        topup.status,
+                        telegram_id,
+                        amount_rub,
+                        source_type[:32],
+                    )
+                    return web.json_response(
+                        {"error": "Conflicting topup parameters for existing source_id"},
+                        status=409,
+                    )
                 return web.json_response({
                     "status": "already_credited",
                     "balance_rub": round(float(user.balance_rub or 0.0), 2),
                 })
-        else:
-            topup = None
 
-        if not topup:
+        try:
             topup = BalanceTopUp(
                 user_id=user.id,
                 telegram_id=telegram_id,
@@ -1545,24 +1624,112 @@ async def handle_internal_balance_credit(request: web.Request) -> web.Response:
                 completed_at=datetime.utcnow(),
             )
             session.add(topup)
-        else:
-            topup.status = "completed"
-            topup.completed_at = datetime.utcnow()
 
-        credit_user_balance(
-            session,
-            user,
-            amount_rub,
-            BalanceTransactionKind.TOPUP,
-            description,
-            source_type=source_type,
-            source_id=source_id or None,
-        )
-        await session.commit()
+            new_balance = await async_credit_user_balance(
+                session,
+                user,
+                amount_rub,
+                BalanceTransactionKind.TOPUP,
+                description,
+                source_type=source_type,
+                source_id=source_id or None,
+            )
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            # Loser of concurrent race: re-read winner's committed record
+            async with async_session() as s2:
+                u2 = (
+                    await s2.execute(select(User).where(User.telegram_id == telegram_id))
+                ).scalar_one_or_none()
+                ex2 = (
+                    await s2.execute(
+                        select(BalanceTopUp).where(BalanceTopUp.provider_payment_id == source_id)
+                    )
+                ).scalars().all()
+                if ex2:
+                    winner_topup = ex2[0]
+                    same_tg = (winner_topup.telegram_id == telegram_id)
+                    same_amt = (abs(float(winner_topup.amount_rub or 0.0) - amount_rub) < 0.01)
+                    same_provider = (winner_topup.provider == source_type[:32])
+                    is_completed = (winner_topup.status == "completed")
+                    if len(ex2) == 1 and same_tg and same_amt and same_provider and is_completed:
+                        return web.json_response({
+                            "status": "already_credited",
+                            "balance_rub": round(float(u2.balance_rub or 0.0), 2) if u2 else 0.0,
+                        })
+                logger.warning("Integrity error with conflicting existing row for source_id=%s", source_id)
+                return web.json_response(
+                    {"error": "Conflicting concurrent topup"},
+                    status=409,
+                )
 
         return web.json_response({
             "status": "credited",
-            "balance_rub": round(float(user.balance_rub or 0.0), 2),
+            "balance_rub": round(new_balance, 2),
+        })
+
+
+async def handle_internal_balance_credit_status(request: web.Request) -> web.Response:
+    """Read-only check for existing balance topup by source_id.
+
+    Returns found status, original telegram_id, amount_rub, completed flag, and provider.
+    Does NOT mutate balance or perform credit.
+    Handles potential historical duplicate rows safely without scalar_one_or_none() crashes.
+    """
+    if not _verify_internal_secret(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    source_id = (request.query.get("source_id") or "").strip()[:128]
+    if not source_id:
+        return web.json_response({"error": "Missing source_id"}, status=400)
+
+    async with async_session() as session:
+        existing = await session.execute(
+            select(BalanceTopUp).where(BalanceTopUp.provider_payment_id == source_id)
+        )
+        rows = existing.scalars().all()
+        if not rows:
+            return web.json_response({
+                "ok": True,
+                "found": False,
+                "completed": False,
+                "ambiguous": False,
+            })
+
+        unique_tgs = {r.telegram_id for r in rows}
+        unique_amounts = {round(float(r.amount_rub or 0.0), 2) for r in rows}
+        unique_providers = {r.provider for r in rows}
+        unique_statuses = {r.status for r in rows}
+
+        if len(rows) != 1 or len(unique_tgs) > 1 or len(unique_amounts) > 1 or len(unique_providers) > 1 or len(unique_statuses) > 1:
+            logger.warning(
+                "Conflicting historical rows found for source_id=%s: tg=%s amounts=%s providers=%s statuses=%s",
+                source_id,
+                unique_tgs,
+                unique_amounts,
+                unique_providers,
+                unique_statuses,
+            )
+            return web.json_response({
+                "ok": True,
+                "found": True,
+                "ambiguous": True,
+                "completed": False,
+                "error": "Conflicting historical rows found for source_id",
+            })
+
+        topup = rows[0]
+        return web.json_response({
+            "ok": True,
+            "found": True,
+            "ambiguous": False,
+            "source_id": topup.provider_payment_id,
+            "telegram_id": topup.telegram_id,
+            "amount_rub": round(float(topup.amount_rub or 0.0), 2),
+            "status": topup.status,
+            "completed": topup.status == "completed",
+            "provider": topup.provider,
         })
 
 
@@ -1647,6 +1814,368 @@ async def handle_internal_balance_toggle(request: web.Request) -> web.Response:
         })
 
 
+_DELIVERED_WEB_ORDERS: set[str] = set()
+_DELIVERED_WEB_ORDERS_QUEUE: deque[str] = deque(maxlen=1000)
+
+
+async def handle_internal_web_order_delivered(request: web.Request) -> web.Response:
+    """Handle notification and DB sync when a webstore order is delivered.
+
+    If the renewed/purchased access belongs to a Telegram bot user,
+    syncs the bot subscription DB and sends the user the exact same
+    renewal messages and platform guide as bot-native purchases.
+    """
+    if not _verify_internal_secret(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    order_id = str(body.get("order_id") or "").strip()
+    adapt_uuid = str(body.get("adapt_uuid") or "").strip()
+    marzban_username = str(body.get("marzban_username") or "").strip()
+    target_order_id = str(body.get("target_order_id") or "").strip()
+    subscription_url = str(body.get("subscription_url") or "").strip()
+    access_expires_at_raw = body.get("access_expires_at")
+    tariff_label = str(body.get("tariff_label") or "").strip()
+    force = bool(body.get("force"))
+    amount_rub = float(body.get("amount_rub") or 0.0)
+    cashback_eligible = bool(body.get("cashback_eligible", True))
+    cashback_only = bool(body.get("cashback_only"))
+
+    if not order_id:
+        return web.json_response({"error": "Missing order_id"}, status=400)
+
+    # Robust fallback extraction for adapt_uuid
+    if not adapt_uuid and target_order_id and "uuid:" in target_order_id:
+        adapt_uuid = target_order_id.split("uuid:", 1)[1].strip()
+    if not adapt_uuid and subscription_url:
+        import re
+        match = re.search(r"/(?:adapt-sub|sub)/([0-9a-f-]{36})", subscription_url, re.IGNORECASE)
+        if match:
+            adapt_uuid = match.group(1)
+
+    # 1. Resolve subscription in bot DB
+    async with async_session() as session:
+        sub = None
+        adapt_record = None
+        if adapt_uuid:
+            adapt_record = await session.scalar(
+                select(AdaptSubscription).where(
+                    func.lower(AdaptSubscription.adapt_uuid) == adapt_uuid.lower()
+                ).limit(1)
+            )
+            if adapt_record:
+                sub = await session.get(Subscription, adapt_record.subscription_id)
+            if not sub:
+                sub = await session.scalar(
+                    select(Subscription).where(
+                        Subscription.client_name == f"adapt_{adapt_uuid}"
+                    ).order_by(Subscription.id.desc()).limit(1)
+                )
+            if not sub:
+                sub = await session.scalar(
+                    select(Subscription).where(
+                        Subscription.vpn_key.contains(adapt_uuid)
+                    ).order_by(Subscription.id.desc()).limit(1)
+                )
+
+        if not sub and target_order_id and target_order_id.startswith("sub_"):
+            try:
+                sub_id_int = int(target_order_id.removeprefix("sub_"))
+                sub = await session.get(Subscription, sub_id_int)
+            except ValueError:
+                pass
+
+        if not sub and marzban_username:
+            sub = await session.scalar(
+                select(Subscription).where(Subscription.client_name == marzban_username).order_by(Subscription.id.desc()).limit(1)
+            )
+
+        if not sub:
+            return web.json_response({
+                "ok": True,
+                "matched": False,
+                "delivered": False,
+                "reason": "subscription_not_found",
+                "cashback_status": "not_eligible",
+                "cashback_rub": 0.0,
+            })
+
+        sub_id = sub.id
+        sub_platform = sub.platform
+
+        user = await session.get(User, sub.user_id)
+        if not user or not user.telegram_id:
+            return web.json_response({
+                "ok": True,
+                "matched": True,
+                "delivered": False,
+                "reason": "no_telegram_user",
+                "subscription_id": sub_id,
+                "cashback_status": "not_eligible",
+                "cashback_rub": 0.0,
+            })
+
+        user_id = user.id
+        telegram_id = user.telegram_id
+        username = user.username
+        full_name = user.full_name
+        user_platform = user.platform
+
+        # 2. Sync expiration date and status in bot DB (skip during cashback-only retries)
+        if not cashback_only and access_expires_at_raw:
+            from bot.services.webstore_bridge import _parse_web_datetime
+            new_expires = _parse_web_datetime(access_expires_at_raw)
+            if new_expires:
+                sub.expires_at = new_expires
+                sub.status = SubStatus.ACTIVE
+                if sub.billing_mode == "demo":
+                    sub.billing_mode = "tariff"
+                if adapt_uuid:
+                    from bot.services.adapt_subscription_proxy import build_adapt_mirror_url
+                    sub.vpn_key = build_adapt_mirror_url(adapt_uuid)
+                elif subscription_url and not sub.vpn_key:
+                    sub.vpn_key = subscription_url
+                if not adapt_record:
+                    adapt_record = await session.scalar(
+                        select(AdaptSubscription).where(AdaptSubscription.subscription_id == sub_id).limit(1)
+                    )
+                if adapt_record:
+                    adapt_record.end_date = new_expires
+                    adapt_record.is_frozen = False
+                await session.commit()
+
+        # 3. Resolve bot instance for delivery and cashback notification
+        bot = request.app.get("bot")
+        if not bot and settings.bot_token:
+            from bot.telegram_client import create_telegram_bot
+            bot = create_telegram_bot(settings.bot_token)
+
+        # 4. Durable cashback idempotency processing BEFORE delivery dedupe early return
+        cashback_status = "not_eligible"
+        cashback_rub = 0.0
+
+        if not cashback_eligible:
+            cashback_status = "web_already_credited"
+        elif amount_rub <= 0:
+            cashback_status = "not_eligible"
+        else:
+            from bot.services.payment_service import credit_cashback
+            cb_result = await credit_cashback(
+                session=session,
+                user_db_id=user_id,
+                payment_id=None,
+                amount_rub=amount_rub,
+                bot=None,
+                source_type="web_order_cashback",
+                source_id=order_id,
+            )
+            cashback_status = cb_result.get("status", "failed")
+            cashback_rub = float(cb_result.get("cashback_rub") or 0.0)
+
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                existing_tx = await session.scalar(
+                    select(BalanceTransaction).where(
+                        BalanceTransaction.user_id == user_id,
+                        BalanceTransaction.kind == BalanceTransactionKind.CASHBACK,
+                        BalanceTransaction.source_type == "web_order_cashback",
+                        BalanceTransaction.source_id == order_id,
+                    ).limit(1)
+                )
+                if existing_tx:
+                    cashback_status = "already_credited"
+                    cashback_rub = float(existing_tx.amount_rub)
+                    cb_result["status"] = "already_credited"
+                else:
+                    raise
+
+            # ONLY AFTER successful commit: send the cashback Telegram notification
+            if cb_result.get("status") == "credited" and bot and telegram_id:
+                notify_text = cb_result.get("notify_text")
+                if not notify_text:
+                    pct_val = cb_result.get("cashback_pct", 10.0)
+                    pct_fmt = int(pct_val) if isinstance(pct_val, (int, float)) and float(pct_val).is_integer() else pct_val
+                    notify_text = (
+                        f"🎁 Вам начислен кешбэк <b>+{cashback_rub:.2f} ₽</b> ({pct_fmt}% от оплаты {amount_rub:.2f} ₽) на ваш баланс!\n\n"
+                        f"Вы можете использовать баланс для оплаты и продления подписки."
+                    )
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        notify_text,
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    logger.error("Failed to send web cashback notification to %s for order %s: %s", telegram_id, order_id, e)
+
+        # In cashback-only mode (used by scheduler retry), return immediately after cashback idempotency
+        # WITHOUT touching delivery dedupe, Subscription.expires_at, sending renewal keys, or bonus messages.
+        if cashback_only:
+            return web.json_response({
+                "ok": True,
+                "matched": True,
+                "delivered": False,
+                "telegram_id": telegram_id,
+                "username": username,
+                "full_name": full_name,
+                "subscription_id": sub_id,
+                "cashback_status": cashback_status,
+                "cashback_rub": cashback_rub,
+            })
+
+        # Check deduplication before sending Telegram delivery messages
+        global _DELIVERED_WEB_ORDERS, _DELIVERED_WEB_ORDERS_QUEUE
+        if not force and order_id in _DELIVERED_WEB_ORDERS:
+            logger.info("Web order %s already delivered to user %s, skipping duplicate", order_id, telegram_id)
+            return web.json_response({
+                "ok": True,
+                "matched": True,
+                "delivered": True,
+                "duplicate": True,
+                "telegram_id": telegram_id,
+                "username": username,
+                "full_name": full_name,
+                "subscription_id": sub_id,
+                "cashback_status": cashback_status,
+                "cashback_rub": cashback_rub,
+            })
+
+        # 5. Deliver keys and messages to user using the standard bot renewal flow
+        delivered = False
+        if bot:
+            try:
+                from bot.handlers.payment import _send_subscription_key_for_platform
+                raw_platform = user_platform or sub_platform or Platform.ANDROID
+                try:
+                    target_platform = Platform(raw_platform)
+                except (ValueError, TypeError):
+                    target_platform = Platform.ANDROID
+
+                delivered = await _send_subscription_key_for_platform(
+                    bot=bot,
+                    chat_id=telegram_id,
+                    telegram_id=telegram_id,
+                    subscription_id=sub_id,
+                    platform=target_platform,
+                )
+                # WhatsApp proxy bonus if enabled
+                wa_enabled_row = await session.get(BotSettings, "whatsapp_proxy_enabled")
+                wa_host_row = await session.get(BotSettings, "whatsapp_proxy_host")
+                if wa_enabled_row and wa_enabled_row.value == "1" and wa_host_row and wa_host_row.value:
+                    from bot.utils.texts import WHATSAPP_PROXY_BONUS
+                    await bot.send_message(
+                        telegram_id,
+                        WHATSAPP_PROXY_BONUS.format(proxy_host=wa_host_row.value),
+                        parse_mode="HTML",
+                    )
+            except Exception as exc:
+                logger.error("Failed to deliver web order renewal to user %s: %s", telegram_id, exc)
+
+        if delivered:
+            _DELIVERED_WEB_ORDERS.add(order_id)
+            _DELIVERED_WEB_ORDERS_QUEUE.append(order_id)
+            if len(_DELIVERED_WEB_ORDERS) > 1000:
+                _DELIVERED_WEB_ORDERS = set(_DELIVERED_WEB_ORDERS_QUEUE)
+
+        plog(
+            "ВЫДАЧА_ВЕБ_ПРОДЛЕНИЕ",
+            user_id=telegram_id,
+            order_id=order_id,
+            tariff=tariff_label or "",
+            subscription_id=sub_id,
+        )
+
+        return web.json_response({
+            "ok": True,
+            "matched": True,
+            "delivered": delivered,
+            "telegram_id": telegram_id,
+            "username": username,
+            "full_name": full_name,
+            "subscription_id": sub_id,
+            "cashback_status": cashback_status,
+            "cashback_rub": cashback_rub,
+        })
+
+
+async def handle_internal_web_order_resolve_user(request: web.Request) -> web.Response:
+    """Resolve associated Telegram user for a web order before/after payment."""
+    if not _verify_internal_secret(request):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    adapt_uuid = request.query.get("adapt_uuid", "").strip()
+    marzban_username = request.query.get("marzban_username", "").strip()
+    target_order_id = request.query.get("target_order_id", "").strip()
+    subscription_url = request.query.get("subscription_url", "").strip()
+
+    if not adapt_uuid and target_order_id and "uuid:" in target_order_id:
+        adapt_uuid = target_order_id.split("uuid:", 1)[1].strip()
+    if not adapt_uuid and subscription_url:
+        import re
+        match = re.search(r"/(?:adapt-sub|sub)/([0-9a-f-]{36})", subscription_url, re.IGNORECASE)
+        if match:
+            adapt_uuid = match.group(1)
+
+    async with async_session() as session:
+        sub = None
+        if adapt_uuid:
+            adapt_record = await session.scalar(
+                select(AdaptSubscription).where(
+                    func.lower(AdaptSubscription.adapt_uuid) == adapt_uuid.lower()
+                ).limit(1)
+            )
+            if adapt_record:
+                sub = await session.get(Subscription, adapt_record.subscription_id)
+            if not sub:
+                sub = await session.scalar(
+                    select(Subscription).where(
+                        Subscription.client_name == f"adapt_{adapt_uuid}"
+                    ).order_by(Subscription.id.desc()).limit(1)
+                )
+            if not sub:
+                sub = await session.scalar(
+                    select(Subscription).where(
+                        Subscription.vpn_key.contains(adapt_uuid)
+                    ).order_by(Subscription.id.desc()).limit(1)
+                )
+
+        if not sub and target_order_id and target_order_id.startswith("sub_"):
+            try:
+                sub_id_int = int(target_order_id.removeprefix("sub_"))
+                sub = await session.get(Subscription, sub_id_int)
+            except ValueError:
+                pass
+
+        if not sub and marzban_username:
+            sub = await session.scalar(
+                select(Subscription).where(Subscription.client_name == marzban_username).order_by(Subscription.id.desc()).limit(1)
+            )
+
+        if not sub:
+            return web.json_response({"ok": True, "user": None})
+
+        user = await session.get(User, sub.user_id)
+        if not user or not user.telegram_id:
+            return web.json_response({"ok": True, "user": None})
+
+        return web.json_response({
+            "ok": True,
+            "user": {
+                "telegram_id": user.telegram_id,
+                "username": user.username,
+                "full_name": user.full_name,
+                "subscription_id": sub.id,
+            }
+        })
+
+
+
 async def handle_vhq_subscription_proxy(request: web.Request) -> web.Response:
     token_payload = resolve_vhq_mirror_token(request.match_info.get("token", ""))
     if not token_payload:
@@ -1656,7 +2185,8 @@ async def handle_vhq_subscription_proxy(request: web.Request) -> web.Response:
     expires_at = None
     key_id = None
     tariff_label = None
-    if token_payload.get("kind") == "subscription":
+    kind = token_payload.get("kind")
+    if kind == "subscription":
         subscription_id = int(token_payload["subscription_id"])
         async with async_session() as session:
             subscription = await session.get(Subscription, subscription_id)
@@ -1669,9 +2199,45 @@ async def handle_vhq_subscription_proxy(request: web.Request) -> web.Response:
                 tariff = await session.get(Tariff, subscription.tariff_id)
                 if tariff:
                     tariff_label = tariff.label
+    elif kind == "web_order":
+        web_order_id = str(token_payload.get("web_order_id") or "").strip()
+        if web_order_id:
+            try:
+                from webstore.database import async_session as web_async_session
+                from webstore.models import WebOrder
+                async with web_async_session() as session:
+                    web_order = await session.scalar(
+                        select(WebOrder).where(WebOrder.order_id == web_order_id).limit(1)
+                    )
+                    if web_order and web_order.vhq_upstream_url:
+                        upstream_url = web_order.vhq_upstream_url
+                        expires_at = web_order.access_expires_at
+                        key_id = web_order.order_id
+                        tariff_label = web_order.tariff_label
+            except Exception as exc:
+                logger.warning("Failed to lookup web_order for vhq proxy: %s", exc)
     else:
-        upstream_url = str(token_payload.get("upstream_url") or "").strip()
-        key_id = str(token_payload.get("order_id") or "").strip() or None
+        # Legacy token with kind == "upstream", format: {"u": ..., "o": ...}
+        order_id = str(token_payload.get("order_id") or "").strip() or None
+        embedded_upstream = str(token_payload.get("upstream_url") or "").strip()
+        key_id = order_id
+        if order_id:
+            try:
+                from webstore.database import async_session as web_async_session
+                from webstore.models import WebOrder
+                async with web_async_session() as session:
+                    web_order = await session.scalar(
+                        select(WebOrder).where(WebOrder.order_id == order_id).limit(1)
+                    )
+                    if web_order and web_order.vhq_upstream_url:
+                        upstream_url = web_order.vhq_upstream_url
+                        expires_at = web_order.access_expires_at
+                        tariff_label = web_order.tariff_label
+            except Exception as exc:
+                logger.warning("Failed to lookup web_order for legacy token vhq proxy: %s", exc)
+
+        if not upstream_url:
+            upstream_url = embedded_upstream
 
     if not upstream_url:
         return web.Response(status=404, text="Not found")
@@ -1731,6 +2297,62 @@ async def handle_adapt_subscription_proxy(request: web.Request) -> web.Response:
     return web.Response(status=status, body=body, headers=headers)
 
 
+def _is_valid_adapt_uuid(val: str) -> bool:
+    import re
+    return bool(re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", val, re.IGNORECASE))
+
+
+async def handle_adapt_subscription_devices(request: web.Request) -> web.Response:
+    """Return JSON list of devices for this subscription."""
+    adapt_uuid = request.match_info.get("uuid", "").strip()
+    if not _is_valid_adapt_uuid(adapt_uuid):
+        return web.json_response({"ok": False, "error": "Invalid subscription"}, status=400)
+    try:
+        from bot.services.adapt_api import AdaptAPI
+        devices = await asyncio.wait_for(AdaptAPI().get_devices(adapt_uuid), timeout=8.0)
+        return web.json_response({"ok": True, "devices": devices})
+    except (asyncio.TimeoutError, TimeoutError):
+        return web.json_response({"ok": False, "error": "Timeout fetching devices"}, status=504)
+    except Exception as exc:
+        logger.warning("Failed to fetch devices for adapt_uuid=%s: %s", adapt_uuid, exc)
+        return web.json_response({"ok": False, "error": "Failed to fetch devices"}, status=500)
+
+
+async def handle_adapt_subscription_device_delete(request: web.Request) -> web.Response:
+    """Delete a device by ID for this subscription."""
+    adapt_uuid = request.match_info.get("uuid", "").strip()
+    if not _is_valid_adapt_uuid(adapt_uuid):
+        return web.json_response({"ok": False, "error": "Invalid subscription"}, status=400)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    raw_dev_id = data.get("device_id")
+    if raw_dev_id is None:
+        return web.json_response({"ok": False, "error": "Missing device_id"}, status=400)
+
+    try:
+        device_id = int(raw_dev_id)
+    except (ValueError, TypeError):
+        return web.json_response({"ok": False, "error": "Invalid device_id"}, status=400)
+
+    try:
+        from bot.services.adapt_api import AdaptAPI
+        api = AdaptAPI()
+        success = await asyncio.wait_for(api.delete_device(adapt_uuid, device_id), timeout=8.0)
+        if success:
+            logger.info("Deleted adapt device %s for uuid=%s", device_id, adapt_uuid)
+            return web.json_response({"ok": True})
+        return web.json_response({"ok": False, "error": "Provider declined device deletion"}, status=502)
+    except (asyncio.TimeoutError, TimeoutError):
+        return web.json_response({"ok": False, "error": "Timeout deleting device"}, status=504)
+    except Exception as exc:
+        logger.error("Failed to delete device %s for adapt_uuid=%s: %s", device_id, adapt_uuid, exc)
+        return web.json_response({"ok": False, "error": "Error deleting device"}, status=500)
+
+
 async def handle_adapt_webhook(request: web.Request) -> web.Response:
     """Handle incoming webhook events from Adapt Group.
 
@@ -1744,18 +2366,25 @@ async def handle_adapt_webhook(request: web.Request) -> web.Response:
 
     raw_body = await request.read()
 
-    # Signature verification
-    webhook_secret = settings.adapt_webhook_secret.strip()
-    if webhook_secret:
-        sig_header = request.headers.get("X-Webhook-Signature", "")
-        expected_sig = hmac.new(
-            webhook_secret.encode(),
-            raw_body,
-            hashlib.sha256,
-        ).hexdigest()
-        if not sig_header or not hmac.compare_digest(expected_sig, sig_header):
-            logger.warning("Adapt webhook: invalid signature from IP=%s", client_ip)
-            return web.Response(status=403, text="Invalid signature")
+    # Signature verification — fail closed if secret is not configured or signature is missing/invalid
+    webhook_secret = (settings.adapt_webhook_secret or "").strip()
+    if not webhook_secret:
+        logger.warning("Adapt webhook rejected: ADAPT_WEBHOOK_SECRET is not configured")
+        return web.Response(status=403, text="Webhook authentication disabled (missing secret)")
+
+    sig_header = request.headers.get("X-Webhook-Signature", "").strip()
+    if not sig_header:
+        logger.warning("Adapt webhook rejected: missing X-Webhook-Signature header from IP=%s", client_ip)
+        return web.Response(status=403, text="Missing signature header")
+
+    expected_sig = hmac.new(
+        webhook_secret.encode(),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_sig, sig_header):
+        logger.warning("Adapt webhook: invalid signature from IP=%s", client_ip)
+        return web.Response(status=403, text="Invalid signature")
 
     try:
         import json as _json
@@ -1835,6 +2464,19 @@ async def handle_adapt_webhook(request: web.Request) -> web.Response:
             # Forward notification to the user
             sub = await session.get(Subscription, adapt_record.subscription_id)
             if sub:
+                sub.adapt_sub = adapt_record
+                canonical_uuid = str(adapt_record.adapt_plan_uuid or "").strip()
+                current_tariff = None
+                if canonical_uuid:
+                    current_tariff = await session.scalar(
+                        _select(Tariff)
+                        .where(Tariff.adapt_plan_uuid == canonical_uuid)
+                        .order_by(Tariff.id.desc())
+                        .limit(1)
+                    )
+                if not current_tariff and sub.tariff_id:
+                    current_tariff = await session.get(Tariff, sub.tariff_id)
+                sub.adapt_current_tariff = current_tariff
                 user = await session.get(User, sub.user_id)
                 if user:
                     await _adapt_notify_user(event, user, sub, adapt_record, request.app)
@@ -1859,7 +2501,6 @@ async def _reconcile_adapt_telegram_create(
 
     from bot.models import AdaptSubscription
     from bot.services.adapt_subscription_proxy import build_adapt_mirror_url
-    from bot.services.client_names import build_adapt_client_name
     from bot.services.subscription_service import (
         _disable_balance_autodebit_after_tariff_purchase,
         get_primary_active_server,
@@ -1871,6 +2512,8 @@ async def _reconcile_adapt_telegram_create(
         payment = await session.get(Payment, payment_id)
         if not payment or payment.status != PaymentStatus.COMPLETED:
             logger.error("Adapt tg reconciliation payment missing/not completed payment_id=%s", payment_id)
+            return True
+        if payment.subscription_id and await session.get(Subscription, payment.subscription_id):
             return True
         user = await session.get(User, payment.user_id)
         tariff = await session.get(Tariff, payment.tariff_id) if payment.tariff_id else None
@@ -1933,7 +2576,8 @@ async def _reconcile_adapt_telegram_create(
                 subscription_id=subscription.id,
             )
 
-        key = subscription.vpn_key or build_adapt_mirror_url(adapt_uuid)
+        from bot.services.vhq_subscription_proxy import get_subscription_display_key
+        key = get_subscription_display_key(subscription) or build_adapt_mirror_url(adapt_uuid)
         expires = subscription.expires_at.strftime("%d.%m.%Y") if subscription.expires_at else "—"
         sent = await notify_expiring(
             request.app["bot"],
@@ -1974,14 +2618,53 @@ async def _adapt_notify_user(
     elif event == "subs.expires_in_24_hours":
         text = "⚠️ Ваш доступ истекает завтра. Продлите его сейчас."
     elif event == "subs.expired_24_hours_ago":
-        text = "❌ Ваш доступ прекратился вчера. Продлите его в боте."
+        tariff = getattr(subscription, "adapt_current_tariff", None)
+        if not tariff:
+            tariff = (
+                subscription.__dict__.get("tariff")
+                if hasattr(subscription, "__dict__")
+                else getattr(subscription, "tariff", None)
+            )
+        tariff_label = escape(str(getattr(tariff, "label", None) or "Подписка Adapt"))
+        tariff_days = getattr(tariff, "days", None) or getattr(subscription, "tariff_days", None) or "—"
+        device_count = getattr(subscription, "device_slots", None) or getattr(tariff, "device_count", None) or "—"
+        expires = (
+            subscription.expires_at.strftime("%d.%m.%Y")
+            if getattr(subscription, "expires_at", None)
+            else "—"
+        )
+        text = (
+            "❌ <b>Подписка истекла</b>\n\n"
+            f"Тариф: <b>{tariff_label}</b>\n"
+            f"Срок тарифа: <b>{tariff_days} дн.</b>\n"
+            f"Устройств: <b>{device_count}</b>\n"
+            f"Действовала до: <b>{expires}</b>\n\n"
+            "Чтобы восстановить доступ и сохранить эту же ссылку подписки,\n"
+            "нажмите «Продлить»."
+        )
     elif event == "subs.traffic_threshold_reached":
         text = "⚡️ Ваш трафик почти исчерпан. Докупите трафик в боте."
     else:
         return
 
     try:
-        await bot.send_message(user.telegram_id, text)
+        if event == "subs.expired_24_hours_ago":
+            await bot.send_message(
+                user.telegram_id,
+                text,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="↻ Продлить",
+                                callback_data=f"purchase_renew_{subscription.id}",
+                            )
+                        ]
+                    ]
+                ),
+            )
+        else:
+            await bot.send_message(user.telegram_id, text)
     except Exception as exc:
         logger.warning(
             "Failed to send Adapt notification to user %s: %s", user.telegram_id, exc
@@ -1995,6 +2678,12 @@ def setup_webhooks(app: web.Application, prefix: str) -> None:
     """Register all payment webhook routes."""
     app.router.add_get(f"{prefix}/vhq-sub/{{token}}", handle_vhq_subscription_proxy)
     app.router.add_get(f"{prefix}/adapt-sub/{{uuid}}", handle_adapt_subscription_proxy)
+    app.router.add_get(f"{prefix}/adapt-sub/{{uuid}}/devices", handle_adapt_subscription_devices)
+    app.router.add_post(f"{prefix}/adapt-sub/{{uuid}}/devices/delete", handle_adapt_subscription_device_delete)
+    if prefix:
+        app.router.add_get("/adapt-sub/{uuid}", handle_adapt_subscription_proxy)
+        app.router.add_get("/adapt-sub/{uuid}/devices", handle_adapt_subscription_devices)
+        app.router.add_post("/adapt-sub/{uuid}/devices/delete", handle_adapt_subscription_device_delete)
     app.router.add_post(f"{prefix}/adapt-webhook", handle_adapt_webhook)
     app.router.add_post(f"{prefix}/webhooks/yookassa", handle_yookassa)
     app.router.add_route("*", f"{prefix}/webhooks/robokassa/result", handle_robokassa_result)
@@ -2005,5 +2694,12 @@ def setup_webhooks(app: web.Application, prefix: str) -> None:
     app.router.add_get(f"{prefix}/internal/balance-profile", handle_internal_balance_profile)
     app.router.add_get(f"{prefix}/internal/balance-config", handle_internal_balance_config)
     app.router.add_post(f"{prefix}/internal/balance-credit", handle_internal_balance_credit)
+    app.router.add_get(f"{prefix}/internal/balance-credit-status", handle_internal_balance_credit_status)
     app.router.add_get(f"{prefix}/internal/balance-history", handle_internal_balance_history)
     app.router.add_post(f"{prefix}/internal/balance-toggle", handle_internal_balance_toggle)
+    app.router.add_post(f"{prefix}/internal/web-order/delivered", handle_internal_web_order_delivered)
+    app.router.add_get(f"{prefix}/internal/web-order/resolve-user", handle_internal_web_order_resolve_user)
+    if prefix:
+        app.router.add_get("/internal/balance-credit-status", handle_internal_balance_credit_status)
+        app.router.add_post("/internal/web-order/delivered", handle_internal_web_order_delivered)
+        app.router.add_get("/internal/web-order/resolve-user", handle_internal_web_order_resolve_user)

@@ -7,8 +7,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
+import uuid
 from aiogram.exceptions import TelegramRetryAfter
-from sqlalchemy import and_, exists, select
+from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.orm import aliased, selectinload
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -33,6 +34,8 @@ from bot.models import (
     SubscriptionNotificationLog,
     Tariff,
     User,
+    VhqSubscriptionFulfillment,
+    ManualSubscriptionOperation,
 )
 from bot.config import settings
 from bot.services.backup_service import create_and_send_backup
@@ -46,9 +49,17 @@ from bot.services.recurring_retry import (
     get_next_retry_at,
 )
 from bot.services.payment_logger import plog
+from bot.services.money import kopecks_to_rub_float, rub_to_kopecks
+from bot.services.purchase_intent import encode_intent
 from bot.services.provisioning_issues import AccessProvisionError
+from bot.services.payment_notification_outbox import process_payment_notification_outbox
 from bot.services.subscription_semantics import is_demo_subscription_row, paid_access_clause
-from bot.services.subscription_service import create_or_extend_balance_subscription, create_or_extend_balance_adapt_subscription
+from bot.services.subscription_service import (
+    _claim_vhq_fulfillment_for_execution,
+    create_or_extend_balance_subscription,
+    create_or_extend_balance_adapt_subscription,
+    execute_vhq_fulfillment,
+)
 from bot.services.adapt_api import AdaptAPI, AdaptAPIError
 from bot.services.vhq_partner_api import VHQPartnerAPI, VHQPartnerAPIError
 
@@ -162,6 +173,31 @@ def setup_scheduler(bot):
         id="check_payment_integrity",
         replace_existing=True,
     )
+    scheduler.add_job(
+        check_overdue_pending_payments,
+        "interval",
+        minutes=10,
+        args=[bot],
+        id="check_overdue_pending_payments",
+        replace_existing=True,
+    )
+    from bot.services.yookassa_reconciliation import reconcile_pending_yookassa_payments
+    scheduler.add_job(
+        reconcile_pending_yookassa_payments,
+        "interval",
+        minutes=3,
+        args=[bot],
+        id="reconcile_pending_yookassa_payments",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        process_payment_notification_outbox,
+        "interval",
+        seconds=30,
+        args=[bot],
+        id="process_payment_notification_outbox",
+        replace_existing=True,
+    )
     if settings.webstore_public_enabled and settings.vhq_partner_api_key.strip():
         scheduler.add_job(
             check_vhq_balance,
@@ -171,6 +207,14 @@ def setup_scheduler(bot):
             id="check_vhq_balance",
             replace_existing=True,
         )
+    scheduler.add_job(
+        process_vhq_subscription_fulfillments,
+        "interval",
+        seconds=30,
+        args=[bot],
+        id="process_vhq_subscription_fulfillments",
+        replace_existing=True,
+    )
     if AdaptAPI().enabled:
         scheduler.add_job(
             check_adapt_balance,
@@ -203,9 +247,10 @@ def setup_scheduler(bot):
 
 async def auto_retry_failed_provisionings(bot) -> None:
     """Attempt to provision subscriptions for completed payments without subscription."""
-    from bot.services.cluster import LeaseManager
+    from bot.services.cluster import LeaseManager, LeaseHeartbeat
     from bot.models import Tariff, Platform, TariffType, RobokassaPayment, Subscription
     from bot.services.subscription_service import create_or_extend_paid_access, create_mtproto_subscription, get_primary_active_server
+    from bot.services.provisioning_issues import AccessProvisionError
     from bot.services.device_slots import get_included_device_slots
     from bot.services.payment_service import credit_referral, log_referral_payment, credit_partner
     from bot.handlers.payment import (
@@ -219,7 +264,6 @@ async def auto_retry_failed_provisionings(bot) -> None:
     
     # We retry payments from the last 2 days
     cutoff = datetime.utcnow() - timedelta(days=2)
-    lease_manager = LeaseManager(settings.instance_id)
 
     async with async_session() as session:
         completed_topup_exists = (
@@ -229,24 +273,77 @@ async def auto_retry_failed_provisionings(bot) -> None:
             .exists()
         )
         result = await session.execute(
-            select(Payment)
-            .where(Payment.status == PaymentStatus.COMPLETED)
-            .where(Payment.subscription_id.is_(None))
+            select(Payment.id)
+            .where(
+                or_(
+                    and_(Payment.status == PaymentStatus.COMPLETED, Payment.subscription_id.is_(None)),
+                    and_(
+                        Payment.method == PaymentMethod.YOOKASSA,
+                        Payment.provisioning_failure_code == "financial_finalization_pending",
+                    ),
+                )
+            )
             .where(Payment.created_at >= cutoff)
             .where(~completed_topup_exists)
             .order_by(Payment.created_at.asc())
         )
-        payments = result.scalars().all()
-        if not payments:
-            return
+        payment_ids = result.scalars().all()
+    if not payment_ids:
+        return
 
-        for payment in payments:
+    for pid in payment_ids:
+        async with async_session() as session:
+            payment = await session.get(Payment, pid)
+            if not payment:
+                continue
+            is_unlinked_completed = payment.status == PaymentStatus.COMPLETED and not payment.subscription_id
+            is_yk_fin_pending = (
+                payment.method == PaymentMethod.YOOKASSA
+                and payment.provisioning_failure_code == "financial_finalization_pending"
+            )
+            if not (is_unlinked_completed or is_yk_fin_pending):
+                continue
+
+            if payment.method == PaymentMethod.YOOKASSA:
+                if not payment.provider_payment_id:
+                    logger.warning(
+                        "Auto-retry payment ID=%s: YooKassa payment missing provider_payment_id; skipping unverified provisioning",
+                        payment.id,
+                    )
+                    continue
+
+                # Route YooKassa payments through authenticated verification/reconciliation pipeline.
+                # No lock is acquired here to avoid nested lease acquisition,
+                # as verify_and_fulfill_yookassa_payment manages its own lease and LeaseHeartbeat.
+                from bot.services.yookassa_reconciliation import verify_and_fulfill_yookassa_payment
+                await verify_and_fulfill_yookassa_payment(bot, payment.provider_payment_id, source="auto_retry")
+                continue
+
+            from uuid import uuid4
+            owner_token = f"{settings.instance_id}:auto_retry:{uuid4().hex[:8]}"
+            lease_manager = LeaseManager(owner_token)
             lock_name = f"payment_retry:{payment.id}"
+
             acquired = await lease_manager.acquire_or_renew(lock_name, ttl_seconds=600)
             if not acquired:
                 continue
 
+            heartbeat = LeaseHeartbeat(lease_manager, lock_name, ttl_seconds=30)
             try:
+                heartbeat.start()
+
+                # Safety check: respect same supplier-operation safety state as YooKassa reconciler
+                if payment.provisioning_failure_code in ("mutation_in_flight", "uncertain_supplier_mutation"):
+                    if payment.subscription_id:
+                        subscription = await session.get(Subscription, payment.subscription_id)
+                        logger.info("Auto-retry payment ID=%s recovering with existing subscription ID=%s", payment.id, payment.subscription_id)
+                    else:
+                        logger.warning(
+                            "Payment ID=%s has unresolved supplier mutation (%s); refusing duplicate mutation in auto-retry",
+                            payment.id, payment.provisioning_failure_code,
+                        )
+                        continue
+
                 user = await session.get(User, payment.user_id)
                 if not user:
                     logger.error("Auto-retry payment ID=%s: user not found", payment.id)
@@ -267,7 +364,7 @@ async def auto_retry_failed_provisionings(bot) -> None:
                     if payment.currency == "XTR":
                         stmt = select(Tariff).where(Tariff.price_stars == amount_val)
                     else:
-                        stmt = select(Tariff).where(Tariff.price_rub == (amount_val / 100.0))
+                        stmt = select(Tariff).where(Tariff.price_rub == kopecks_to_rub_float(amount_val))
                     
                     tariffs = (await session.execute(stmt)).scalars().all()
                     if len(tariffs) == 1:
@@ -315,11 +412,16 @@ async def auto_retry_failed_provisionings(bot) -> None:
                 vpn_key = None
                 proxy_link = None
 
-                if not is_tg_proxy_only:
+                if not is_tg_proxy_only and not payment.subscription_id:
                     bonus = 0 if is_vhq_tariff(tariff) else (user.bonus_days or 0)
                     if bonus > 0:
                         user.bonus_days = 0
-                    
+
+                    # Persist durable in-flight marker BEFORE supplier mutation
+                    payment.provisioning_failure_code = "mutation_in_flight"
+                    await session.commit()
+
+                    delivery_issue = None
                     try:
                         subscription, vpn_key = await create_or_extend_paid_access(
                             session,
@@ -331,24 +433,43 @@ async def auto_retry_failed_provisionings(bot) -> None:
                             **_purchase_access_kwargs(platform_str or ""),
                         )
                     except AccessProvisionError as e:
+                        delivery_issue = e.code or "delivery_failed"
                         logger.error(
                             "AccessProvisionError in auto-retry for payment ID=%s: %s",
                             payment.id, e.admin_message
                         )
-                        continue
                     except Exception as e:
+                        delivery_issue = "delivery_failed"
                         logger.error(
                             "Unexpected error in auto-retry for payment ID=%s: %s",
                             payment.id, e
                         )
+
+                    # Fencing check after supplier provisioning: if lease expired while supplier call was in flight, do NOT proceed
+                    lease_is_held = (not heartbeat.lease_lost) and await lease_manager.is_owned_by_me(lock_name)
+                    if not lease_is_held:
+                        logger.error("Lease %s lost/expired during auto-retry provisioning for payment ID=%s", lock_name, payment.id)
+                        async with async_session() as sess:
+                            p = await sess.get(Payment, payment.id)
+                            if p and p.status == PaymentStatus.COMPLETED and not p.subscription_id:
+                                p.provisioning_failure_code = "uncertain_supplier_mutation"
+                                if subscription:
+                                    p.subscription_id = subscription.id
+                                await sess.commit()
                         continue
 
-                    if not subscription or not vpn_key:
-                        logger.error("Auto-retry for payment ID=%s failed to provision VPN", payment.id)
+                    if delivery_issue or not subscription or not vpn_key:
+                        fail_code = delivery_issue or "provisioning_failed"
+                        logger.error("Auto-retry for payment ID=%s failed: %s", payment.id, fail_code)
+                        if payment.provisioning_failure_code == "mutation_in_flight":
+                            payment.provisioning_failure_code = fail_code
+                            await session.commit()
                         continue
+                elif payment.subscription_id:
+                    subscription = await session.get(Subscription, payment.subscription_id)
 
                 if is_tg_proxy_only or is_both:
-                    if is_tg_proxy_only:
+                    if is_tg_proxy_only and not subscription:
                         server = await get_primary_active_server(session)
                         if not server:
                             logger.error("Auto-retry payment ID=%s: no active proxy server found", payment.id)
@@ -380,16 +501,17 @@ async def auto_retry_failed_provisionings(bot) -> None:
                         continue
 
                 payment.subscription_id = subscription.id if subscription else None
+                payment.provisioning_failure_code = None
                 await session.flush()
 
                 amount_rub = (
                     float(tariff.price_rub)
                     if payment.currency == "XTR"
-                    else payment.amount / 100.0
+                    else kopecks_to_rub_float(payment.amount)
                 )
                 try:
                     await credit_referral(session, user.id, payment.id, amount_rub, bot=bot)
-                    await log_referral_payment(session, user.id, amount_rub, bot=bot)
+                    await log_referral_payment(session, user.id, amount_rub, bot=bot, payment_id=payment.id)
                 except Exception as e:
                     logger.error("Error crediting referral in auto-retry: %s", e)
 
@@ -398,6 +520,12 @@ async def auto_retry_failed_provisionings(bot) -> None:
                         await credit_partner(session, user.id, payment.id, amount_rub, bot=bot)
                     except Exception as e:
                         logger.error("Error crediting partner in auto-retry: %s", e)
+
+                try:
+                    from bot.services.payment_service import credit_cashback
+                    await credit_cashback(session, user.id, payment.id, amount_rub, bot=bot)
+                except Exception as e:
+                    logger.error("Error crediting cashback in auto-retry: %s", e)
 
                 plog(
                     "ОПЛАТА_АВТО_РЕЗОЛВ",
@@ -414,18 +542,8 @@ async def auto_retry_failed_provisionings(bot) -> None:
                     payment.id, subscription.id if subscription else None
                 )
 
-                if vpn_key and needs_platform_choice and subscription:
-                    try:
-                        from bot.utils.texts import SELECT_DEVICE_AFTER_PAYMENT
-                        await bot.send_message(
-                            user.telegram_id,
-                            SELECT_DEVICE_AFTER_PAYMENT,
-                            parse_mode="HTML",
-                            reply_markup=_delivery_platform_kb(subscription.id),
-                        )
-                    except Exception as exc:
-                        logger.error("Failed to send platform selector keyboard in auto-retry: %s", exc)
-                elif vpn_key and subscription:
+                if vpn_key and subscription:
+                    key_delivered = False
                     try:
                         delivered = await _send_subscription_key_for_platform(
                             bot=bot,
@@ -436,8 +554,22 @@ async def auto_retry_failed_provisionings(bot) -> None:
                         )
                         if not delivered:
                             logger.error("Failed to deliver key in auto-retry for sub ID=%s", subscription.id)
+                        else:
+                            key_delivered = True
                     except Exception as exc:
                         logger.error("Failed to deliver key via telegram in auto-retry: %s", exc)
+
+                    if key_delivered and needs_platform_choice:
+                        try:
+                            from bot.utils.texts import SELECT_DEVICE_AFTER_PAYMENT
+                            await bot.send_message(
+                                user.telegram_id,
+                                SELECT_DEVICE_AFTER_PAYMENT,
+                                parse_mode="HTML",
+                                reply_markup=_delivery_platform_kb(subscription.id),
+                            )
+                        except Exception as exc:
+                            logger.warning("Failed to send auxiliary platform selector in auto-retry: %s", exc)
 
                 if proxy_link and subscription:
                     try:
@@ -480,6 +612,7 @@ async def auto_retry_failed_provisionings(bot) -> None:
             except Exception as e:
                 logger.error("Error in auto-retry loop for payment ID=%s: %s", payment.id, e)
             finally:
+                await heartbeat.stop()
                 await lease_manager.release(lock_name)
 
 
@@ -523,7 +656,11 @@ async def check_payment_integrity(bot) -> None:
 
         details = []
         for payment, user in rows:
-            amount_rub = payment.amount / 100.0 if payment.currency == "RUB" else float(payment.amount)
+            amount_rub = (
+                kopecks_to_rub_float(payment.amount)
+                if payment.currency == "RUB"
+                else float(payment.amount)
+            )
             username = f"@{user.username}" if user.username else "—"
             details.append(
                 f"payment_id={payment.id}, user={user.telegram_id} {username}, "
@@ -542,6 +679,23 @@ async def check_payment_integrity(bot) -> None:
         else:
             session.add(BotSettings(key="payment_integrity_alert_ids", value=ids))
         await session.commit()
+
+
+async def check_overdue_pending_payments(bot) -> None:
+    """Always-runnable periodic audit for overdue pending payments and balance topups.
+
+    Verifies bounded candidates against YooKassa and alerts admins without spam.
+    Ensures long-lived unresolved payments remain visibly tracked until resolved.
+    """
+    from bot.services.problem_payments import (
+        alert_admins_if_problem_payments_detected,
+        refresh_unsnapshotted_yookassa_state,
+    )
+    try:
+        await refresh_unsnapshotted_yookassa_state()
+        await alert_admins_if_problem_payments_detected(bot)
+    except Exception as exc:
+        logger.error("Error in check_overdue_pending_payments audit: %s", exc)
 
 
 async def send_balance_low_warnings(bot):
@@ -756,13 +910,26 @@ def _format_date(dt: datetime) -> str:
     return dt.astimezone(_MSK).strftime("%d.%m.%Y %H:%M МСК")
 
 
-def _paid_warning_text(sub: Subscription, days: int) -> str:
+def _format_balance_line(user_balance: float, custom_template: str = "") -> str:
+    if user_balance <= 0:
+        return ""
+    if custom_template:
+        try:
+            return "\n\n" + custom_template.format(balance=f"{user_balance:.2f}")
+        except Exception:
+            pass
+    return f"\n\n💰 У вас на балансе <b>{user_balance:.2f} ₽</b> — вы можете использовать их для оплаты продления!"
+
+
+def _paid_warning_text(sub: Subscription, days: int, user_balance: float = 0.0, custom_balance_template: str = "") -> str:
     day_word = "день" if days == 1 else ("дня" if days in (2, 3, 4) else "дней")
+    balance_line = _format_balance_line(user_balance, custom_balance_template)
     return (
         f"⚠️ <b>Подписка скоро закончится</b>\n\n"
         f"Доступ перестанет работать через <b>{days} {day_word}</b>.\n"
         f"Дата окончания: <b>{_format_date(sub.expires_at)}</b>\n\n"
         f"Чтобы не потерять доступ, продлите подписку заранее."
+        f"{balance_line}"
     )
 
 
@@ -775,18 +942,22 @@ def _demo_warning_text(sub: Subscription) -> str:
     )
 
 
-def _expired_text(sub: Subscription) -> str:
+def _expired_text(sub: Subscription, user_balance: float = 0.0, custom_balance_template: str = "") -> str:
+    balance_line = _format_balance_line(user_balance, custom_balance_template)
+
     if _is_demo_subscription(sub):
         return (
             f"🔴 <b>Демо-доступ завершен</b>\n\n"
             f"Демо-ключ отключен {_format_date(sub.expires_at)}.\n"
             f"Чтобы снова получить доступ, оформите платный тариф."
+            f"{balance_line}"
         )
 
     return (
         f"🔴 <b>Подписка завершена</b>\n\n"
         f"Ключ отключен {_format_date(sub.expires_at)}.\n"
         f"Чтобы восстановить доступ, продлите подписку."
+        f"{balance_line}"
     )
 
 
@@ -1027,7 +1198,15 @@ async def check_expirations(bot):
                 should_notify = should_notify and not await _has_future_paid_access(session, sub.user_id, now)
 
             if should_notify and sub.user and not await _has_subscription_notification(session, sub.id, "expired"):
-                sent = await notify_expired(bot, sub.user.telegram_id, _expired_text(sub), reply_markup=renew_kb())
+                custom_bal_row = await session.get(BotSettings, "balance_reminder_text")
+                custom_bal_tpl = custom_bal_row.value if (custom_bal_row and custom_bal_row.value) else ""
+                user_balance = float(getattr(sub.user, "balance_rub", 0.0) or 0.0)
+                sent = await notify_expired(
+                    bot,
+                    sub.user.telegram_id,
+                    _expired_text(sub, user_balance=user_balance, custom_balance_template=custom_bal_tpl),
+                    reply_markup=renew_kb(),
+                )
                 if sent:
                     session.add(
                         SubscriptionNotificationLog(
@@ -1049,6 +1228,8 @@ async def send_expiry_warnings(bot):
         now = datetime.utcnow()
         latest_paid_sub_ids = await _latest_paid_subscription_ids(session, now)
         active_paid_users = set(latest_paid_sub_ids)
+        custom_bal_row = await session.get(BotSettings, "balance_reminder_text")
+        custom_bal_tpl = custom_bal_row.value if (custom_bal_row and custom_bal_row.value) else ""
 
         result = await session.execute(
             select(Subscription)
@@ -1079,10 +1260,11 @@ async def send_expiry_warnings(bot):
             else:
                 if latest_paid_sub_ids.get(sub.user_id) != sub.id:
                     continue
+                user_balance = float(getattr(sub.user, "balance_rub", 0.0) or 0.0)
                 for code, days, lower_bound, upper_bound in PAID_WARNING_WINDOWS:
                     if lower_bound < remaining <= upper_bound:
                         notification_code = code
-                        text = _paid_warning_text(sub, days)
+                        text = _paid_warning_text(sub, days, user_balance=user_balance, custom_balance_template=custom_bal_tpl)
                         break
 
             if not notification_code or not text:
@@ -1255,15 +1437,11 @@ async def process_recurring_charges(bot):
         logger.info("Recurring payments are disabled; skipping scheduler job.")
         return
 
-    import hashlib
-
     from bot.services.payment_service import create_recurring_yookassa_payment
-    from bot.services.subscription_service import create_or_extend_paid_access
     from bot.utils.texts import (
         RECURRING_CHARGE_DISABLED,
         RECURRING_CHARGE_FAILED_1,
         RECURRING_CHARGE_FAILED_2,
-        RECURRING_CHARGE_SUCCESS,
         RECURRING_DEACTIVATED,
         RECURRING_PROVIDER_ERROR,
         fmt_user,
@@ -1328,6 +1506,117 @@ async def process_recurring_charges(bot):
             if sub and sub.status == SubStatus.ACTIVE and sub.expires_at > now:
                 continue
 
+            user_info = fmt_user(user.telegram_id, user.username, user.full_name)
+
+            # Blocker 1: Do not charge again if an open paid renewal cycle is already in progress
+            active_ff = await session.scalar(
+                select(VhqSubscriptionFulfillment)
+                .where(
+                    (VhqSubscriptionFulfillment.subscription_id == sub.id)
+                    | (VhqSubscriptionFulfillment.recurring_profile_id == profile.id)
+                )
+                .where(
+                    VhqSubscriptionFulfillment.status.in_([
+                        "pending",
+                        "processing",
+                        "retry_wait",
+                        "uncertain",
+                        "buy_inflight",
+                        "renew_inflight",
+                        "manual_review",
+                    ])
+                )
+                .order_by(VhqSubscriptionFulfillment.id.desc())
+                .limit(1)
+            )
+            if active_ff:
+                if active_ff.status == "manual_review":
+                    profile.is_active = False
+                    profile.consent_granted = False
+                    await session.commit()
+                    logger.warning(
+                        "Recurring profile %s paused: active fulfillment %s is in manual_review",
+                        profile.id, active_ff.id,
+                    )
+                    await notify_admins_issue(
+                        bot,
+                        title="Автопродление приостановлено (требуется ручная проверка)",
+                        details=[
+                            f"Пользователь: {user_info}",
+                            f"Тариф: {tariff.label}",
+                            f"Fulfillment ID: {active_ff.id}",
+                            f"Статус: manual_review",
+                            f"Код ошибки: {active_ff.last_error_code or '—'}",
+                        ],
+                    )
+                    continue
+
+                has_paid_or_completed_payment = False
+                if active_ff.payment_id:
+                    pmt = await session.get(Payment, active_ff.payment_id)
+                    if pmt and (
+                        pmt.status == PaymentStatus.COMPLETED
+                        or pmt.provider_paid is True
+                        or pmt.provider_status in ("succeeded", "pending", "waiting_for_capture")
+                    ):
+                        has_paid_or_completed_payment = True
+
+                if has_paid_or_completed_payment:
+                    logger.info(
+                        "Skipping recurring charge for profile %s: fulfillment %s is %s with completed payment %s",
+                        profile.id, active_ff.id, active_ff.status, active_ff.payment_id,
+                    )
+                    continue
+
+            operation_amount_kopecks = profile.recurring_operation_amount_kopecks
+            operation_description = profile.recurring_operation_description
+            operation_payment_method_id = profile.recurring_operation_payment_method_id
+            if profile.recurring_operation_key is None:
+                cycle_marker = profile.next_charge_at or sub.expires_at or now
+                cycle_token = int(cycle_marker.timestamp())
+                generation = int(profile.recurring_operation_generation or 0) + 1
+                profile.recurring_operation_generation = generation
+                profile.recurring_operation_key = f"recurring-profile-{profile.id}-{generation}-{cycle_token}"[:64]
+                operation_amount_kopecks = rub_to_kopecks(tariff.price_rub)
+                operation_description = f"Автопродление {tariff.label}"
+                profile.recurring_operation_amount_kopecks = operation_amount_kopecks
+                profile.recurring_operation_description = operation_description
+                operation_payment_method_id = profile.provider_payment_method_id
+                profile.recurring_operation_payment_method_id = operation_payment_method_id
+                profile.recurring_operation_started_at = now
+                await session.commit()
+            else:
+                if operation_amount_kopecks is None:
+                    operation_amount_kopecks = rub_to_kopecks(tariff.price_rub)
+                    profile.recurring_operation_amount_kopecks = operation_amount_kopecks
+                if not operation_description:
+                    operation_description = f"Автопродление {tariff.label}"
+                    profile.recurring_operation_description = operation_description
+                if not operation_payment_method_id:
+                    operation_payment_method_id = profile.provider_payment_method_id
+                    profile.recurring_operation_payment_method_id = operation_payment_method_id
+                await session.commit()
+
+            # Never roll an unknown POST outcome into a fresh operation after
+            # YooKassa's idempotence window. Stop for operator reconciliation.
+            if (
+                profile.recurring_operation_started_at
+                and now - profile.recurring_operation_started_at >= timedelta(hours=23)
+            ):
+                profile.is_active = False
+                profile.consent_granted = False
+                await session.commit()
+                await notify_admins_issue(
+                    bot,
+                    title="Автопродление остановлено для проверки",
+                    details=[
+                        f"Профиль: {profile.id}",
+                        f"Пользователь: {user.telegram_id}",
+                        "Неизвестный результат операции старше 23 часов; новый ключ не создан.",
+                    ],
+                )
+                continue
+
             # Check retry policy
             if not can_retry_now(
                 profile.payment_attempt_count,
@@ -1362,154 +1651,165 @@ async def process_recurring_charges(bot):
                             pass
                 continue
 
-            # Build idempotence key
-            idempotence_key = hashlib.md5(
-                f"recurring:{user.id}:{profile.id}:{tariff.id}:"
-                f"{tariff.price_rub:.2f}:{profile.payment_attempt_count}:"
-                f"{(profile.last_payment_attempt or now).isoformat()}".encode()
-            ).hexdigest()
+            renewal_platform = encode_intent("deferred", "renew", sub.id)
+            # Persist the recurring billing intent before the provider POST.
+            # This gives an ambiguous create a durable local operation to
+            # reconcile and guarantees retries reuse the same key and payload.
+            operation_payment = await session.scalar(
+                select(Payment).where(
+                    Payment.provider_idempotence_key == profile.recurring_operation_key,
+                    Payment.method == PaymentMethod.YOOKASSA,
+                ).limit(1)
+            )
+            if not operation_payment:
+                operation_payment = Payment(
+                    user_id=user.id,
+                    subscription_id=None,
+                    tariff_id=tariff.id,
+                    amount=operation_amount_kopecks,
+                    currency="RUB",
+                    method=PaymentMethod.YOOKASSA,
+                    status=PaymentStatus.PENDING,
+                    provider_payment_id=None,
+                    provider_idempotence_key=profile.recurring_operation_key,
+                    telegram_chat_id=user.telegram_id,
+                    purchase_kopecks=operation_amount_kopecks,
+                    discount_kopecks=0,
+                    platform=renewal_platform,
+                    provisioning_failure_code="recurring_create_pending",
+                )
+                session.add(operation_payment)
+                await session.flush()
+                await session.commit()
 
             res, payment_id, yk_status = await create_recurring_yookassa_payment(
-                payment_method_id=profile.provider_payment_method_id,
-                amount_rub=float(tariff.price_rub),
-                description=f"Автопродление {tariff.label}",
+                payment_method_id=operation_payment_method_id,
+                amount_rub=kopecks_to_rub_float(operation_amount_kopecks),
+                amount_kopecks=operation_amount_kopecks,
+                description=operation_description,
                 user_id=user.id,
                 tariff_id=tariff.id,
-                idempotence_key=idempotence_key,
+                idempotence_key=profile.recurring_operation_key,
+                telegram_user_id=user.telegram_id,
+                platform=renewal_platform,
+                subscription_id=sub.id,
+                recurring_profile_id=profile.id,
             )
 
+            if payment_id:
+                profile.recurring_operation_provider_payment_id = payment_id
+                await session.commit()
+
+            if payment_id and res != "succeeded":
+                existing_recurring_payment = await session.scalar(
+                    select(Payment).where(Payment.provider_payment_id == payment_id).limit(1)
+                )
+                if not existing_recurring_payment:
+                    existing_recurring_payment = operation_payment
+                existing_recurring_payment.provider_payment_id = payment_id
+                existing_recurring_payment.status = PaymentStatus.PENDING if res == "pending" else PaymentStatus.FAILED
+                existing_recurring_payment.provider_status = yk_status or res
+                existing_recurring_payment.provider_paid = False
+                existing_recurring_payment.provider_amount_kopecks = operation_amount_kopecks
+                existing_recurring_payment.provider_currency = "RUB"
+                existing_recurring_payment.provider_verified_at = now
+                existing_recurring_payment.provisioning_failure_code = (
+                    "recurring_provider_pending" if res == "pending" else "recurring_provider_failed"
+                )
+                await session.commit()
+
             payment_label = profile.payment_method_label or profile.provider
-            user_info = fmt_user(user.telegram_id, user.username, user.full_name)
 
             if res == "succeeded":
-                # Extend subscription
-                try:
-                    new_sub, vpn_key = await create_or_extend_paid_access(
-                        session,
-                        user=user,
-                        tariff=tariff,
-                        platform=sub.platform,
-                        purchase_action="renew",
-                        target_subscription_id=sub.id,
-                    )
-                except AccessProvisionError as issue:
-                    profile.is_active = False
-                    session.add(Payment(
-                        user_id=user.id,
-                        subscription_id=sub.id if sub else None,
-                        amount=tariff.price_rub * 100,
-                        currency="RUB",
-                        method=PaymentMethod.YOOKASSA,
-                        status=PaymentStatus.COMPLETED,
-                        provider_payment_id=payment_id,
-                        telegram_chat_id=user.telegram_id,
-                    ))
+                # Ensure durable Payment entity exists BEFORE provisioning
+                if not payment_id:
+                    operation_payment.provider_status = yk_status or "succeeded"
+                    operation_payment.provider_paid = True
+                    operation_payment.provider_amount_kopecks = operation_amount_kopecks
+                    operation_payment.provider_currency = "RUB"
+                    operation_payment.provider_verified_at = now
+                    operation_payment.provisioning_failure_code = "recurring_missing_provider_id"
                     await session.commit()
-                    plog(
-                        "ОШИБКА_ВЫДАЧИ",
-                        provider=issue.provider.upper(),
-                        user_id=user.telegram_id,
-                        tariff=tariff.label,
-                        method="autopay",
-                        code=issue.code,
-                        status=issue.status or "",
-                        PayId=payment_id or "",
-                    )
-                    try:
-                        support_line = (
-                            f"\nЕсли вопрос срочный, напишите в поддержку {settings.support_username}."
-                            if settings.support_username else ""
-                        )
-                        await bot.send_message(
-                            user.telegram_id,
-                            f"❌ {issue.client_message}\nАвтопродление временно приостановлено.{support_line}",
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        pass
-                    await notify_admins_issue(
-                        bot,
-                        title="Ошибка автопродления после успешного списания",
-                        details=[
-                            f"Пользователь: {user_info}",
-                            f"Тариф: {tariff.label}",
-                            f"Сумма: {tariff.price_rub}₽",
-                            f"Провайдер: {issue.provider}",
-                            f"Код: {issue.code}",
-                            f"HTTP статус: {issue.status or '—'}",
-                            f"PayId: {payment_id or '—'}",
-                            f"Причина: {issue.admin_message}",
-                        ],
-                    )
                     logger.error(
-                        "Recurring payment charged but delivery failed: user=%s tariff=%s payment=%s issue=%s",
-                        user.telegram_id,
-                        tariff.label,
-                        payment_id,
-                        issue.admin_message,
+                        "Recurring YooKassa create returned succeeded without a provider payment ID: profile=%s",
+                        profile.id,
                     )
                     continue
-                profile.payment_attempt_count = 0
-                profile.last_payment_attempt = None
-                profile.last_charge_at = now
-                if new_sub:
-                    profile.subscription_id = new_sub.id
-                    profile.next_charge_at = new_sub.expires_at
 
-                    # Record payment
-                    session.add(Payment(
-                        user_id=user.id,
-                        subscription_id=new_sub.id,
-                        amount=tariff.price_rub * 100,
-                        currency="RUB",
-                        method=PaymentMethod.YOOKASSA,
-                        status=PaymentStatus.COMPLETED,
-                        provider_payment_id=payment_id,
-                        telegram_chat_id=user.telegram_id,
-                    ))
+                payment = await session.scalar(
+                    select(Payment).where(Payment.provider_payment_id == payment_id).limit(1)
+                )
+                if not payment:
+                    payment = operation_payment
+                    payment.provider_payment_id = payment_id
+                else:
+                    payment.status = PaymentStatus.PENDING
+                    payment.provider_idempotence_key = payment.provider_idempotence_key or profile.recurring_operation_key
+                    payment.amount = operation_amount_kopecks
+                    payment.platform = payment.platform or renewal_platform
 
+                payment.status = PaymentStatus.PENDING
+                payment.amount = operation_amount_kopecks
+                payment.platform = payment.platform or renewal_platform
+                payment.provider_status = yk_status or "succeeded"
+                payment.provider_paid = True
+                payment.provider_amount_kopecks = operation_amount_kopecks
+                payment.provider_currency = "RUB"
+                payment.provider_verified_at = now
+
+                payment.provisioning_failure_code = "recurring_fulfillment_pending"
+
+                # Provider success is durable before any supplier mutation or
+                # fulfillment validation begins.
                 await session.commit()
-                charged += 1
 
-                expires_str = _format_date(new_sub.expires_at) if new_sub else "—"
-                try:
-                    await bot.send_message(
-                        user.telegram_id,
-                        RECURRING_CHARGE_SUCCESS.format(
-                            expires=expires_str,
-                            payment_method=payment_label,
-                            amount=tariff.price_rub,
-                        ),
-                        parse_mode="HTML",
+                # Route every recurring supplier operation through the same
+                # authenticated verification and payment lease used by
+                # webhook/reconciliation workers.  The provider-success
+                # snapshot above is durable before this call; this pipeline is
+                # the only owner allowed to mutate the supplier.
+                from bot.services.yookassa_reconciliation import verify_and_fulfill_yookassa_payment
+
+                fulfilled, fulfillment_code = await verify_and_fulfill_yookassa_payment(
+                    bot,
+                    payment_id,
+                    source="recurring_scheduler",
+                )
+                if not fulfilled:
+                    logger.info(
+                        "Recurring payment %s remains unresolved after canonical fulfillment: %s",
+                        payment_id,
+                        fulfillment_code,
                     )
-                except Exception:
-                    pass
+                    continue
 
-                for admin_id in settings.notification_recipient_ids:
-                    try:
-                        await bot.send_message(
-                            admin_id,
-                            f"🔔 Автопродление (YooKassa)\n"
-                            f"Пользователь: {user_info}\n"
-                            f"Тариф: {tariff.label}\n"
-                            f"Сумма: {tariff.price_rub}₽\n"
-                            f"До: {expires_str}",
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        pass
+                # VHQ background fulfillment returns success only for the
+                # durable pending state; its worker owns final completion.
+                if fulfillment_code == "supplier_fulfillment_pending":
+                    continue
 
-                plog("ПРОДЛЕНИЕ", provider="Yookassa", user_id=user.telegram_id,
-                     tariff=tariff.label, amount=f"{tariff.price_rub:.2f}",
-                     PayId=payment_id or "")
+                await session.refresh(payment)
+                await session.refresh(profile)
+                if payment.status != PaymentStatus.COMPLETED:
+                    continue
+
+                charged += 1
                 logger.info(
-                    "Recurring charge succeeded: user=%s, tariff=%s, payment=%s",
-                    user.telegram_id, tariff.label, payment_id,
+                    "Recurring charge fulfilled through canonical payment pipeline: user=%s tariff=%s payment=%s",
+                    user.telegram_id,
+                    tariff.label,
+                    payment_id,
                 )
 
             elif res == "deactivate":
                 profile.is_active = False
                 profile.consent_granted = False
+                profile.recurring_operation_key = None
+                profile.recurring_operation_amount_kopecks = None
+                profile.recurring_operation_description = None
+                profile.recurring_operation_payment_method_id = None
+                profile.recurring_operation_provider_payment_id = None
+                profile.recurring_operation_started_at = None
                 await session.commit()
 
                 try:
@@ -1568,6 +1868,13 @@ async def process_recurring_charges(bot):
                 attempt_num = profile.payment_attempt_count + 1
                 profile.payment_attempt_count = attempt_num
                 profile.last_payment_attempt = now
+                if res == "failed":
+                    profile.recurring_operation_key = None
+                    profile.recurring_operation_amount_kopecks = None
+                    profile.recurring_operation_description = None
+                    profile.recurring_operation_payment_method_id = None
+                    profile.recurring_operation_provider_payment_id = None
+                    profile.recurring_operation_started_at = None
                 plog("ОШИБКА_СПИСАНИЯ", provider="Yookassa",
                      user_id=user.telegram_id, попытка=f"{attempt_num}/{MAX_PAYMENT_ATTEMPTS}",
                      tariff=tariff.label, amount=f"{tariff.price_rub:.2f}")
@@ -1798,3 +2105,222 @@ async def check_webstore_health(bot) -> None:
                 f"Время UTC: {now.isoformat(timespec='seconds')}",
             ],
         )
+
+
+async def process_vhq_subscription_fulfillments(bot) -> None:
+    """Background worker processing pending, retry_wait, uncertain VHQ fulfillments and re-claiming stale processing leases."""
+    now = datetime.utcnow()
+
+    async with async_session() as session:
+        query = (
+            select(VhqSubscriptionFulfillment.id)
+            .where(
+                or_(
+                    and_(
+                        VhqSubscriptionFulfillment.status.in_(("pending", "retry_wait", "uncertain")),
+                        or_(
+                            VhqSubscriptionFulfillment.next_attempt_at.is_(None),
+                            VhqSubscriptionFulfillment.next_attempt_at <= now,
+                        ),
+                    ),
+                    and_(
+                        VhqSubscriptionFulfillment.status == "processing",
+                        or_(
+                            VhqSubscriptionFulfillment.lease_expires_at.is_(None),
+                            VhqSubscriptionFulfillment.lease_expires_at <= now,
+                        ),
+                    ),
+                    and_(
+                        VhqSubscriptionFulfillment.status.in_(("buy_inflight", "renew_inflight")),
+                        or_(
+                            VhqSubscriptionFulfillment.lease_expires_at.is_(None),
+                            VhqSubscriptionFulfillment.lease_expires_at <= now,
+                        ),
+                    ),
+                )
+            )
+            .order_by(VhqSubscriptionFulfillment.id.asc())
+            .limit(10)
+        )
+        candidate_ids = (await session.scalars(query)).all()
+
+    for cid in candidate_ids:
+        has_completed_oneoff_payment = False
+        async with async_session() as session:
+            ff_quick = await session.get(VhqSubscriptionFulfillment, cid)
+            if not ff_quick:
+                continue
+
+            # Crash safety: detect stale buy_inflight after crash and never reissue buy!
+            if ff_quick.status == "buy_inflight":
+                if ff_quick.lease_expires_at and ff_quick.lease_expires_at > datetime.utcnow():
+                    logger.info(
+                        "Fulfillment %s has active buy_inflight lease until %s. Leaving untouched.",
+                        cid,
+                        ff_quick.lease_expires_at,
+                    )
+                    continue
+                ff_quick.status = "manual_review"
+                ff_quick.lease_token = None
+                ff_quick.lease_expires_at = None
+                ff_quick.last_error_code = "stale_buy_inflight"
+                ff_quick.last_error_message = (
+                    "Crash recovery: stale buy_inflight detected. Duplicate buy prohibited."
+                )
+                if ff_quick.manual_operation_id:
+                    manual_op = await session.get(ManualSubscriptionOperation, ff_quick.manual_operation_id)
+                    if manual_op:
+                        manual_op.status = "manual_review"
+                await session.commit()
+                logger.critical("Fulfillment %s had stale buy_inflight. Moved to manual_review.", cid)
+                await notify_admins_issue(
+                    bot,
+                    title="VHQ Fallback Buy: обнаружен stale buy_inflight (manual_review)",
+                    details=[
+                        f"Fulfillment ID: {cid}",
+                        f"Subscription ID: {ff_quick.subscription_id}",
+                        f"Ошибка: stale buy_inflight после сбоя процесса",
+                    ],
+                )
+                continue
+
+            if ff_quick.status == "renew_inflight":
+                if ff_quick.lease_expires_at and ff_quick.lease_expires_at > datetime.utcnow():
+                    logger.info(
+                        "Fulfillment %s has active renew_inflight lease until %s. Leaving untouched.",
+                        cid,
+                        ff_quick.lease_expires_at,
+                    )
+                    continue
+
+            if not await _claim_vhq_fulfillment_for_execution(session, ff_quick):
+                continue
+
+            fulfillment = ff_quick
+            token = fulfillment.lease_token
+            if not fulfillment or not token:
+                continue
+
+            try:
+                await execute_vhq_fulfillment(
+                    session,
+                    fulfillment,
+                    lease_token=token,
+                )
+                if fulfillment.status == "completed":
+                    # 1. Update manual operation if linked
+                    if fulfillment.manual_operation_id:
+                        manual_op = await session.get(ManualSubscriptionOperation, fulfillment.manual_operation_id)
+                        if manual_op:
+                            manual_op.status = "completed"
+                            manual_op.completed_at = datetime.utcnow()
+                            if (
+                                fulfillment.baseline_local_expires_at
+                                and fulfillment.baseline_local_expires_at <= datetime.utcnow()
+                            ):
+                                target_sub = await session.get(Subscription, fulfillment.subscription_id)
+                                target_user = await session.get(User, fulfillment.user_id)
+                                if target_sub and target_user and bot:
+                                    try:
+                                        from bot.utils.texts import MANUAL_KEY_DELIVERED
+                                        from bot.services.vhq_subscription_proxy import build_vhq_subscription_ref_url
+                                        exp_str = _format_date(target_sub.expires_at)
+                                        customer_url = build_vhq_subscription_ref_url(target_sub.id) or target_sub.vpn_key
+                                        key_display = customer_url if len(customer_url) <= 200 else customer_url[:200] + "..."
+                                        await bot.send_message(
+                                            target_user.telegram_id,
+                                            MANUAL_KEY_DELIVERED.format(key=key_display, expires=exp_str),
+                                            parse_mode="HTML",
+                                        )
+                                    except Exception as exc:
+                                        logger.warning("Failed to send background manual renew notification: %s", exc)
+
+                    # 2. Finalize payment if linked
+                    if fulfillment.payment_id:
+                        payment = await session.get(Payment, fulfillment.payment_id)
+                        if payment:
+                            payment.subscription_id = fulfillment.subscription_id
+                            # Provider truth is already durable before this
+                            # worker runs.  Business completion is only
+                            # terminal after the fulfillment reached
+                            # ``completed``.
+                            payment.status = PaymentStatus.COMPLETED
+                            payment.provisioning_failure_code = (
+                                None
+                                if fulfillment.recurring_profile_id
+                                else "financial_finalization_pending"
+                            )
+                        if not fulfillment.recurring_profile_id:
+                            has_completed_oneoff_payment = True
+
+                    # 3. Finalize recurring payment profile ONLY if fulfillment has a linked recurring_profile_id
+                    if fulfillment.recurring_profile_id:
+                        rec_profile = await session.get(RecurringPaymentProfile, fulfillment.recurring_profile_id)
+                        if rec_profile and fulfillment.target_local_expires_at:
+                            rec_profile.payment_attempt_count = 0
+                            rec_profile.last_payment_attempt = None
+                            rec_profile.next_charge_at = fulfillment.target_local_expires_at
+                            rec_profile.last_charge_at = datetime.utcnow()
+                            rec_profile.recurring_operation_key = None
+                            rec_profile.recurring_operation_amount_kopecks = None
+                            rec_profile.recurring_operation_description = None
+                            rec_profile.recurring_operation_payment_method_id = None
+                            rec_profile.recurring_operation_provider_payment_id = None
+                            rec_profile.recurring_operation_started_at = None
+                            rec_user = await session.get(User, fulfillment.user_id)
+                            if rec_user and bot:
+                                try:
+                                    from bot.utils.texts import RECURRING_CHARGE_SUCCESS
+                                    exp_str = _format_date(fulfillment.target_local_expires_at)
+                                    payment_label = rec_profile.payment_method_label or rec_profile.provider
+                                    rec_tariff = await session.get(Tariff, rec_profile.tariff_id) if rec_profile.tariff_id else None
+                                    amount_val = rec_tariff.price_rub if rec_tariff else 0
+                                    await bot.send_message(
+                                        rec_user.telegram_id,
+                                        RECURRING_CHARGE_SUCCESS.format(
+                                            expires=exp_str,
+                                            payment_method=payment_label,
+                                            amount=amount_val,
+                                        ),
+                                        parse_mode="HTML",
+                                    )
+                                except Exception as exc:
+                                    logger.warning("Failed to send recurring success after worker fulfillment: %s", exc)
+                elif fulfillment.status in ("manual_review", "failed"):
+                    if fulfillment.manual_operation_id:
+                        manual_op = await session.get(ManualSubscriptionOperation, fulfillment.manual_operation_id)
+                        if manual_op:
+                            manual_op.status = fulfillment.status
+            except Exception as exc:
+                logger.exception("Error executing VHQ fulfillment %s: %s", cid, exc)
+                fulfillment.status = "uncertain"
+                fulfillment.next_attempt_at = datetime.utcnow() + timedelta(seconds=30)
+                fulfillment.last_error_code = "worker_exception"
+                fulfillment.last_error_message = str(exc)
+            finally:
+                if fulfillment.status != "processing":
+                    fulfillment.lease_token = None
+                    fulfillment.lease_expires_at = None
+                await session.commit()
+
+            if fulfillment.status == "manual_review":
+                try:
+                    await notify_admins_issue(
+                        bot,
+                        title="Требуется ручная проверка VHQ продления",
+                        details=[
+                            f"Fulfillment ID: {fulfillment.id}",
+                            f"Subscription ID: {fulfillment.subscription_id}",
+                            f"Action: {fulfillment.action}",
+                            f"Source: {fulfillment.source_type}:{fulfillment.source_id}",
+                            f"Код ошибки: {fulfillment.last_error_code or '—'}",
+                            f"Ошибка: {fulfillment.last_error_message or '—'}",
+                        ],
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to notify admins of VHQ manual_review: %s", exc)
+
+            # Trigger canonical payment finalizer once for completed one-off payments
+            if has_completed_oneoff_payment and bot:
+                await auto_retry_failed_provisionings(bot)
+

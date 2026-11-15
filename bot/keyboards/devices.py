@@ -98,6 +98,7 @@ def adapt_devices_kb(sub_id: int, devices: list[dict]) -> InlineKeyboardMarkup:
             )
 
     builder.row(
-        InlineKeyboardButton(text="◀️ Назад в профиль", callback_data="profile")
+        InlineKeyboardButton(text="◀️ К подписке", callback_data="my_keys_1"),
+        InlineKeyboardButton(text="В профиль", callback_data="profile"),
     )
     return builder.as_markup()

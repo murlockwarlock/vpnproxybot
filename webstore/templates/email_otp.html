@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Подтверждение email — {{SITE_NAME}}</title>
+  <link rel="icon" type="image/svg+xml" href="/api/store/favicon">
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; color: #12212b; font: 16px "Manrope", "Segoe UI", sans-serif; background: linear-gradient(180deg, #fff8ef, #f2eadf); }
+    main { width: min(460px, calc(100% - 32px)); margin: 8vh auto; padding: 28px 24px; background: rgba(255, 250, 243, .86); border: 1px solid rgba(18, 33, 43, .12); border-radius: 28px; box-shadow: 0 18px 44px rgba(20, 44, 54, .14); }
+    h1 { margin: 0 0 12px; font-size: clamp(1.5rem, 4vw, 2rem); }
+    p { line-height: 1.5; overflow-wrap: anywhere; }
+    label { display: block; margin: 16px 0 6px; font-weight: 700; }
+    input, .primary { width: 100%; min-height: 48px; padding: 12px 14px; border: 1px solid rgba(18, 33, 43, .16); border-radius: 12px; font: inherit; }
+    input { background: white; }
+    #code { font-size: 1.35rem; letter-spacing: .3em; text-align: center; }
+    .primary { margin-top: 14px; background: linear-gradient(135deg, #0c8c8c, #0f5e63); color: white; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: default; }
+    .secondary { min-height: 44px; padding: 8px 0; border: 0; background: transparent; color: #0f5e63; font: inherit; text-decoration: underline; cursor: pointer; }
+    a { color: #0f5e63; }
+    #error { color: #b3273d; }
+    #notice { color: #0f5e63; }
+    .muted { color: #5c6c75; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+<main>
+  <div id="codeStep">
+    <h1>Проверьте почту</h1>
+    <p>Мы отправили шестизначный код на <strong id="email"></strong>. Проверьте Входящие и Спам.</p>
+    <form id="codeForm">
+      <label for="code">Код из письма</label>
+      <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required>
+      <button class="primary" id="verifyButton" type="submit">Подтвердить</button>
+    </form>
+    <button class="secondary" id="resendButton" type="button" disabled>Отправить код повторно</button>
+    <p class="muted" id="timer" aria-live="polite"></p>
+  </div>
+  <div id="passwordStep" hidden>
+    <h1>Новый пароль</h1>
+    <form id="passwordForm">
+      <label for="password">Новый пароль</label>
+      <input id="password" type="password" autocomplete="new-password" minlength="8" required>
+      <label for="password2">Повторите пароль</label>
+      <input id="password2" type="password" autocomplete="new-password" minlength="8" required>
+      <button class="primary" id="passwordButton" type="submit">Сохранить пароль</button>
+    </form>
+  </div>
+  <p id="error" role="alert"></p>
+  <p id="notice" role="status"></p>
+  <a id="changeEmail" href="/buy?auth=register">Изменить email</a>
+</main>
+<script>
+  const storageKey = "darimiru_otp";
+  let state;
+  try { state = JSON.parse(sessionStorage.getItem(storageKey) || "null"); } catch { state = null; }
+  const error = document.getElementById("error");
+  const notice = document.getElementById("notice");
+  const codeStep = document.getElementById("codeStep");
+  const passwordStep = document.getElementById("passwordStep");
+  const resend = document.getElementById("resendButton");
+  const timer = document.getElementById("timer");
+  const change = document.getElementById("changeEmail");
+  let deadline = 0;
+  let timerId;
+
+  function saveState() { sessionStorage.setItem(storageKey, JSON.stringify(state)); }
+  function updateTimer(seconds) {
+    deadline = Date.now() + Math.max(0, seconds) * 1000;
+    clearInterval(timerId);
+    const tick = () => {
+      const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      resend.disabled = remaining > 0;
+      timer.textContent = remaining ? `Повторная отправка через ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}` : '';
+      if (!remaining) clearInterval(timerId);
+    };
+    tick();
+    if (seconds > 0) timerId = setInterval(tick, 1000);
+  }
+  async function api(path, body) {
+    const response = await fetch(`/api/store/auth/otp/${path}`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    return {response, data: await response.json()};
+  }
+  function showPassword() {
+    codeStep.hidden = true;
+    passwordStep.hidden = false;
+    document.getElementById('password').focus();
+  }
+  function showError(message) { error.textContent = message; notice.textContent = ''; }
+  change.addEventListener('click', () => sessionStorage.removeItem(storageKey));
+  document.getElementById('code').addEventListener('input', event => {
+    event.target.value = event.target.value.replace(/[^0-9]/g, '').slice(0, 6);
+  });
+  document.getElementById('codeForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const code = document.getElementById('code').value;
+    if (!/^\d{6}$/.test(code)) { showError('Введите шесть цифр из письма.'); return; }
+    const button = document.getElementById('verifyButton');
+    button.disabled = true;
+    button.textContent = 'Проверяем…';
+    try {
+      const {response, data} = await api('verify', {challenge: state.challenge, code, email: state.email, purpose: state.purpose, support_recovery_id: state.support_recovery_id});
+      if (!response.ok) {
+        if (response.status === 409 && data.next === 'login') {
+          sessionStorage.removeItem(storageKey);
+          change.href = '/profile#forgot';
+          change.textContent = 'Восстановить пароль';
+          resend.disabled = true;
+        }
+        showError(data.error || 'Не удалось проверить код.');
+        document.getElementById('code').value = '';
+        return;
+      }
+      if (data.next === 'password') {
+        state.step = 'password';
+        saveState();
+        error.textContent = '';
+        showPassword();
+      } else {
+        const destination = state.purpose === 'register' && /^\/buy(?:\?|$)/.test(state.returnTo || '') ? state.returnTo : '/profile';
+        sessionStorage.removeItem(storageKey);
+        window.location.assign(destination);
+      }
+    } catch { showError('Ошибка соединения. Попробуйте ещё раз.'); }
+    finally { button.disabled = false; button.textContent = 'Подтвердить'; }
+  });
+  resend.addEventListener('click', async () => {
+    resend.disabled = true;
+    error.textContent = '';
+    notice.textContent = '';
+    try {
+      const {response, data} = await api('resend', {challenge: state.challenge});
+      if (!response.ok) {
+        showError(data.error || 'Не удалось отправить код. Начните заново.');
+        if (response.status === 429) updateTimer(data.retry_after || 0);
+        else resend.disabled = true;
+        return;
+      }
+      document.getElementById('code').value = '';
+      notice.textContent = 'Новый код отправлен. Проверьте почту.';
+      updateTimer(data.retry_after || 60);
+    } catch { showError('Ошибка соединения. Попробуйте ещё раз.'); resend.disabled = false; }
+  });
+  document.getElementById('passwordForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const password = document.getElementById('password').value;
+    const password2 = document.getElementById('password2').value;
+    if (password.length < 8 || password !== password2) { showError('Пароли должны совпадать и содержать не менее 8 знаков.'); return; }
+    const button = document.getElementById('passwordButton');
+    button.disabled = true;
+    button.textContent = 'Сохраняем…';
+    try {
+      const {response, data} = await api('reset', {password, password2});
+      if (!response.ok) { showError(data.error || 'Не удалось сохранить пароль.'); return; }
+      sessionStorage.removeItem(storageKey);
+      window.location.assign('/profile');
+    } catch { showError('Ошибка соединения. Попробуйте ещё раз.'); }
+    finally { button.disabled = false; button.textContent = 'Сохранить пароль'; }
+  });
+  async function initialize() {
+    if (!state || !state.challenge || !state.email || !['register', 'reset', 'support'].includes(state.purpose)) {
+      codeStep.hidden = true;
+      showError('Начните регистрацию или восстановление заново.');
+      return;
+    }
+    change.href = state.purpose === 'reset' ? '/profile#forgot' : state.purpose === 'support' ? '/support' : '/buy?auth=register';
+    if (state.purpose === 'support') document.querySelector('#codeStep h1').textContent = 'Подтвердите новый email';
+    document.getElementById('email').textContent = state.email;
+    if (state.step === 'password' && ['reset', 'support'].includes(state.purpose)) { showPassword(); return; }
+    try {
+      const {response, data} = await api('status', {challenge: state.challenge});
+      if (!response.ok) {
+        if (response.status === 410 || data.expired) {
+          showError('Код истёк. Запросите новый код.');
+          resend.disabled = false;
+        } else {
+          showError('Сессия подтверждения недействительна. Начните заново.');
+          resend.disabled = true;
+        }
+        return;
+      }
+      state.email = data.email;
+      state.purpose = data.purpose;
+      saveState();
+      document.getElementById('email').textContent = state.email;
+      if (data.locked) showError('Слишком много неверных попыток. Запросите новый код.');
+      updateTimer(data.retry_after || 0);
+      document.getElementById('code').focus();
+    } catch { showError('Не удалось проверить состояние кода. Обновите страницу.'); }
+  }
+  initialize();
+</script>
+</body>
+</html>

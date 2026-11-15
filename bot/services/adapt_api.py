@@ -23,25 +23,10 @@ def can_upgrade_after_minimum_custom_renew(
     current_plan: dict[str, Any] | None,
     target_plan: dict[str, Any] | None,
 ) -> bool:
-    """Return whether Adapt's post-reactivation upgrade charge stays positive."""
-    if not current_plan or not target_plan:
-        return False
-    current_uuid = str(current_plan.get("uuid") or current_plan.get("plan_uuid") or "").strip()
-    target_uuid = str(target_plan.get("uuid") or target_plan.get("plan_uuid") or "").strip()
-    if not current_uuid or not target_uuid:
-        return False
-    if current_uuid == target_uuid:
-        return True
-    try:
-        current_price = float(current_plan["price_usd"])
-        current_days = int(current_plan["days"])
-        target_price = float(target_plan["price_usd"])
-    except (KeyError, TypeError, ValueError):
-        return False
-    if current_days <= 0:
-        return False
-    remaining_value = current_price / current_days * ADAPT_MIN_CUSTOM_RENEW_DAYS
-    return target_price - remaining_value > 0
+    """Return whether target_plan is an eligible Adapt upgrade from current_plan."""
+    from bot.services.subscription_semantics import is_adapt_provider_upgrade_eligible
+
+    return is_adapt_provider_upgrade_eligible(current_plan, target_plan)
 
 
 class AdaptAPIError(RuntimeError):
@@ -62,10 +47,35 @@ class AdaptAPI:
         api_key: str | None = None,
         base_url: str | None = None,
     ) -> None:
-        self.api_id = api_id if api_id is not None else int(os.getenv("ADAPT_API_ID", "0"))
-        self.api_key = (
-            api_key if api_key is not None else os.getenv("ADAPT_API_KEY", "")
-        ).strip()
+        if api_id is not None:
+            self.api_id = api_id
+        else:
+            raw_id = os.getenv("ADAPT_API_ID")
+            if raw_id:
+                try:
+                    self.api_id = int(raw_id)
+                except ValueError:
+                    self.api_id = 0
+            else:
+                try:
+                    from bot.config import settings
+                    self.api_id = int(getattr(settings, "adapt_api_id", 0) or 0)
+                except Exception:
+                    self.api_id = 0
+
+        if api_key is not None:
+            self.api_key = api_key.strip()
+        else:
+            raw_key = os.getenv("ADAPT_API_KEY", "").strip()
+            if raw_key:
+                self.api_key = raw_key
+            else:
+                try:
+                    from bot.config import settings
+                    self.api_key = str(getattr(settings, "adapt_api_key", "") or "").strip()
+                except Exception:
+                    self.api_key = ""
+
         self.base_url = (
             base_url if base_url is not None else os.getenv("ADAPT_BASE_URL", _DEFAULT_BASE_URL)
         ).strip().rstrip("/")

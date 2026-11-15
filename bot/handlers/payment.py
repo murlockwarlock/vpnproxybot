@@ -6,7 +6,7 @@ import asyncio
 import logging
 import math
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -25,6 +25,7 @@ from bot.models import (
     BalanceTopUp,
     Payment,
     PaymentMethod,
+    PaymentNotificationOutbox,
     PaymentStatus,
     Platform,
     RobokassaPayment,
@@ -39,6 +40,13 @@ from bot.services.balance_service import credit_user_balance, debit_user_balance
 from bot.services import vpn_manager
 from bot.services.client_names import build_client_name
 from bot.services.device_slots import get_included_device_slots, get_max_device_slots
+from bot.services.money import (
+    MIN_YOOKASSA_KOPECKS,
+    canonical_discount_and_payable,
+    kopecks_to_rub_float,
+    kopecks_to_rub_string,
+    rub_to_kopecks,
+)
 from bot.services.notifications import notify_admins_issue, notify_admins_payment, notify_expiring, notify_staff_text
 from bot.services.payment_logger import plog
 from bot.services.payment_service import (
@@ -60,6 +68,10 @@ from bot.services.tariff_rules import (
     can_purchase_intro_basic_tariff,
 )
 from bot.services.vhq_routing import is_vhq_tariff
+from bot.services.payment_notification_outbox import (
+    enqueue_subscription_delivery,
+    process_payment_notification_outbox,
+)
 from bot.utils.texts import (
     ERROR,
     GUIDE_ANDROID,
@@ -193,10 +205,11 @@ async def _send_subscription_key_for_platform(
             return False
         subscription.platform = platform
         user.platform = platform
-        vpn_key = subscription.vpn_key
         client_name = subscription.client_name
         expires_str = subscription.expires_at.strftime("%d.%m.%Y") if subscription.expires_at else "N/A"
         explanation = await _get_key_change_explanation(session, user.id, subscription.id, client_name)
+        from bot.services.vhq_subscription_proxy import get_subscription_display_key
+        vpn_key = get_subscription_display_key(subscription) or subscription.vpn_key
         await session.commit()
 
     if not vpn_key:
@@ -270,13 +283,60 @@ async def deliver_paid_key_for_platform(callback: CallbackQuery) -> None:
         await callback.answer("Некорректный ключ", show_alert=True)
         return
     platform = _platform_from_str("_".join(parts[2:]))
-    delivered = await _send_subscription_key_for_platform(
-        callback.bot,
-        callback.message.chat.id,
-        callback.from_user.id,
-        subscription_id,
-        platform,
-    )
+    yookassa_payment_id = None
+    async with async_session() as session:
+        subscription = await session.get(Subscription, subscription_id)
+        owner = await session.get(User, subscription.user_id) if subscription else None
+        if not subscription or not owner or int(owner.telegram_id) != int(callback.from_user.id):
+            await callback.answer("Ключ не найден. Напишите в поддержку.", show_alert=True)
+            return
+        yookassa_payment = await session.scalar(
+            select(Payment)
+            .where(Payment.subscription_id == subscription_id)
+            .where(Payment.method == PaymentMethod.YOOKASSA)
+            .where(Payment.status == PaymentStatus.COMPLETED)
+            .order_by(Payment.id.desc())
+            .limit(1)
+        )
+        if yookassa_payment:
+            yookassa_payment_id = yookassa_payment.id
+            outbox_row = await session.scalar(
+                select(PaymentNotificationOutbox)
+                .where(PaymentNotificationOutbox.payment_id == yookassa_payment.id)
+                .where(PaymentNotificationOutbox.kind == "subscription_delivery")
+                .limit(1)
+            )
+            if outbox_row is None:
+                outbox_row = await enqueue_subscription_delivery(
+                    session,
+                    payment_id=yookassa_payment.id,
+                    recipient_telegram_id=callback.message.chat.id,
+                    telegram_user_id=callback.from_user.id,
+                    subscription_id=subscription_id,
+                    delivery_platform=platform.value,
+                    needs_platform_choice=False,
+                )
+            await session.commit()
+        else:
+            outbox_row = None
+
+    if yookassa_payment_id is not None:
+        stats = await process_payment_notification_outbox(
+            callback.bot,
+            payment_id=yookassa_payment_id,
+            limit=10,
+            kind="subscription_delivery",
+            session_factory=async_session,
+        )
+        delivered = stats["sent"] > 0 or outbox_row.status == "sent"
+    else:
+        delivered = await _send_subscription_key_for_platform(
+            callback.bot,
+            callback.message.chat.id,
+            callback.from_user.id,
+            subscription_id,
+            platform,
+        )
     if not delivered:
         await callback.answer("Ключ не найден. Напишите в поддержку.", show_alert=True)
         return
@@ -416,10 +476,8 @@ def _topup_text(balance_rub: float, daily_rate: float, amount_rub: int | None = 
         f"Сейчас на балансе: <b>{balance_rub:.2f} ₽</b>",
         "",
         "Можно купить тариф как обычно или пополнить баланс на любую сумму.",
-        f"Если включить ежедневные списания, доступ будет продлеваться автоматически по <b>{daily_rate:.2f} ₽ в день</b>.",
         "Одна ссылка работает на 3 устройства.",
-        "Дополнительные устройства покупаются отдельно и в это списание не входят.",
-        "Если потом выключить списания, доступ останется до уже оплаченной даты.",
+        "Дополнительные устройства покупаются отдельно.",
         "Бонусы за приглашения тоже падают на этот же баланс.",
         "",
         "Можно пополнить баланс на любую сумму от <b>70 ₽</b> до <b>50 000 ₽</b>.",
@@ -558,10 +616,31 @@ async def _create_balance_topup_record(
             session.add(user)
             await session.flush()
 
+        if provider == "yookassa":
+            existing = await session.scalar(
+                select(BalanceTopUp)
+                .where(
+                    BalanceTopUp.user_id == user.id,
+                    BalanceTopUp.provider == "yookassa",
+                    BalanceTopUp.status == "pending",
+                    BalanceTopUp.amount_kopecks == rub_to_kopecks(amount_rub),
+                )
+                .order_by(BalanceTopUp.id.desc())
+                .limit(1)
+            )
+            if existing:
+                if existing.provider_status == "canceled" and existing.provider_paid is False:
+                    existing.status = "canceled"
+                    existing.provider_failure_code = "payment_canceled_at_provider"
+                    await session.flush()
+                else:
+                    return user.id, existing.id
+
         topup = BalanceTopUp(
             user_id=user.id,
             telegram_id=telegram_user.id,
             amount_rub=float(amount_rub),
+            amount_kopecks=rub_to_kopecks(amount_rub),
             provider=provider,
             status="pending",
             provider_payment_id=provider_payment_id,
@@ -569,6 +648,7 @@ async def _create_balance_topup_record(
         session.add(topup)
         await session.flush()
         topup_id = topup.id
+        topup.provider_idempotence_key = f"balance-topup-{topup_id}"
         if provider_payment_id is None:
             topup.provider_payment_id = str(topup_id)
         await session.commit()
@@ -600,7 +680,7 @@ async def initiate_telegram_topup(callback: CallbackQuery) -> None:
             payload=f"topup_{amount_rub}_{topup_id}",
             provider_token=settings.telegram_payment_provider_token,
             currency="RUB",
-            prices=[LabeledPrice(label="Пополнение баланса", amount=int(amount_rub * 100))],
+            prices=[LabeledPrice(label="Пополнение баланса", amount=rub_to_kopecks(amount_rub))],
         )
     except Exception as exc:
         logger.error("Telegram Pay topup invoice failed: %s", exc)
@@ -627,6 +707,23 @@ async def initiate_yookassa_topup(callback: CallbackQuery) -> None:
         provider="yookassa",
     )
 
+    async with async_session() as session:
+        topup = await session.get(BalanceTopUp, topup_id)
+        if topup and not topup.provider_idempotence_key:
+            topup.provider_failure_code = "yookassa_create_ambiguous_manual_review"
+            await session.commit()
+            await callback.answer("Предыдущая попытка пополнения требует проверки поддержки.", show_alert=True)
+            return
+        if topup and topup.provider_status == "succeeded" and topup.provider_paid is True:
+            await callback.answer("Это пополнение уже принято и ожидает зачисления.", show_alert=True)
+            return
+        if topup and topup.created_at and datetime.utcnow() - topup.created_at >= timedelta(hours=24):
+            topup.provider_failure_code = "yookassa_create_ambiguous_manual_review"
+            await session.commit()
+            await callback.answer("Предыдущая попытка платежа требует проверки поддержки.", show_alert=True)
+            return
+        topup_idempotence_key = topup.provider_idempotence_key if topup else f"balance-topup-{topup_id}"
+
     try:
         import yookassa
 
@@ -636,7 +733,7 @@ async def initiate_yookassa_topup(callback: CallbackQuery) -> None:
         def _create():
             return yookassa.Payment.create(
                 {
-                    "amount": {"value": f"{amount_rub:.2f}", "currency": "RUB"},
+                    "amount": {"value": kopecks_to_rub_string(rub_to_kopecks(amount_rub)), "currency": "RUB"},
                     "confirmation": {
                         "type": "redirect",
                         "return_url": settings.base_webhook_url or "https://t.me/",
@@ -650,12 +747,18 @@ async def initiate_yookassa_topup(callback: CallbackQuery) -> None:
                         "chat_id": str(callback.message.chat.id),
                     },
                 },
-                f"balance-topup-{topup_id}",
+                topup_idempotence_key,
             )
 
         payment = await asyncio.to_thread(_create)
     except Exception as exc:
         logger.error("Failed to create YooKassa topup: %s", exc)
+        async with async_session() as session:
+            topup = await session.get(BalanceTopUp, topup_id)
+            if topup and topup.provider_payment_id == str(topup_id):
+                topup.provider_failure_code = "yookassa_create_ambiguous"
+                topup.provider_idempotence_key = topup.provider_idempotence_key or f"balance-topup-{topup_id}"
+                await session.commit()
         await callback.answer("Не удалось создать платёж", show_alert=True)
         return
 
@@ -663,6 +766,8 @@ async def initiate_yookassa_topup(callback: CallbackQuery) -> None:
         topup = await session.get(BalanceTopUp, topup_id)
         if topup:
             topup.provider_payment_id = payment.id
+            topup.provider_idempotence_key = topup_idempotence_key
+            topup.provider_failure_code = None
             await session.commit()
 
     await callback.message.answer(
@@ -822,26 +927,24 @@ async def initiate_telegram_payment(callback: CallbackQuery) -> None:
         except ValueError as exc:
             await callback.answer(str(exc), show_alert=True)
             return
-        discount = 0.0
-        if use_bal == 1 and user:
-            discount = min(get_user_balance(user), purchase_price)
+        purchase_kopecks, discount_kopecks, payable_kopecks = canonical_discount_and_payable(
+            purchase_price,
+            get_user_balance(user) if use_bal == 1 else 0,
+            minimum_external_kopecks=7000,
+        )
 
-    if discount >= purchase_price and purchase_price > 0:
+    if discount_kopecks >= purchase_kopecks and purchase_kopecks > 0:
         await callback.answer("Баланса достаточно для полной оплаты. Используйте 'Оплатить с баланса'", show_alert=True)
         return
 
-    final_price_rub = float(purchase_price - discount)
-    
-    # Telegram Pay minimum is ~1 USD (approx 65-70 RUB). We set 70 RUB as safe minimum.
-    if 0 < final_price_rub < 70:
-        if use_bal == 1:
-            final_price_rub = 70.0
-            discount = float(purchase_price - final_price_rub)
-        else:
-            await callback.answer(f"Сумма к оплате ({final_price_rub} ₽) меньше минимальной (70 ₽).", show_alert=True)
-            return
+    if 0 < payable_kopecks < 7000:
+        await callback.answer(
+            f"Сумма к оплате ({kopecks_to_rub_string(payable_kopecks)} ₽) меньше минимальной (70 ₽).",
+            show_alert=True,
+        )
+        return
 
-    payload = f"{tariff_id}_{platform}_{discount}"
+    payload = f"{tariff_id}_{platform}_{kopecks_to_rub_string(discount_kopecks)}"
 
     try:
         await create_telegram_pay_invoice(
@@ -849,7 +952,7 @@ async def initiate_telegram_payment(callback: CallbackQuery) -> None:
             chat_id=callback.message.chat.id,
             tariff_id=tariff_id,
             tariff_label=tariff.label,
-            price_rub=final_price_rub,
+            price_rub=kopecks_to_rub_float(payable_kopecks),
             platform=platform,
             payload=payload,
             provider_token=settings.telegram_payment_provider_token,
@@ -903,10 +1006,11 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
 
         await callback.answer("Обрабатываем оплату…")
 
+        purchase_kopecks = rub_to_kopecks(purchase_price)
         debit_user_balance(
             session,
             user,
-            float(purchase_price),
+            kopecks_to_rub_float(purchase_kopecks),
             BalanceTransactionKind.TOPUP,
             f"Оплата тарифа «{tariff.label}» с баланса",
             source_type="tariff",
@@ -916,11 +1020,13 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
         payment = Payment(
             user_id=user.id,
             subscription_id=None,
-            amount=int(round(float(purchase_price) * 100)),
+            amount=purchase_kopecks,
             currency="RUB",
             method=PaymentMethod.BALANCE,
             status=PaymentStatus.COMPLETED,
             provider_payment_id="balance_" + str(uuid.uuid4()),
+            purchase_kopecks=purchase_kopecks,
+            discount_kopecks=0,
             tariff_id=tariff.id,
             platform=platform_str,
         )
@@ -961,7 +1067,8 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                     "adapt_renew_failed",
                     "adapt_upgrade_failed",
                 }
-                if not ambiguous_adapt:
+                vhq_pending = issue.provider == "vhq" and issue.code == "supplier_fulfillment_pending"
+                if not ambiguous_adapt and not vhq_pending:
                     credit_user_balance(
                         session,
                         user,
@@ -982,6 +1089,12 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                     status=issue.status or "",
                 )
                 await session.commit()
+                if vhq_pending:
+                    await callback.message.answer(
+                        f"⏳ {issue.client_message}",
+                        parse_mode="HTML",
+                    )
+                    return
                 await _notify_delivery_issue(
                     callback.bot,
                     telegram_id=callback.from_user.id,
@@ -995,7 +1108,7 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                 await notify_expiring(
                     callback.bot,
                     callback.from_user.id,
-                    f"⚠️ {_build_delivery_issue_text(issue, refunded_balance=not ambiguous_adapt)}",
+                    f"⚠️ {_build_delivery_issue_text(issue, refunded_balance=not ambiguous_adapt and not vhq_pending)}",
                 )
                 return
             if not subscription or not vpn_key:
@@ -1097,10 +1210,10 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
             await credit_referral(session, user.id, payment.id, float(tariff.price_rub), bot=callback.bot)
             await log_referral_payment(session, user.id, float(tariff.price_rub), bot=callback.bot)
 
-        # Partner logic
-        if user.partner_id:
-            from bot.services.payment_service import credit_partner
-            await credit_partner(session, user.id, payment.id, float(tariff.price_rub), bot=callback.bot)
+        # Partner and cashback logic
+        from bot.services.payment_service import credit_cashback, credit_partner
+        await credit_partner(session, user.id, payment.id, float(tariff.price_rub), bot=callback.bot)
+        await credit_cashback(session, user.id, payment.id, float(tariff.price_rub), bot=callback.bot)
 
         await session.commit()
         plog(
@@ -1203,41 +1316,101 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
             await callback.answer(str(exc), show_alert=True)
             return
 
-        # Calculate discount
-        discount = 0.0
-        if use_bal == 1:
-            discount = min(get_user_balance(user), purchase_price)
-        
-        if discount >= purchase_price and purchase_price > 0:
+        purchase_kopecks, discount_kopecks, payable_kopecks = canonical_discount_and_payable(
+            purchase_price,
+            get_user_balance(user) if use_bal == 1 else 0,
+            minimum_external_kopecks=MIN_YOOKASSA_KOPECKS,
+        )
+
+        if discount_kopecks >= purchase_kopecks and purchase_kopecks > 0:
             await callback.answer("Баланса достаточно для полной оплаты. Используйте 'Оплатить с баланса'", show_alert=True)
             return
-            
-        final_price_rub = float(purchase_price - discount)
-        
-        # YooKassa minimum is usually 10 RUB
-        if 0 < final_price_rub < 10:
-            if use_bal == 1:
-                final_price_rub = 10.0
-                discount = float(purchase_price - final_price_rub)
-            else:
-                await callback.answer(f"Сумма к оплате ({final_price_rub} ₽) меньше минимальной (10 ₽).", show_alert=True)
-                return
 
-        # Create pending payment record
-        payment = Payment(
-            user_id=user.id,
-            amount=int(final_price_rub * 100),  # rubles → kopecks
-            currency="RUB",
-            method=PaymentMethod.YOOKASSA,
-            status=PaymentStatus.PENDING,
-            telegram_chat_id=callback.message.chat.id,
-            discount_applied=discount,
-            tariff_id=tariff_id,
-            platform=platform_str,
+        if 0 < payable_kopecks < MIN_YOOKASSA_KOPECKS:
+            await callback.answer(
+                f"Сумма к оплате ({kopecks_to_rub_string(payable_kopecks)} ₽) меньше минимальной (10 ₽).",
+                show_alert=True,
+            )
+            return
+
+        # Reuse an ambiguous local operation for up to YooKassa's idempotence
+        # window. A fresh callback must not create a second financial intent.
+        payment = await session.scalar(
+            select(Payment)
+            .where(
+                Payment.user_id == user.id,
+                Payment.currency == "RUB",
+                Payment.method == PaymentMethod.YOOKASSA,
+                Payment.status == PaymentStatus.PENDING,
+                Payment.tariff_id == tariff_id,
+                Payment.platform == platform_str,
+            )
+            .order_by(Payment.id.desc())
+            .limit(1)
         )
-        session.add(payment)
-        await session.flush()
+        if not payment:
+            payment = Payment(
+                user_id=user.id,
+                amount=payable_kopecks,
+                currency="RUB",
+                method=PaymentMethod.YOOKASSA,
+                status=PaymentStatus.PENDING,
+                telegram_chat_id=callback.message.chat.id,
+                discount_applied=kopecks_to_rub_float(discount_kopecks),
+                purchase_kopecks=purchase_kopecks,
+                discount_kopecks=discount_kopecks,
+                tariff_id=tariff_id,
+                platform=platform_str,
+                provider_idempotence_key=None,
+            )
+            session.add(payment)
+            await session.flush()
+        elif payment.created_at and datetime.utcnow() - payment.created_at >= timedelta(hours=24):
+            if payment.provider_status == "canceled" and payment.provider_paid is False:
+                # A terminal, authenticated cancellation closes the abandoned
+                # intent.  Unknown outcomes remain fail-closed above.
+                payment.status = PaymentStatus.FAILED
+                payment.provisioning_failure_code = "payment_canceled_at_provider"
+                await session.flush()
+                payment = Payment(
+                    user_id=user.id,
+                    amount=payable_kopecks,
+                    currency="RUB",
+                    method=PaymentMethod.YOOKASSA,
+                    status=PaymentStatus.PENDING,
+                    telegram_chat_id=callback.message.chat.id,
+                    discount_applied=kopecks_to_rub_float(discount_kopecks),
+                    purchase_kopecks=purchase_kopecks,
+                    discount_kopecks=discount_kopecks,
+                    tariff_id=tariff_id,
+                    platform=platform_str,
+                    provider_idempotence_key=None,
+                )
+                session.add(payment)
+                await session.flush()
+            else:
+                payment.provisioning_failure_code = "yookassa_create_ambiguous_manual_review"
+                await session.commit()
+                await callback.answer("Предыдущая попытка платежа требует проверки поддержки.", show_alert=True)
+                return
+        elif not payment.provider_idempotence_key:
+            payment.provisioning_failure_code = "yookassa_create_ambiguous_manual_review"
+            await session.commit()
+            await callback.answer("Предыдущая попытка платежа требует проверки поддержки.", show_alert=True)
+            return
+        elif payment.provider_status == "succeeded" and payment.provider_paid is True:
+            await callback.answer("Этот платёж уже принят и ожидает завершения выдачи.", show_alert=True)
+            return
+        if not payment.provider_idempotence_key:
+            payment.provider_idempotence_key = f"bot-payment-{payment.id}"
+        else:
+            payable_kopecks = payment.amount
+            discount_kopecks = payment.discount_kopecks
+            if discount_kopecks is None:
+                discount_kopecks = rub_to_kopecks(payment.discount_applied or 0)
+            purchase_kopecks = payment.purchase_kopecks or (payable_kopecks + discount_kopecks)
         payment_id = payment.id
+        operation_idempotence_key = payment.provider_idempotence_key
         user_telegram_id = user.telegram_id
         await session.commit()
 
@@ -1251,10 +1424,19 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
             chat_id=callback.message.chat.id,
             return_url=return_url,
             tariff_label=tariff.label,
-            price_rub=float(final_price_rub),
+            price_kopecks=payable_kopecks,
+            local_payment_id=payment_id,
+            idempotence_key=operation_idempotence_key,
+            metadata={"payment_id": str(payment_id)},
         )
     except Exception as exc:
         logger.error(f"Failed to create YooKassa payment: {exc}")
+        async with async_session() as session:
+            payment_record = await session.get(Payment, payment_id)
+            if payment_record and not payment_record.provider_payment_id:
+                payment_record.provider_idempotence_key = payment_record.provider_idempotence_key or f"bot-payment-{payment_id}"
+                payment_record.provisioning_failure_code = "yookassa_create_ambiguous"
+                await session.commit()
         await callback.message.answer(
             "❌ Ошибка создания платежа. Попробуйте позже или используйте другой способ оплаты.",
             reply_markup=_single_back_kb(
@@ -1269,11 +1451,13 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
         payment_record = await session.get(Payment, payment_id)
         if payment_record:
             payment_record.provider_payment_id = yookassa_payment_id
+            payment_record.provider_idempotence_key = f"bot-payment-{payment_id}"
+            payment_record.provisioning_failure_code = None
         await session.commit()
 
     await callback.message.answer(
         f"💳 <b>Оплата через YooKassa</b>\n\n"
-        f"Тариф: <b>{tariff.label}</b> - {purchase_price}₽\n\n"
+        f"Тариф: <b>{tariff.label}</b> - {kopecks_to_rub_string(purchase_kopecks)}₽\n\n"
         f"<i>Ключ будет отправлен сюда автоматически после оплаты.</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1666,6 +1850,12 @@ async def process_successful_payment(message: Message) -> None:
                     **_purchase_access_kwargs(platform_str),
                 )
             except AccessProvisionError as issue:
+                if issue.provider == "vhq" and issue.code == "supplier_fulfillment_pending":
+                    await message.answer(
+                        f"⏳ {issue.client_message}",
+                        parse_mode="HTML",
+                    )
+                    return
                 plog(
                     "ОШИБКА_ВЫДАЧИ",
                     provider=issue.provider.upper(),
@@ -1819,14 +2009,13 @@ async def process_successful_payment(message: Message) -> None:
         amount_rub = (
             float(tariff.price_rub)
             if payment_info.currency == "XTR"
-            else payment_info.total_amount / 100.0
+            else kopecks_to_rub_float(payment_info.total_amount)
         )
         await credit_referral(session, user.id, payment.id, amount_rub, bot=message.bot)
         await log_referral_payment(session, user.id, amount_rub, bot=message.bot)
-        # Partner logic
-        if user.partner_id:
-            from bot.services.payment_service import credit_partner
-            await credit_partner(session, user.id, payment.id, amount_rub, bot=message.bot)
+        from bot.services.payment_service import credit_cashback, credit_partner
+        await credit_partner(session, user.id, payment.id, amount_rub, bot=message.bot)
+        await credit_cashback(session, user.id, payment.id, amount_rub, bot=message.bot)
         plog("ОПЛАТА", provider="Stars", user_id=message.from_user.id,
              amount=f"{amount_rub:.2f}", payment_id=payment.id)
         await session.commit()
@@ -1888,7 +2077,7 @@ async def process_successful_payment(message: Message) -> None:
 
         amount_rub = (
             float(tariff.price_rub) if payment_info.currency == "XTR"
-            else payment_info.total_amount / 100.0
+            else kopecks_to_rub_float(payment_info.total_amount)
         )
         method_str = "⭐ Telegram Stars" if payment_info.currency == "XTR" else "💳 Telegram Pay"
         product_label = {
@@ -1977,13 +2166,14 @@ async def process_device_payment(message: Message, payload_str: str) -> None:
         # accounting/UI state; Marzban keeps the same user/key.
         sub.device_slots += 1
         new_slot = sub.device_slots
-        vpn_key = sub.vpn_key
+        from bot.services.vhq_subscription_proxy import get_subscription_display_key
+        vpn_key = get_subscription_display_key(sub) or sub.vpn_key
 
         payment.subscription_id = sub.id
         
         # Referral commission + log
         amount_rub = (
-            payment_info.total_amount / 100.0 
+            kopecks_to_rub_float(payment_info.total_amount)
             if payment_info.currency != "XTR" 
             else float(payment_info.total_amount) # Stars are 1:1 rub for commission in this logic
         )
@@ -1994,10 +2184,11 @@ async def process_device_payment(message: Message, payload_str: str) -> None:
             logger.error(f"Failed to credit referral for device: {e}")
 
         try:
-            from bot.services.payment_service import credit_partner
+            from bot.services.payment_service import credit_cashback, credit_partner
             await credit_partner(session, sub.user_id, payment.id, amount_rub, bot=message.bot)
+            await credit_cashback(session, sub.user_id, payment.id, amount_rub, bot=message.bot)
         except Exception as e:
-            logger.error(f"Failed to credit partner for device: {e}")
+            logger.error(f"Failed to credit partner/cashback for device: {e}")
 
         await session.commit()
         logger.info(
@@ -2032,7 +2223,7 @@ async def process_device_payment(message: Message, payload_str: str) -> None:
             admin_text = (
                 f"💰 <b>Дополнительное устройство оплачено!</b>\n"
                 f"Пользователь: {user_link} (<code>{message.from_user.id}</code>)\n"
-                f"Сумма: {payment_info.total_amount / 100.0 if payment_info.currency != 'XTR' else payment_info.total_amount} {payment_info.currency}\n"
+                f"Сумма: {kopecks_to_rub_float(payment_info.total_amount) if payment_info.currency != 'XTR' else payment_info.total_amount} {payment_info.currency}\n"
                 f"Подписка ID: {sub_id}\n"
                 f"Устройство: №{new_slot}"
             )

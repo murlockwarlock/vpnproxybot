@@ -50,6 +50,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(text="🔌 Adapt планы",          callback_data="adm_adapt_plans"),
+        InlineKeyboardButton(text="⚠️ Проблемные платежи",  callback_data="adm_problem_payments"),
     )
     return builder.as_markup()
 
@@ -112,22 +113,15 @@ def guide_detail_kb(platform: str, has_media: bool, has_text: bool, has_buttons:
 def stats_menu_kb(webstore: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="📋 Обзор", callback_data="adm_stats_overview"),
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="adm_stats"),
     )
     builder.row(
-        InlineKeyboardButton(text="💰 Выручка", callback_data="adm_stats_revenue"),
-        InlineKeyboardButton(text="👥 Пользователи", callback_data="adm_stats_users"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="📈 Конверсия и отток", callback_data="adm_stats_conversion"),
         InlineKeyboardButton(text="💳 Способы оплаты", callback_data="adm_stats_methods"),
-    )
-    builder.row(
         InlineKeyboardButton(text="🏆 Топ тарифов", callback_data="adm_stats_tariffs"),
     )
     if webstore:
         builder.row(
-            InlineKeyboardButton(text="🌐 Вебстор", callback_data="adm_stats_web"),
+            InlineKeyboardButton(text="🌐 Управление сайтом", callback_data="adm_stats_web"),
         )
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back"))
     return builder.as_markup()
@@ -204,6 +198,7 @@ def user_actions_kb(
     is_blocked: bool,
     partner_id: int | None = None,
     has_active_sub: bool = False,
+    feedback_count: int = 0,
 ) -> InlineKeyboardMarkup:
     block_text = "🔓 Разблокировать" if is_blocked else "🚫 Заблокировать"
     builder = InlineKeyboardBuilder()
@@ -220,6 +215,9 @@ def user_actions_kb(
     builder.row(
         InlineKeyboardButton(text="📊 Подписки (подробно)", callback_data=f"adm_usr_subs_{telegram_id}"),
         InlineKeyboardButton(text="💳 Оплаты", callback_data=f"adm_usr_pays_{telegram_id}_1"),
+    )
+    builder.row(
+        InlineKeyboardButton(text=f"💬 Обращения · {feedback_count}", callback_data=f"adm_usr_fb_{telegram_id}_1"),
     )
     if partner_id is None:
         builder.row(
@@ -458,13 +456,25 @@ def settings_kb(
     stars_enabled: bool,
     demo_key_enabled: bool = False,
     whatsapp_enabled: bool = False,
+    cashback_enabled: bool = False,
 ) -> InlineKeyboardMarkup:
     stars_text = "⭐ Stars: ВКЛ ✅" if stars_enabled else "⭐ Stars: ВЫКЛ ❌"
     demo_text = "🎁 Демо-ключ: ВКЛ ✅" if demo_key_enabled else "🎁 Демо-ключ: ВЫКЛ ❌"
     wa_text = "💬 WhatsApp: ВКЛ ✅" if whatsapp_enabled else "💬 WhatsApp: ВЫКЛ ❌"
+    cb_text = "🎁 Кешбэк: ВКЛ ✅" if cashback_enabled else "🎁 Кешбэк: ВЫКЛ ❌"
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text=stars_text, callback_data="adm_toggle_stars"),
+    )
+    builder.row(
+        InlineKeyboardButton(text=cb_text, callback_data="adm_toggle_cashback"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🎁 Изменить % кешбэка", callback_data="adm_set_cashback_pct"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="✏️ Текст кешбэк-уведомления", callback_data="adm_set_cashback_text"),
+        InlineKeyboardButton(text="✏️ Текст напоминания о балансе", callback_data="adm_set_bal_remind_text"),
     )
     builder.row(
         InlineKeyboardButton(text=demo_text, callback_data="adm_toggle_demo_key"),
@@ -493,4 +503,233 @@ def settings_kb(
         InlineKeyboardButton(text="📑 Изменить /oferta", callback_data="adm_doc_oferta"),
     )
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back"))
+    return builder.as_markup()
+
+
+def format_item_button_label(item: Any) -> str:
+    """Format a compact item button label strictly bounded within 64 chars."""
+    cat = getattr(item, "category", None)
+    cat_val = cat.value if hasattr(cat, "value") else str(cat or "")
+    if cat_val == "confirmed_unfulfilled":
+        prefix = "🚨 ОПЛАЧЕН"
+    elif cat_val == "telegram_delivery_failed":
+        prefix = "📨 СБОЙ TG"
+    elif cat_val in ("verified_manually_fulfilled", "manually_fulfilled"):
+        prefix = "✅ ВЫДАН ВРУЧНУЮ"
+    elif cat_val == "failed_supplier":
+        prefix = "⚙️ СБОЙ"
+    elif cat_val == "delivery_uncertain":
+        prefix = "⚠️ ТРЕБУЕТСЯ ПРОВЕРКА"
+    elif cat_val == "unresolved_subscription":
+        prefix = "🔗 БЕЗ ПОДПИСКИ"
+    elif cat_val == "missing_provider_id":
+        prefix = "❓ БЕЗ ID"
+    elif cat_val == "processed":
+        prefix = "✅ ОБРАБОТАН"
+    elif cat_val == "provider_pending":
+        prefix = "⏳ Ожидает"
+    else:
+        prefix = "⚠️"
+
+    amt = getattr(item, "amount_rub", 0.0)
+    age = getattr(item, "age_str", "")
+    uname = getattr(item, "username", None)
+    tg_id = getattr(item, "telegram_id", None)
+    if uname:
+        user_str = f"@{uname[:10]}"
+    elif tg_id:
+        user_str = f"id{tg_id}"
+    else:
+        user_str = ""
+
+    parts = [f"{prefix} #{item.item_id} · {amt:.0f}₽"]
+    if user_str:
+        parts.append(user_str)
+    if age:
+        parts.append(age)
+    label = " · ".join(parts)
+    if len(label) > 60:
+        label = label[:57] + "..."
+    return label
+
+
+def problem_payments_main_kb(summary: Any) -> InlineKeyboardMarkup:
+    """Main screen keyboard for the fast problem payments dashboard."""
+    builder = InlineKeyboardBuilder()
+
+    # If there are urgent active items, surface them right at top
+    urgent_items = getattr(summary, "urgent_items", []) or []
+    for it in urgent_items:
+        code = "p" if getattr(it, "item_type", "payment") == "payment" else "t"
+        lbl = format_item_button_label(it)
+        builder.row(InlineKeyboardButton(text=lbl, callback_data=f"adm_prob_inspect:{code}:{it.item_id}:main"))
+
+    # Category counters
+    u_cnt = getattr(summary, "urgent_unfulfilled", 0)
+    tg_cnt = getattr(summary, "tg_delivery_failed", 0)
+    s_cnt = getattr(summary, "supplier_failed", 0)
+    r_cnt = getattr(summary, "needs_review", 0)
+    arch_cnt = getattr(summary, "total_archive", 0)
+
+    builder.row(
+        InlineKeyboardButton(text=f"🚨 Срочные ({u_cnt})", callback_data="adm_prob_cat:urgent:1"),
+        InlineKeyboardButton(text=f"📨 Доставка TG ({tg_cnt})", callback_data="adm_prob_cat:tg_delivery:1"),
+    )
+    builder.row(
+        InlineKeyboardButton(text=f"⚙️ Сбои выдачи ({s_cnt})", callback_data="adm_prob_cat:supplier:1"),
+        InlineKeyboardButton(text=f"🔎 На проверке ({r_cnt})", callback_data="adm_prob_cat:review:1"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔍 Найти платёж", callback_data="adm_prob_search"),
+        InlineKeyboardButton(text=f"🗂 Архив ({arch_cnt})", callback_data="adm_prob_archive:1"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="adm_problem_payments"),
+        InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel"),
+    )
+    return builder.as_markup()
+
+
+def problem_payments_list_kb(
+    items: list[Any],
+    category: str | None = None,
+    scope: str = "active",
+    page: int = 1,
+    total_pages: int = 1,
+) -> InlineKeyboardMarkup:
+    """Paginated list keyboard for categories and archive."""
+    builder = InlineKeyboardBuilder()
+    for item in items:
+        code = "p" if getattr(item, "item_type", "payment") == "payment" else "t"
+        source_code = f"cat_{category}_{page}" if category else f"arch_{page}"
+        btn_text = format_item_button_label(item)
+        builder.row(InlineKeyboardButton(text=btn_text, callback_data=f"adm_prob_inspect:{code}:{item.item_id}:{source_code}"))
+
+    nav_buttons = []
+    if page > 1:
+        prev_cb = f"adm_prob_cat:{category}:{page - 1}" if category else f"adm_prob_archive:{page - 1}"
+        nav_buttons.append(InlineKeyboardButton(text="◀️", callback_data=prev_cb))
+    nav_buttons.append(InlineKeyboardButton(text=f"{page}/{max(1, total_pages)}", callback_data="ignore"))
+    if page < total_pages:
+        next_cb = f"adm_prob_cat:{category}:{page + 1}" if category else f"adm_prob_archive:{page + 1}"
+        nav_buttons.append(InlineKeyboardButton(text="▶️", callback_data=next_cb))
+    if nav_buttons:
+        builder.row(*nav_buttons)
+
+    refresh_cb = f"adm_prob_cat:{category}:{page}" if category else f"adm_prob_archive:{page}"
+    builder.row(
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=refresh_cb),
+        InlineKeyboardButton(text="◀️ К сводке", callback_data="adm_problem_payments"),
+    )
+    builder.row(InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel"))
+    return builder.as_markup()
+
+
+def problem_payment_detail_kb(
+    item_type: str,
+    item_id: int,
+    user_id: int | None,
+    provider_payment_id: str | None,
+    page: Any = 1,
+    category: Any | None = None,
+    can_force_retry: bool = False,
+) -> InlineKeyboardMarkup:
+    """Detailed inspection card keyboard with safe actions and context-aware back navigation."""
+    builder = InlineKeyboardBuilder()
+    code = "p" if item_type == "payment" else "t"
+    cat_val = category.value if hasattr(category, "value") else str(category or "")
+    source = str(page)
+
+    if provider_payment_id or cat_val == "telegram_delivery_failed":
+        # Row 1: Live YooKassa verification button (always available on-demand)
+        builder.row(
+            InlineKeyboardButton(text="🔄 Проверить в YooKassa", callback_data=f"adm_prob_refresh:{code}:{item_id}:{source}"),
+        )
+
+        # Context-dependent action button
+        if cat_val == "telegram_delivery_failed":
+            if can_force_retry:
+                builder.row(
+                    InlineKeyboardButton(text="⚡️ Принудительный сброс и отправка в TG", callback_data=f"adm_prob_retry_tg:{code}:{item_id}:{source}:force"),
+                )
+            else:
+                builder.row(
+                    InlineKeyboardButton(text="📨 Отправить доступ клиенту в TG", callback_data=f"adm_prob_retry_tg:{code}:{item_id}:{source}"),
+                )
+        elif cat_val in ("verified_manually_fulfilled", "manually_fulfilled"):
+            builder.row(
+                InlineKeyboardButton(text="✅ Доступ уже выдан", callback_data="ignore"),
+            )
+        elif cat_val == "delivery_uncertain":
+            builder.row(
+                InlineKeyboardButton(text="⚠️ Статус неясен (ручная проверка)", callback_data="ignore"),
+            )
+        elif cat_val == "provider_pending":
+            builder.row(
+                InlineKeyboardButton(text="⏳ Ожидает оплаты", callback_data="ignore"),
+            )
+        elif cat_val == "processed":
+            builder.row(
+                InlineKeyboardButton(text="✅ Обработан", callback_data="ignore"),
+            )
+        else:
+            builder.row(
+                InlineKeyboardButton(text="⚡️ Запустить сверку", callback_data=f"adm_prob_reconcile:{code}:{item_id}:{source}"),
+            )
+
+    if user_id:
+        builder.row(
+            InlineKeyboardButton(text="👤 Карточка клиента", callback_data=f"adm_prob_user:{user_id}"),
+        )
+
+    # Context-aware back button
+    if source in ("main", "1"):
+        back_text = "◀️ К сводке"
+        back_cb = "adm_problem_payments"
+    elif source.startswith("cat_"):
+        parts = source[4:].rsplit("_", 1)
+        cat_n = parts[0]
+        p_n = parts[1] if len(parts) > 1 else "1"
+        back_text = "◀️ К категории"
+        back_cb = f"adm_prob_cat:{cat_n}:{p_n}"
+    elif source.startswith("arch_"):
+        p_n = source[5:] or "1"
+        back_text = "◀️ В архив"
+        back_cb = f"adm_prob_archive:{p_n}"
+    elif source == "search":
+        back_text = "◀️ К поиску"
+        back_cb = "adm_prob_search"
+    else:
+        back_text = "◀️ К списку проблем"
+        back_cb = f"adm_prob_page:{source}"
+
+    builder.row(
+        InlineKeyboardButton(text=back_text, callback_data=back_cb),
+        InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel"),
+    )
+    return builder.as_markup()
+
+
+def problem_payment_search_back_kb() -> InlineKeyboardMarkup:
+    """Back button for search prompt."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="◀️ Отмена", callback_data="adm_problem_payments"),
+        InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel"),
+    )
+    return builder.as_markup()
+
+
+def problem_payment_reconcile_confirm_kb(
+    code: str,
+    item_id: int,
+    page: Any = 1,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="⚡️ Да, запустить сверку", callback_data=f"adm_prob_rec_confirm:{code}:{item_id}:{page}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="◀️ Отмена", callback_data=f"adm_prob_inspect:{code}:{item_id}:{page}"),
+    )
     return builder.as_markup()

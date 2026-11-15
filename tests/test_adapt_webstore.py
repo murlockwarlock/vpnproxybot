@@ -296,3 +296,138 @@ def test_webstore_config_adapt_api_settings():
     s = WebStoreSettings()
     assert s.adapt_api_id == "12"
     assert s.adapt_api_key == "testkey"
+
+
+# ── Regression tests: stored darimiru.ru URLs do not override darimiru.xyz ──
+
+def test_display_order_subscription_url_normalizes_stored_darimiru_ru_to_xyz():
+    from webstore.routes import _display_order_subscription_url
+    from webstore.models import WebOrder
+
+    uuid_str = "7f29f9f6-6f35-47ba-b6fb-13a9155324c5"
+    order = WebOrder(
+        order_id="test_adapt_1",
+        status="delivered",
+        marzban_username=f"adapt_{uuid_str}",
+        subscription_url=f"https://darimiru.ru/vpnbot/adapt-sub/{uuid_str}",
+    )
+    url = _display_order_subscription_url(order)
+    assert url == f"https://darimiru.xyz/vpnbot/adapt-sub/{uuid_str}"
+
+
+def test_display_order_subscription_url_demo_normalizes_to_xyz():
+    from webstore.routes import _display_order_subscription_url
+    from webstore.models import WebOrder
+
+    uuid_str = "bcbccd61-c8e3-4e1e-a7aa-5ead9d8c2c55"
+    order = WebOrder(
+        order_id="test_adapt_demo",
+        status="demo",
+        marzban_username=f"adapt_{uuid_str}",
+        subscription_url=f"https://darimiru.ru/vpnbot/adapt-sub/{uuid_str}",
+    )
+    url = _display_order_subscription_url(order)
+    assert url == f"https://darimiru.xyz/vpnbot/adapt-sub/{uuid_str}"
+
+
+def test_display_order_subscription_url_preserves_vhq_mirror():
+    from webstore.routes import _display_order_subscription_url
+    from webstore.models import WebOrder
+
+    order = WebOrder(
+        order_id="test_vhq_1",
+        status="delivered",
+        marzban_username="vhq_abcdef123456",
+        vhq_order_id="abcdef123456",
+        subscription_url="https://sub.vhq-connect.online/abcdef123456",
+    )
+    url = _display_order_subscription_url(order)
+    assert url is not None
+    assert "/proxy-subscription/" in url or "vhq" in url
+    assert "darimiru.xyz/vpnbot/adapt-sub" not in url
+
+
+def test_display_order_subscription_url_preserves_marzban():
+    from webstore.routes import _display_order_subscription_url
+    from webstore.models import WebOrder
+
+    raw_marzban = "https://darimiru.ru/sub/ZGFyaV90ZzM0MjI2MDA5OF8x"
+    order = WebOrder(
+        order_id="test_marzban_1",
+        status="delivered",
+        marzban_username="dari_tg342260098_1",
+        subscription_url=raw_marzban,
+    )
+    url = _display_order_subscription_url(order)
+    assert url == raw_marzban
+
+
+def test_display_order_subscription_url_non_delivered_returns_none():
+    from webstore.routes import _display_order_subscription_url
+    from webstore.models import WebOrder
+
+    uuid_str = "7f29f9f6-6f35-47ba-b6fb-13a9155324c5"
+    order = WebOrder(
+        order_id="test_pending",
+        status="pending",
+        marzban_username=f"adapt_{uuid_str}",
+        subscription_url=f"https://darimiru.ru/vpnbot/adapt-sub/{uuid_str}",
+    )
+    assert _display_order_subscription_url(order) is None
+
+
+def test_serialize_telegram_items_normalizes_adapt_key():
+    from webstore.routes import _serialize_telegram_items
+    from webstore.models import WebTelegramItem
+
+    uuid_str = "125271e8-1481-44dd-8113-cf3489349f2c"
+    item = WebTelegramItem(
+        id=1,
+        profile_token="pt_123",
+        telegram_id=123456,
+        item_type="vpn",
+        external_id="sub_186",
+        title="VPN Подписка",
+        key_value=f"https://darimiru.ru/vpnbot/adapt-sub/{uuid_str}",
+        status="active",
+        provider="adapt",
+        adapt_plan_uuid="plan_123",
+    )
+    serialized = _serialize_telegram_items([item])
+    assert len(serialized) == 1
+    assert serialized[0]["key_value"] == f"https://darimiru.xyz/vpnbot/adapt-sub/{uuid_str}"
+
+
+@pytest.mark.asyncio
+async def test_handle_order_status_returns_preferred_xyz_url():
+    import json
+    from webstore.routes import handle_order_status
+    from webstore.models import WebOrder
+
+    uuid_str = "7f29f9f6-6f35-47ba-b6fb-13a9155324c5"
+    order = WebOrder(
+        order_id="wo_test_xyz",
+        status="delivered",
+        tariff_label="Базовый 30",
+        days=30,
+        profile_token="pt_test",
+        marzban_username=f"adapt_{uuid_str}",
+        subscription_url=f"https://darimiru.ru/vpnbot/adapt-sub/{uuid_str}",
+    )
+
+    class DummySession:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def execute(self, *args, **kwargs):
+            return MagicMock(scalar_one_or_none=MagicMock(return_value=order))
+
+    with patch("webstore.routes.async_session", return_value=DummySession()):
+        req = MagicMock()
+        req.query = {"order_id": "wo_test_xyz"}
+        resp = await handle_order_status(req)
+        body = json.loads(resp.text)
+        assert body["status"] == "delivered"
+        assert body["subscription_url"] == f"https://darimiru.xyz/vpnbot/adapt-sub/{uuid_str}"
+

@@ -51,14 +51,14 @@ def test_upgrade_quote_uses_current_adapt_replacement_formula():
 @pytest.mark.asyncio
 async def test_expired_adapt_trial_upgrade_costs_full_paid_tariff_price():
     current = SimpleNamespace(
-        id=1, days=7, price_rub=45, adapt_plan_uuid="trial-plan"
+        id=1, days=7, price_rub=45, adapt_plan_uuid="trial-plan", adapt_cost_price_usd=0.30
     )
     target = SimpleNamespace(
         id=199, user_id=10, tariff_id=1, expires_at=datetime.utcnow() - timedelta(days=1),
         client_name="adapt_trial",
     )
     paid = SimpleNamespace(
-        id=2, days=14, price_rub=75, adapt_plan_uuid="paid-plan"
+        id=2, days=14, price_rub=75, adapt_plan_uuid="paid-plan", adapt_cost_price_usd=0.80
     )
     session = SimpleNamespace(get=AsyncMock(side_effect=[target, current]))
 
@@ -76,7 +76,7 @@ async def test_expired_adapt_trial_upgrade_costs_full_paid_tariff_price():
 @pytest.mark.asyncio
 async def test_expired_paid_subscription_can_move_to_cheaper_tariff_for_full_price():
     current = SimpleNamespace(
-        id=1, days=365, price_rub=995, adapt_plan_uuid="annual-plan"
+        id=1, days=365, price_rub=995, adapt_plan_uuid="annual-plan", adapt_cost_price_usd=12.00
     )
     target = SimpleNamespace(
         id=200, user_id=10, tariff_id=1,
@@ -84,7 +84,7 @@ async def test_expired_paid_subscription_can_move_to_cheaper_tariff_for_full_pri
         client_name="adapt_expired",
     )
     cheaper = SimpleNamespace(
-        id=2, days=30, price_rub=155, adapt_plan_uuid="monthly-plan"
+        id=2, days=30, price_rub=155, adapt_plan_uuid="monthly-plan", adapt_cost_price_usd=2.00
     )
     session = SimpleNamespace(get=AsyncMock(side_effect=[target, current]))
 
@@ -114,7 +114,7 @@ async def test_active_upgrade_quote_respects_payment_minimum_only_below_ten(
 ):
     now = datetime.utcnow()
     current = SimpleNamespace(
-        id=1, days=10, price_rub=100, adapt_plan_uuid="current-plan"
+        id=1, days=10, price_rub=100, adapt_plan_uuid="current-plan", adapt_cost_price_usd=1.00
     )
     target = SimpleNamespace(
         id=201,
@@ -124,7 +124,7 @@ async def test_active_upgrade_quote_respects_payment_minimum_only_below_ten(
         client_name="adapt_active",
     )
     upgrade = SimpleNamespace(
-        id=2, days=10, price_rub=new_price, adapt_plan_uuid="upgrade-plan"
+        id=2, days=10, price_rub=new_price, adapt_plan_uuid="upgrade-plan", adapt_cost_price_usd=new_price / 100
     )
     session = SimpleNamespace(get=AsyncMock(side_effect=[target, current]))
 
