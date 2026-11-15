@@ -13,13 +13,13 @@ from bot.config import settings
 logger = logging.getLogger(__name__)
 
 
-async def _send_admin_text(bot: Bot, text: str) -> None:
+async def _send_admin_text(bot: Bot, text: str) -> bool:
     admin_ids = set(settings.admin_ids)
     admin_ids.update(settings.owner_ids)
     admin_ids.update(settings.support_agent_ids)
     if not admin_ids:
         logger.warning("No admin IDs configured for admin notification")
-        return
+        return False
 
     sent = 0
     failed = 0
@@ -37,11 +37,12 @@ async def _send_admin_text(bot: Bot, text: str) -> None:
                     break
                 await asyncio.sleep(min(retry_after or attempt, 5.0))
     logger.info("Admin notification finished: sent=%s failed=%s", sent, failed)
+    return sent > 0
 
 
-async def notify_staff_text(bot: Bot, text: str) -> None:
+async def notify_staff_text(bot: Bot, text: str) -> bool:
     """Send a preformatted operational message to all staff with retries."""
-    await _send_admin_text(bot, text)
+    return await _send_admin_text(bot, text)
 
 
 async def notify_expiring(bot: Bot, user_id: int, text: str, reply_markup=None) -> bool:
@@ -153,10 +154,10 @@ async def notify_admins_issue(
     *,
     title: str,
     details: list[str],
-) -> None:
+) -> bool:
     """Broadcast an operational issue to all admins."""
     safe_details = [html.escape(line) for line in details if line]
     text = f"🚨 <b>{html.escape(title)}</b>"
     if safe_details:
         text += "\n\n" + "\n".join(safe_details)
-    await _send_admin_text(bot, text)
+    return await _send_admin_text(bot, text)

@@ -46,6 +46,7 @@ async def db_session_factory(db_engine):
 
 async def test_yookassa_webhook_stores_completed_payment(monkeypatch, db_session_factory):
     monkeypatch.setattr("bot.webhooks.async_session", db_session_factory)
+    monkeypatch.setattr("bot.services.yookassa_reconciliation.async_session", db_session_factory)
 
     async with db_session_factory() as session:
         from bot.models import Tariff, User
@@ -65,14 +66,32 @@ async def test_yookassa_webhook_stores_completed_payment(monkeypatch, db_session
         user_id = user.id
 
     acquire_lock = AsyncMock(return_value=True)
-    monkeypatch.setattr("bot.webhooks.lease_manager.acquire_or_renew", acquire_lock)
-    monkeypatch.setattr("bot.webhooks.lease_manager.release", AsyncMock())
+    monkeypatch.setattr("bot.services.cluster.LeaseManager.acquire_or_renew", acquire_lock)
+    monkeypatch.setattr("bot.services.cluster.LeaseManager.release", AsyncMock())
+    monkeypatch.setattr("bot.services.cluster.LeaseManager.is_owned_by_me", AsyncMock(return_value=True))
     monkeypatch.setattr("bot.webhooks._wait_for_completed_payment", AsyncMock(return_value=False))
     process_and_deliver = AsyncMock(return_value=(user_id, 9001))
     monkeypatch.setattr("bot.webhooks._process_and_deliver", process_and_deliver)
     monkeypatch.setattr("bot.webhooks.credit_referral", AsyncMock())
     monkeypatch.setattr("bot.webhooks.log_referral_payment", AsyncMock())
     monkeypatch.setattr("bot.services.payment_service.credit_partner", AsyncMock())
+
+    verified_payment = {
+        "id": "yk_bot_123",
+        "status": "succeeded",
+        "paid": True,
+        "amount": {"value": "15.00", "currency": "RUB"},
+        "metadata": {
+            "user_id": "777001",
+            "chat_id": "777001",
+            "tariff_id": "51",
+            "platform": Platform.IOS.value,
+        },
+    }
+    monkeypatch.setattr(
+        "bot.services.yookassa_reconciliation.fetch_yookassa_payment",
+        AsyncMock(return_value=verified_payment),
+    )
 
     request = _Request(
         _json_body={
@@ -115,6 +134,7 @@ async def test_yookassa_webhook_stores_completed_payment(monkeypatch, db_session
 
 async def test_yookassa_balance_topup_notifies_admins_and_credits_balance(monkeypatch, db_session_factory):
     monkeypatch.setattr("bot.webhooks.async_session", db_session_factory)
+    monkeypatch.setattr("bot.services.yookassa_reconciliation.async_session", db_session_factory)
 
     async with db_session_factory() as session:
         from bot.models import User
@@ -126,10 +146,27 @@ async def test_yookassa_balance_topup_notifies_admins_and_credits_balance(monkey
 
     acquire_lock = AsyncMock(return_value=True)
     notify_admins = AsyncMock()
-    monkeypatch.setattr("bot.webhooks.lease_manager.acquire_or_renew", acquire_lock)
-    monkeypatch.setattr("bot.webhooks.lease_manager.release", AsyncMock())
+    monkeypatch.setattr("bot.services.cluster.LeaseManager.acquire_or_renew", acquire_lock)
+    monkeypatch.setattr("bot.services.cluster.LeaseManager.release", AsyncMock())
+    monkeypatch.setattr("bot.services.cluster.LeaseManager.is_owned_by_me", AsyncMock(return_value=True))
     monkeypatch.setattr("bot.webhooks._wait_for_completed_payment", AsyncMock(return_value=False))
-    monkeypatch.setattr("bot.webhooks.notify_admins_payment", notify_admins)
+    monkeypatch.setattr("bot.services.yookassa_reconciliation.notify_admins_payment", notify_admins)
+
+    verified_topup = {
+        "id": "yk_topup_123",
+        "status": "succeeded",
+        "paid": True,
+        "amount": {"value": "500.00", "currency": "RUB"},
+        "metadata": {
+            "user_id": "777002",
+            "chat_id": "777002",
+            "purpose": "balance_topup",
+        },
+    }
+    monkeypatch.setattr(
+        "bot.services.yookassa_reconciliation.fetch_yookassa_payment",
+        AsyncMock(return_value=verified_topup),
+    )
 
     request = _Request(
         _json_body={

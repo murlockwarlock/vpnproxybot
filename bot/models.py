@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import uuid
 from datetime import datetime
 
 from sqlalchemy import (
@@ -12,11 +13,13 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -201,6 +204,8 @@ class Subscription(Base):
 
     # FK to the Tariff that created/last-renewed this subscription (nullable for legacy rows).
     tariff_id: Mapped[int | None] = mapped_column(ForeignKey("tariffs.id"), nullable=True)
+    vhq_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    vhq_active_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="subscriptions")
     server: Mapped["Server"] = relationship(back_populates="subscriptions")
@@ -223,8 +228,16 @@ class Payment(Base):
         Enum(PaymentStatus), default=PaymentStatus.PENDING
     )
     provider_payment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    provider_idempotence_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     discount_applied: Mapped[float] = mapped_column(Float, default=0.0)
+    purchase_kopecks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    discount_kopecks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    provider_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider_paid: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    provider_amount_kopecks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    provider_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    provider_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     
     tariff_id: Mapped[int | None] = mapped_column(ForeignKey("tariffs.id"), nullable=True)
@@ -233,6 +246,10 @@ class Payment(Base):
     provisioning_baseline_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     provisioning_baseline_plan_uuid: Mapped[str | None] = mapped_column(String(64), nullable=True)
     provisioning_failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provisioning_freeze_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    telegram_delivery_error: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    reconciliation_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
     user: Mapped["User"] = relationship(back_populates="payments")
     subscription: Mapped["Subscription"] = relationship(back_populates="payment")
@@ -276,6 +293,14 @@ class ReferralConfig(Base):
 
 class ReferralEarning(Base):
     __tablename__ = "referral_earnings"
+    __table_args__ = (
+        Index(
+            "uq_referral_earnings_payment_id",
+            "payment_id",
+            unique=True,
+            sqlite_where=text("payment_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     referrer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
@@ -288,16 +313,41 @@ class ReferralEarning(Base):
 class ReferralPaymentLog(Base):
     """Tracks all payments made by referred users (for turnover stats and pay bonus)."""
     __tablename__ = "referral_payment_logs"
+    __table_args__ = (
+        Index(
+            "uq_referral_payment_logs_payment_id",
+            "payment_id",
+            unique=True,
+            sqlite_where=text("payment_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     referrer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
     referred_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    payment_id: Mapped[int | None] = mapped_column(ForeignKey("payments.id"), nullable=True, index=True)
     amount: Mapped[float] = mapped_column(Float, nullable=False)
     paid_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class BalanceTransaction(Base):
     __tablename__ = "balance_transactions"
+    __table_args__ = (
+        Index(
+            "uq_balance_tx_web_cashback",
+            "source_type",
+            "source_id",
+            unique=True,
+            sqlite_where=text("kind = 'CASHBACK' AND source_type = 'web_order_cashback' AND source_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_balance_tx_payment_cashback",
+            "source_type",
+            "source_id",
+            unique=True,
+            sqlite_where=text("kind = 'CASHBACK' AND source_type = 'payment' AND source_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
@@ -317,18 +367,68 @@ class BalanceTransaction(Base):
 
 class BalanceTopUp(Base):
     __tablename__ = "balance_topups"
+    __table_args__ = (
+        Index(
+            "uq_balance_topup_web_balance_wbtr",
+            "provider_payment_id",
+            unique=True,
+            sqlite_where=text("provider = 'web_balance_migration' AND provider_payment_id LIKE 'wbtr_%'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     profile_token: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     amount_rub: Mapped[float] = mapped_column(Float, nullable=False)
+    amount_kopecks: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cashback_amount_rub: Mapped[float] = mapped_column(Float, default=0.0)
     provider: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     provider_payment_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    provider_idempotence_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    provider_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider_paid: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    provider_amount_kopecks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    provider_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    provider_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    provider_failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reconciliation_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+class PaymentNotificationOutbox(Base):
+    __tablename__ = "payment_notification_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "payment_id",
+            "kind",
+            name="uq_payment_notification_outbox_payment_kind",
+        ),
+        Index(
+            "ix_payment_notification_outbox_due",
+            "status",
+            "next_attempt_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    payment_id: Mapped[int] = mapped_column(ForeignKey("payments.id"), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    recipient_telegram_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    message_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class WebReferralEarning(Base):
@@ -356,6 +456,8 @@ class WebPartnerEarning(Base):
     tariff_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
     payment_amount_rub: Mapped[float] = mapped_column(Float, nullable=False)
     earning_amount_rub: Mapped[float] = mapped_column(Float, nullable=False)
+    depth: Mapped[int] = mapped_column(Integer, default=1)
+    commission_percent: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -516,6 +618,13 @@ class RecurringPaymentProfile(Base):
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
     )
+    recurring_operation_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    recurring_operation_amount_kopecks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recurring_operation_description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    recurring_operation_payment_method_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    recurring_operation_provider_payment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    recurring_operation_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    recurring_operation_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     user: Mapped["User"] = relationship()
     subscription: Mapped["Subscription"] = relationship()
@@ -567,6 +676,31 @@ class Feedback(Base):
     media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    messages: Mapped[list["FeedbackMessage"]] = relationship(
+        "FeedbackMessage",
+        back_populates="feedback",
+        order_by="FeedbackMessage.created_at, FeedbackMessage.id",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+    )
+
+
+class FeedbackMessage(Base):
+    """Message in a feedback support thread."""
+    __tablename__ = "feedback_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    feedback_id: Mapped[int] = mapped_column(ForeignKey("feedbacks.id"), nullable=False, index=True)
+    sender_type: Mapped[str] = mapped_column(String(16), nullable=False)  # "user" | "admin"
+    sender_telegram_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    media_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    feedback: Mapped["Feedback"] = relationship("Feedback", back_populates="messages")
+
+
 
 class AppLease(Base):
     """Distributed lease used for leader election and short-lived processing locks."""
@@ -608,6 +742,8 @@ class Partner(Base):
     contact_info: Mapped[str | None] = mapped_column(Text, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     commission_percent: Mapped[float] = mapped_column(Float, default=0.0)
+    commission_l2_percent: Mapped[float] = mapped_column(Float, default=0.0)
+    commission_l3_percent: Mapped[float] = mapped_column(Float, default=0.0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     valid_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     welcome_text: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -639,12 +775,23 @@ class PartnerLink(Base):
 class PartnerEarning(Base):
     """Commission earnings log for a partner."""
     __tablename__ = "partner_earnings"
+    __table_args__ = (
+        Index(
+            "uq_partner_earnings_payment_depth",
+            "payment_id",
+            "depth",
+            unique=True,
+            sqlite_where=text("payment_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     partner_id: Mapped[int] = mapped_column(ForeignKey("partners.id"), nullable=False, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     payment_id: Mapped[int | None] = mapped_column(ForeignKey("payments.id"), nullable=True)
     amount: Mapped[float] = mapped_column(Float, nullable=False)
+    depth: Mapped[int] = mapped_column(Integer, default=1)
+    commission_percent: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -724,3 +871,87 @@ class AdminActionLog(Base):
     summary: Mapped[str] = mapped_column(String(255), nullable=False)
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+# ── VHQ Renew & Manual Operations ─────────────────────
+
+class ManualSubscriptionOperation(Base):
+    """Durable tracking of manual admin operations (e.g. renew) to protect against concurrent callbacks."""
+    __tablename__ = "manual_subscription_operations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    operation_uuid: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, default=lambda: str(uuid.uuid4()), index=True
+    )
+    admin_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    target_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    subscription_id: Mapped[int | None] = mapped_column(ForeignKey("subscriptions.id"), nullable=True, index=True)
+    tariff_id: Mapped[int | None] = mapped_column(ForeignKey("tariffs.id"), nullable=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False, default="renew")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    target_user: Mapped["User"] = relationship(foreign_keys=[target_user_id])
+    subscription: Mapped["Subscription | None"] = relationship(foreign_keys=[subscription_id])
+    tariff: Mapped["Tariff | None"] = relationship(foreign_keys=[tariff_id])
+
+
+class VhqSubscriptionFulfillment(Base):
+    """Durable outbox for VHQ subscription fulfillment operations (e.g. renew, buy_fallback)."""
+    __tablename__ = "vhq_subscription_fulfillments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    fulfillment_uuid: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, default=lambda: str(uuid.uuid4()), index=True
+    )
+    subscription_id: Mapped[int] = mapped_column(ForeignKey("subscriptions.id"), nullable=False, index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    payment_id: Mapped[int | None] = mapped_column(ForeignKey("payments.id"), nullable=True, index=True)
+    manual_operation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("manual_subscription_operations.id"), nullable=True, index=True
+    )
+    recurring_profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("recurring_payment_profiles.id"), nullable=True, index=True
+    )
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False, default="renew")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    vhq_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    baseline_provider_active_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expected_provider_active_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    confirmed_provider_active_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    baseline_local_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    target_local_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("source_type", "source_id", name="uq_vhq_fulfillment_source"),
+        Index(
+            "uq_active_vhq_renewal_per_sub_v2",
+            "subscription_id",
+            unique=True,
+            sqlite_where=text(
+                "status IN ('pending', 'processing', 'retry_wait', 'uncertain', 'buy_inflight', 'renew_inflight')"
+            ),
+        ),
+    )
+
+    subscription: Mapped["Subscription"] = relationship()
+    user: Mapped["User"] = relationship()
+    payment: Mapped["Payment | None"] = relationship()
+    manual_operation: Mapped["ManualSubscriptionOperation | None"] = relationship()
+    recurring_profile: Mapped["RecurringPaymentProfile | None"] = relationship()
+

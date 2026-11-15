@@ -15,6 +15,13 @@ MANAGE_SCRIPT = "/opt/mtproto-proxy/manage_secrets.py"
 
 # TLS domain hex for link building (www.ietf.org)
 _TLS_DOMAIN_HEX = "7777772e696574662e6f7267"
+_SERVER_LABELS = {
+    "72.56.71.124": "🇳🇱 Нидерланды 1",
+    "185.70.185.209": "🇳🇱 Нидерланды 2",
+    "81.200.156.43": "🇩🇪 Германия",
+}
+
+
 def _restart_command() -> str:
     """Restart MTProto proxy in a way that works for systemd-managed hosts."""
     return (
@@ -152,7 +159,7 @@ def _build_link(host: str, port: int, secret: str) -> str:
 
 def _display_label(server: dict) -> str:
     host = server.get("host", "")
-    fallback = host
+    fallback = _SERVER_LABELS.get(host, host)
     label = str(server.get("label", "") or "").strip()
     if not label:
         return fallback

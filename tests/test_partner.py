@@ -342,6 +342,69 @@ class TestPartnerCommission:
         )
         assert count == 2
 
+    async def test_credit_partner_multilevel_chain(self, session, partner):
+        """Test multi-level partner commissions: Level 1 (30%), Level 2 (15%), Level 3+ (5%)."""
+        from bot.services.payment_service import credit_partner
+
+        partner.commission_percent = 30.0
+        partner.commission_l2_percent = 15.0
+        partner.commission_l3_percent = 5.0
+        await session.commit()
+
+        u1 = User(
+            telegram_id=200001,
+            username="user_l1",
+            partner_id=partner.id,
+            referral_root_partner_id=partner.id,
+            referral_depth=1,
+        )
+        u2 = User(
+            telegram_id=200002,
+            username="user_l2",
+            referred_by=200001,
+            referral_root_partner_id=partner.id,
+            referral_depth=2,
+        )
+        u3 = User(
+            telegram_id=200003,
+            username="user_l3",
+            referred_by=200002,
+            referral_root_partner_id=partner.id,
+            referral_depth=3,
+        )
+        u4 = User(
+            telegram_id=200004,
+            username="user_l4",
+            referred_by=200003,
+            referral_root_partner_id=partner.id,
+            referral_depth=4,
+        )
+        session.add_all([u1, u2, u3, u4])
+        await session.commit()
+
+        # Level 1 payment: 1000 RUB -> 300 RUB
+        await credit_partner(session, u1.id, None, 1000.0)
+        # Level 2 payment: 1000 RUB -> 150 RUB
+        await credit_partner(session, u2.id, None, 1000.0)
+        # Level 3 payment: 1000 RUB -> 50 RUB
+        await credit_partner(session, u3.id, None, 1000.0)
+        # Level 4 payment: 1000 RUB -> 50 RUB
+        await credit_partner(session, u4.id, None, 1000.0)
+        await session.commit()
+
+        await session.refresh(partner)
+        assert partner.partner_balance == 300.0 + 150.0 + 50.0 + 50.0
+
+        earnings = (await session.execute(
+            select(PartnerEarning).where(PartnerEarning.partner_id == partner.id).order_by(PartnerEarning.id)
+        )).scalars().all()
+
+        assert len(earnings) == 4
+        assert earnings[0].depth == 1 and earnings[0].amount == 300.0 and earnings[0].commission_percent == 30.0
+        assert earnings[1].depth == 2 and earnings[1].amount == 150.0 and earnings[1].commission_percent == 15.0
+        assert earnings[2].depth == 3 and earnings[2].amount == 50.0 and earnings[2].commission_percent == 5.0
+        assert earnings[3].depth == 4 and earnings[3].amount == 50.0 and earnings[3].commission_percent == 5.0
+
 
 # ── Partner Link Resolution Tests ────────────────────
 

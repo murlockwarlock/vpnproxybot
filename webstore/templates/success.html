@@ -130,9 +130,10 @@
       margin-bottom: 12px;
     }
     .key-url {
-      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 12px;
       padding: 14px 16px;
-      padding-right: 80px;
       border: 1px solid var(--line);
       border-radius: 12px;
       background: rgba(255, 255, 255, 0.8);
@@ -143,11 +144,10 @@
       color: var(--text);
       cursor: pointer;
     }
+    #keyUrlText { flex: 1; min-width: 0; overflow-wrap: anywhere; }
     .copy-btn {
-      position: absolute;
-      right: 8px;
-      top: 50%;
-      transform: translateY(-50%);
+      flex: 0 0 auto;
+      min-height: 44px;
       padding: 8px 14px;
       border: none;
       border-radius: 8px;
@@ -159,6 +159,10 @@
       cursor: pointer;
     }
     .copy-btn:active { opacity: 0.8; }
+    @media (max-width: 480px) {
+      .key-url { flex-direction: column; align-items: stretch; }
+      .key-url .copy-btn { align-self: flex-start; }
+    }
     .copy-status {
       margin-top: 8px;
       font-size: 13px;
@@ -220,6 +224,8 @@
     }
     .invite-link-text {
       flex: 1 1 320px;
+      min-width: 0;
+      max-width: 100%;
       min-height: 46px;
       padding: 12px 14px;
       border: 1px solid var(--line);
@@ -373,7 +379,7 @@
         <div class="success-icon">&#10003;</div>
         <h1>Оплата прошла!</h1>
         <p id="tariffInfo"></p>
-        <p><strong>Это и есть ваш ключ.</strong> Скопируйте ссылку ниже и вставьте её в приложение. По SMS и email ключ не отправляется: email нужен только для чека.</p>
+        <p><strong>Это и есть ваш ключ.</strong> Скопируйте ссылку ниже и вставьте её в приложение. Ключ также доступен в личном кабинете, а чек придёт на email.</p>
       </div>
 
       <div class="key-card">

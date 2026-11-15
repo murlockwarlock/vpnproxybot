@@ -122,9 +122,17 @@
       color: var(--text);
     }
     .ghost-link svg {
-      width: 16px;
-      height: 16px;
-      fill: currentColor;
+      width: 18px;
+      height: 18px;
+      flex-shrink: 0;
+    }
+    .topbar-renew-btn {
+      color: var(--brand) !important;
+      background: rgba(37,99,235,0.08) !important;
+      border-color: rgba(37,99,235,0.25) !important;
+    }
+    .topbar-renew-btn:hover {
+      background: rgba(37,99,235,0.14) !important;
     }
     .telegram-link {
       width: 44px;
@@ -205,6 +213,49 @@
       gap: 12px;
       align-items: center;
       margin-bottom: 22px;
+    }
+    .hero-account-actions {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      gap: 10px;
+      margin: -4px 0 22px;
+      padding: 14px 16px;
+      border: 1px solid rgba(12, 140, 140, 0.16);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.58);
+    }
+    .hero-account-actions p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .hero-account-actions p strong {
+      display: block;
+      color: var(--text);
+      margin-bottom: 2px;
+    }
+    .hero-account-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .hero-account-links a {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 0 13px;
+      border: 1px solid rgba(12, 140, 140, 0.22);
+      border-radius: 999px;
+      background: rgba(12, 140, 140, 0.08);
+      color: var(--brand-deep);
+      font-size: 13px;
+      font-weight: 800;
+      text-decoration: none;
+    }
+    .hero-account-links a:hover {
+      background: rgba(12, 140, 140, 0.14);
     }
     .hero-benefits {
       position: relative;
@@ -327,6 +378,7 @@
     .demo-modal-close:hover { background: var(--brand-soft); }
     .demo-modal h3 { font-size: 20px; font-weight: 800; margin-bottom: 10px; }
     .demo-modal > div > p { color: var(--muted); font-size: 14px; line-height: 1.6; margin-bottom: 18px; }
+    .auth-instruction { margin-bottom: 14px; color: var(--muted); font-size: 14px; line-height: 1.6; }
     .demo-input {
       width: 100%;
       height: 48px;
@@ -357,6 +409,7 @@
     }
     .demo-note { text-align: center; font-size: 13px; color: var(--muted); }
     .demo-note a { color: var(--brand); text-decoration: none; }
+    .auth-forgot-link { display: flex; align-items: center; min-height: 44px; margin: 8px 0; color: var(--brand-deep); }
     .demo-success-icon { font-size: 36px; margin-bottom: 12px; }
     .demo-url-box {
       background: rgba(12, 140, 140, 0.07);
@@ -389,6 +442,320 @@
       font-weight: 700;
       color: var(--brand-deep);
       text-decoration: none;
+    }
+    /* Quick Renew modal */
+    .quick-renew-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(20, 34, 44, 0.5);
+      backdrop-filter: blur(6px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 16px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 200ms ease;
+    }
+    .quick-renew-overlay.active { opacity: 1; pointer-events: all; }
+    .quick-renew-modal {
+      background: var(--panel-solid);
+      border-radius: var(--radius-xl);
+      padding: 30px 26px;
+      max-width: 480px;
+      width: 100%;
+      position: relative;
+      box-shadow: var(--shadow);
+      animation: fadeUp 250ms ease-out both;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+    /* Backup domain announcement banner and modal */
+    .backup-domain-banner {
+      position: relative;
+      margin-bottom: 22px;
+      padding: 16px 52px 16px 18px;
+      border-radius: var(--radius-lg);
+      background: linear-gradient(135deg, rgba(12, 140, 140, 0.12), rgba(239, 138, 37, 0.14));
+      border: 1px solid rgba(12, 140, 140, 0.28);
+      box-shadow: 0 8px 24px rgba(20, 34, 44, 0.06);
+      animation: fadeUp 350ms ease-out both;
+      display: flex;
+      align-items: center;
+    }
+    .backup-banner-content {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      width: 100%;
+      flex-wrap: wrap;
+    }
+    .backup-banner-badge {
+      font-size: 26px;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .backup-banner-text {
+      flex: 1 1 280px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .backup-banner-title {
+      font-size: 15px;
+      font-weight: 800;
+      color: var(--brand-deep);
+      letter-spacing: -0.01em;
+    }
+    .backup-banner-desc {
+      font-size: 13.5px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .backup-banner-actions {
+      flex-shrink: 0;
+    }
+    .backup-banner-cta {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      padding: 0 18px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--brand), var(--brand-deep));
+      color: #fff;
+      font-size: 13.5px;
+      font-weight: 700;
+      border: none;
+      cursor: pointer;
+      font-family: var(--font);
+      box-shadow: 0 4px 14px rgba(12, 140, 140, 0.25);
+      transition: transform 140ms ease, box-shadow 140ms ease, filter 140ms ease;
+      white-space: nowrap;
+    }
+    .backup-banner-cta:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.05);
+      box-shadow: 0 6px 18px rgba(12, 140, 140, 0.32);
+    }
+    .backup-banner-cta:active {
+      transform: translateY(0);
+    }
+    .backup-banner-close {
+      position: absolute;
+      top: 50%;
+      right: 12px;
+      transform: translateY(-50%);
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      border: none;
+      background: rgba(20, 34, 44, 0.06);
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 150ms ease, color 150ms ease, transform 150ms ease;
+    }
+    .backup-banner-close:hover {
+      background: rgba(20, 34, 44, 0.12);
+      color: var(--text);
+    }
+    .backup-link-modal {
+      max-width: 480px;
+    }
+    .backup-sub-card {
+      background: rgba(255, 255, 255, 0.9);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .backup-sub-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+    }
+    .backup-sub-title {
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .backup-sub-expiry {
+      font-size: 11.5px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .backup-sub-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .backup-sub-input {
+      flex: 1;
+      min-width: 0;
+      height: 36px;
+      padding: 0 10px;
+      font-size: 12px;
+      font-family: monospace;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f8fafc;
+      color: var(--brand-deep);
+      outline: none;
+    }
+    .backup-copy-btn {
+      height: 36px;
+      padding: 0 14px;
+      font-size: 12px;
+      font-weight: 700;
+      border-radius: 8px;
+      border: none;
+      background: var(--brand);
+      color: #fff;
+      cursor: pointer;
+      white-space: nowrap;
+      flex-shrink: 0;
+      font-family: var(--font);
+      transition: background 150ms ease;
+    }
+    .backup-copy-btn:hover {
+      background: var(--brand-deep);
+    }
+    .backup-copy-btn.copied {
+      background: #059669;
+    }
+    @media (max-width: 720px) {
+      .backup-domain-banner {
+        padding: 14px 44px 14px 14px;
+        margin-bottom: 18px;
+      }
+      .backup-banner-content {
+        gap: 12px;
+      }
+      .backup-banner-badge {
+        font-size: 22px;
+      }
+      .backup-banner-title {
+        font-size: 14px;
+      }
+      .backup-banner-desc {
+        font-size: 12.5px;
+      }
+      .backup-banner-actions {
+        width: 100%;
+        margin-top: 4px;
+      }
+      .backup-banner-cta {
+        width: 100%;
+        min-height: 42px;
+        font-size: 14px;
+      }
+      .backup-banner-close {
+        top: 14px;
+        right: 10px;
+        transform: none;
+      }
+      .backup-sub-row {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .backup-copy-btn {
+        width: 100%;
+        height: 38px;
+      }
+    }
+    .quick-renew-card {
+      background: rgba(12, 140, 140, 0.06);
+      border: 1px solid rgba(12, 140, 140, 0.2);
+      border-radius: var(--radius-md);
+      padding: 14px 16px;
+      margin: 14px 0;
+    }
+    .quick-renew-badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 800;
+      padding: 3px 8px;
+      border-radius: 6px;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+    .badge-active { background: rgba(34, 197, 94, 0.18); color: #15803d; }
+    .badge-expired { background: rgba(239, 68, 68, 0.18); color: #b91c1c; }
+    .badge-trial { background: rgba(234, 179, 8, 0.18); color: #a16207; }
+    .quick-tariffs-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin: 12px 0 16px;
+    }
+    .quick-tariff-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border: 1.5px solid var(--line);
+      border-radius: var(--radius-md);
+      background: #fff;
+      cursor: pointer;
+      transition: all 150ms ease;
+    }
+    .quick-tariff-card:hover {
+      border-color: var(--brand);
+      background: rgba(12, 140, 140, 0.03);
+    }
+    .quick-tariff-card.selected {
+      border-color: var(--brand);
+      background: rgba(12, 140, 140, 0.08);
+      box-shadow: 0 0 0 1px var(--brand);
+    }
+    .quick-tariff-card > div:first-child {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    .quick-tariff-card strong {
+      font-size: 14px;
+      color: var(--text);
+    }
+    .quick-tariff-card .quick-price {
+      flex-shrink: 0;
+      white-space: nowrap;
+      font-size: 15px;
+      font-weight: 800;
+      color: var(--brand-deep);
+    }
+    .quick-renew-tabs {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+      margin-bottom: 12px;
+    }
+    .quick-tab-btn {
+      flex: 1;
+      padding: 8px;
+      border-radius: var(--radius-md);
+      border: 1.5px solid var(--line);
+      background: #fff;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      color: var(--muted);
+      font-family: var(--font);
+      transition: all 150ms ease;
+    }
+    .quick-tab-btn.active {
+      background: var(--brand-soft);
+      border-color: var(--brand);
+      color: var(--brand-deep);
     }
     .proof-strip {
       display: grid;
@@ -1175,6 +1542,9 @@
     .cookie-banner.active {
       display: flex;
     }
+    .cookie-banner.active ~ .support-fab {
+      visibility: hidden;
+    }
     .cookie-banner-card {
       width: min(720px, 100%);
       padding: 18px 20px;
@@ -1409,19 +1779,44 @@
         <span class="brand-text">{{SITE_NAME}}</span>
       </a>
       <div class="topbar-actions">
-        <button type="button" class="ghost-link" id="loginTopbarBtn" aria-label="Войти">
-          <span>Войти</span>
+        <a href="/renew" class="ghost-link topbar-renew-btn" id="quickRenewTopbarBtn" aria-label="Продлить по ссылке" title="Продлить по ссылке" onclick="event.preventDefault(); openQuickRenewModal();">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="color: var(--brand);">
+            <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3L21.5 8M22 12.5a10 10 0 0 1-18.8 4.2L2.5 16"/>
+          </svg>
+          <span style="font-weight: 700; color: var(--brand);">Продлить</span>
+        </a>
+        <button type="button" class="ghost-link" id="loginTopbarBtn" aria-label="Войти" title="Войти в профиль">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/>
+            <circle cx="12" cy="7" r="4"/>
+          </svg>
+          <span id="loginTopbarText">Войти</span>
         </button>
-        <button type="button" class="ghost-link telegram-auth-link" id="registerTopbarBtn" aria-label="Зарегистрироваться">
+        <button type="button" class="ghost-link telegram-auth-link" id="registerTopbarBtn" aria-label="Зарегистрироваться" title="Зарегистрироваться">
           <span>Регистрация</span>
         </button>
-        <a href="{{CHANNEL_URL}}" class="telegram-link" target="_blank" aria-label="Telegram">
+        <a href="{{CHANNEL_URL}}" class="telegram-link" target="_blank" aria-label="Telegram" title="Telegram-канал">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M21.5 4.5 18.4 19c-.23 1.03-.84 1.28-1.7.8l-4.7-3.47-2.27 2.18c-.25.25-.46.46-.94.46l.34-4.83 8.8-7.95c.38-.34-.08-.54-.6-.2L6.4 13.2 1.76 11.75c-1-.31-1.03-1 .22-1.49L20.2 3.3c.84-.31 1.57.2 1.3 1.2Z"/>
           </svg>
         </a>
         {{VK_LINK_HTML}}
       </div>
+    </div>
+
+    <!-- Backup domain announcement banner -->
+    <div class="backup-domain-banner" id="backupDomainBanner" style="display: none;" role="region" aria-label="Резервная ссылка для HAPP и INCY">
+      <div class="backup-banner-content">
+        <div class="backup-banner-badge" aria-hidden="true">🛡</div>
+        <div class="backup-banner-text">
+          <strong class="backup-banner-title">Резервная ссылка для HAPP / INCY</strong>
+          <span class="backup-banner-desc">Если основная ссылка не работает или не обновляется, воспользуйтесь альтернативной.</span>
+        </div>
+        <div class="backup-banner-actions">
+          <button type="button" class="backup-banner-cta" id="backupBannerCta">Получить резервную ссылку</button>
+        </div>
+      </div>
+      <button type="button" class="backup-banner-close" id="backupBannerClose" aria-label="Закрыть уведомление" title="Закрыть">✕</button>
     </div>
 
     <section class="hero">
@@ -1433,12 +1828,21 @@
         <div class="hero-actions">
           <button type="button" class="accent-btn" id="demoHeroBtn">Попробовать бесплатно — 3 дня</button>
           <a href="#tariffs" class="primary-link">Выбрать тариф</a>
+          <button type="button" class="telegram-auth-cta" id="quickRenewHeroBtn" style="background: linear-gradient(135deg, var(--brand), var(--brand-deep)); color: #fff; border: none;">↻ Продлить по ссылке</button>
           <button type="button" class="telegram-auth-cta" id="authHeroBtn">Войти / зарегистрироваться</button>
+        </div>
+        <div class="hero-account-actions" id="heroAccountActions">
+          <p><strong>Уже покупали доступ?</strong>Откройте профиль, привяжите Telegram и получите реферальную ссылку.</p>
+          <div class="hero-account-links">
+            <a href="/profile">Мой профиль</a>
+            <a href="/profile#telegram">Привязать Telegram</a>
+            <a href="/buy#referral-program">Пригласить друга</a>
+          </div>
         </div>
         <div class="hero-benefits">
           <div class="hero-benefit">
             <strong>Без карты на старте</strong>
-            <span>3 дня доступа бесплатно — просто введите email или телефон.</span>
+            <span>3 дня доступа бесплатно — зарегистрируйтесь с email.</span>
           </div>
           <div class="hero-benefit">
             <strong>Если приложение уже стоит</strong>
@@ -1504,12 +1908,12 @@
           <div class="step-card">
             <div class="step-index">1</div>
             <h3>Войдите или зарегистрируйтесь</h3>
-            <p>Нужны email или телефон и пароль от 8 знаков. Так заказ и ключ сохранятся в личном кабинете.</p>
+            <p>Войдите с паролем или зарегистрируйтесь по email и подтвердите адрес кодом из письма.</p>
           </div>
           <div class="step-card">
             <div class="step-index">2</div>
             <h3>Оплатите и получите ссылку</h3>
-            <p>После оплаты ссылка появится прямо на сайте. По SMS и email ключ не отправляется: email нужен для чека.</p>
+            <p>После оплаты ключ появится в личном кабинете, а чек придёт на email.</p>
           </div>
           <div class="step-card">
             <div class="step-index">3</div>
@@ -1609,6 +2013,17 @@
           </label>
         </div>
 
+        <div class="quick-renew-banner" id="quickRenewTariffBanner" style="background: linear-gradient(135deg, rgba(37,99,235,0.06), rgba(30,64,175,0.1)); border: 1.5px dashed var(--brand); border-radius: var(--radius-md); padding: 14px 18px; margin: 16px 0 20px 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span style="font-size: 22px;">↻</span>
+            <div>
+              <strong style="color: var(--text-main); font-size: 15px; display: block;">Уже пользуетесь сервисом и хотите продлить текущий ключ?</strong>
+              <span style="color: var(--text-muted); font-size: 13px;">Вставьте ссылку на вашу подписку, чтобы продлить её без повторной настройки на устройствах.</span>
+            </div>
+          </div>
+          <button type="button" class="accent-btn" id="quickRenewTariffBtn" style="white-space: nowrap; padding: 10px 18px; font-size: 14px; margin: 0;">↻ Продлить по ссылке</button>
+        </div>
+
         <div class="tariffs" id="tariffCards"></div>
     </section>
 
@@ -1674,11 +2089,11 @@
       </div>
     </section>
 
-    <section class="section" id="inviteSection" style="display:none;">
-      <div class="referral-box">
+    <section class="section" id="inviteSection">
+      <div class="referral-box" id="referral-program">
         <div class="referral-copy">
           <h2>Пригласить друга</h2>
-          <p>Отправьте другу свою ссылку. После его оплаты деньги придут на ваш баланс на сайте.</p>
+          <p>Отправьте другу свою ссылку. После его подходящей оплаты вознаграждение придёт на ваш баланс на сайте.</p>
           <div class="referral-points">
             <div>Ссылка открывает сайт сразу.</div>
             <div>Начисление приходит после оплаты друга.</div>
@@ -1687,7 +2102,8 @@
         </div>
         <div class="referral-actions">
           <button type="button" class="referral-link referral-copy-btn" id="inviteCopyBtn" style="display:none;">Копировать</button>
-          <a href="/profile" class="referral-link referral-open-btn" id="inviteProfileLink" target="_blank" rel="noopener" style="display:none;">Открыть</a>
+          <a href="/profile" class="referral-link referral-open-btn" id="inviteProfileLink">Мой профиль</a>
+          <a href="/profile" class="referral-link referral-login-btn" id="inviteLoginLink">Войти</a>
         </div>
       </div>
     </section>
@@ -1772,13 +2188,220 @@
     <div class="demo-modal">
       <button type="button" class="demo-modal-close" id="authModalClose">✕</button>
       <h3 id="authTitle">Войти в личный кабинет</h3>
-      <p id="authText">Введите email или телефон и пароль. После входа мы сразу вернём вас к оплате.</p>
+      <p class="auth-instruction" id="authText">Введите email или телефон и пароль.</p>
       <input type="text" class="demo-input" id="authContactInput" placeholder="Email или телефон" autocomplete="username" autocorrect="off">
       <input type="password" class="demo-input" id="authPasswordInput" placeholder="Пароль от 8 знаков" autocomplete="current-password">
       <input type="password" class="demo-input" id="authPassword2Input" placeholder="Повторите пароль" autocomplete="new-password" style="display:none;">
+      <a href="/profile#forgot" class="auth-forgot-link" id="authForgotLink">Забыли пароль?</a>
       <button type="button" class="demo-submit-btn" id="authSubmitBtn">Войти</button>
       <p class="demo-note" id="authSwitchText">Нет профиля? <a href="#" id="authSwitchLink">Зарегистрироваться</a></p>
-      <p class="demo-note" style="margin-top:8px;">Ключ после оплаты появится на сайте. На email приходит чек, не ключ.</p>
+      <p class="demo-note" id="authNote" style="margin-top:8px;">После оплаты ключ будет доступен в личном кабинете, а чек придёт на email.</p>
+    </div>
+  </div>
+
+  <!-- Quick Renew modal -->
+  <div class="quick-renew-overlay" id="quickRenewOverlay">
+    <div class="quick-renew-modal">
+      <button type="button" class="demo-modal-close" id="quickRenewModalClose">✕</button>
+      
+      <!-- Step 1: Input query -->
+      <div id="quickRenewLookupStep">
+        <h3>↻ Продлить по ссылке или ключу</h3>
+        <p style="color: var(--muted); font-size: 14px; line-height: 1.6; margin-bottom: 18px;">
+          Вставьте вашу ссылку из приложения (Happ, V2Ray и т.д.) или ключ. Мы проверим статус и продлим тот же доступ без смены настроек.
+        </p>
+        <input type="text" class="demo-input" id="quickRenewQueryInput" placeholder="https://.../vpnbot/adapt-sub/..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" style="font-size: 13px;">
+        <button type="button" class="demo-submit-btn" id="quickRenewFindBtn">Найти подписку</button>
+        
+        <div class="quick-renew-guide-toggle" id="quickGuideToggle" style="margin-top: 14px; background: rgba(37,99,235,0.06); border: 1px solid rgba(37,99,235,0.15); border-radius: var(--radius-sm); padding: 12px 14px; cursor: pointer; display: flex; align-items: center; justify-content: space-between; font-size: 13.5px; color: var(--brand); font-weight: 600;">
+          <span style="display: flex; align-items: center; gap: 8px;">
+            <span>❓</span>
+            <span>Где взять ссылку? Инструкция по шагам</span>
+          </span>
+          <span id="quickGuideChevron" style="transition: transform 0.2s; font-size: 11px;">▼</span>
+        </div>
+        <div id="quickGuideContent" style="display: none; background: #fff; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; margin-top: 8px; font-size: 13px; color: var(--text-main); line-height: 1.6; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
+          
+          <div style="font-weight: 700; color: var(--text-main); margin-bottom: 10px; font-size: 14px;">
+            Как скопировать ссылку на вашу подписку?
+          </div>
+
+          <!-- Guide App Selector Tabs -->
+          <div style="display: flex; gap: 8px; margin-bottom: 14px;">
+            <button type="button" id="guideTabHapp" style="flex: 1; padding: 8px 12px; font-size: 13px; font-weight: 700; border-radius: 6px; border: 1.5px solid var(--brand); background: var(--brand); color: #fff; cursor: pointer; transition: all 0.2s;">📱 Happ</button>
+            <button type="button" id="guideTabIncy" style="flex: 1; padding: 8px 12px; font-size: 13px; font-weight: 700; border-radius: 6px; border: 1.5px solid var(--border); background: #f8fafc; color: var(--text-main); cursor: pointer; transition: all 0.2s;">📱 INCY</button>
+          </div>
+
+          <!-- Happ Guide Pane -->
+          <div id="guidePaneHapp">
+            <p style="margin: 0 0 10px 0; color: var(--text-main); font-size: 13px;">
+              Если вы пользуетесь приложением <b>Happ</b>:
+            </p>
+            <div style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px;">
+              <div style="display: flex; gap: 12px; align-items: center; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;">
+                <div onclick="openGuideLightbox('/api/store/assets/happ_step1.jpeg')" title="Нажмите для увеличения" style="position: relative; width: 56px; height: 96px; flex-shrink: 0; cursor: pointer; border-radius: 6px; overflow: hidden; border: 1px solid #cbd5e1;">
+                  <img src="/api/store/assets/happ_step1.jpeg" alt="Шаг 1" style="width: 100%; height: 100%; object-fit: cover; display: block;">
+                  <div style="position: absolute; bottom: 3px; right: 3px; background: rgba(0,0,0,0.65); color: #fff; font-size: 10px; padding: 1px 4px; border-radius: 4px; line-height: 1;">🔍</div>
+                </div>
+                <div style="flex: 1; min-width: 0;">
+                  <strong style="color: var(--brand); display: block; margin-bottom: 2px;">Шаг 1</strong>
+                  <span>Нажмите на <b>«...»</b> (три точки) в кружочке рядом с названием подписки.</span>
+                </div>
+              </div>
+              <div style="display: flex; gap: 12px; align-items: center; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;">
+                <div onclick="openGuideLightbox('/api/store/assets/happ_step2.jpeg')" title="Нажмите для увеличения" style="position: relative; width: 56px; height: 96px; flex-shrink: 0; cursor: pointer; border-radius: 6px; overflow: hidden; border: 1px solid #cbd5e1;">
+                  <img src="/api/store/assets/happ_step2.jpeg" alt="Шаг 2" style="width: 100%; height: 100%; object-fit: cover; display: block;">
+                  <div style="position: absolute; bottom: 3px; right: 3px; background: rgba(0,0,0,0.65); color: #fff; font-size: 10px; padding: 1px 4px; border-radius: 4px; line-height: 1;">🔍</div>
+                </div>
+                <div style="flex: 1; min-width: 0;">
+                  <strong style="color: var(--brand); display: block; margin-bottom: 2px;">Шаг 2</strong>
+                  <span>Во всплывающем окошке нажмите <b>«Редактировать»</b>.</span>
+                </div>
+              </div>
+              <div style="display: flex; gap: 12px; align-items: center; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;">
+                <div onclick="openGuideLightbox('/api/store/assets/happ_step3.jpeg')" title="Нажмите для увеличения" style="position: relative; width: 56px; height: 96px; flex-shrink: 0; cursor: pointer; border-radius: 6px; overflow: hidden; border: 1px solid #cbd5e1;">
+                  <img src="/api/store/assets/happ_step3.jpeg" alt="Шаг 3" style="width: 100%; height: 100%; object-fit: cover; display: block;">
+                  <div style="position: absolute; bottom: 3px; right: 3px; background: rgba(0,0,0,0.65); color: #fff; font-size: 10px; padding: 1px 4px; border-radius: 4px; line-height: 1;">🔍</div>
+                </div>
+                <div style="flex: 1; min-width: 0;">
+                  <strong style="color: var(--brand); display: block; margin-bottom: 2px;">Шаг 3</strong>
+                  <span>Появится экран с <b>URL подписки</b>. Внизу нажмите на кнопку с <b>иконкой копирования 📋</b> (выделена кружочком). Ссылка скопируется в буфер обмена.</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Incy Guide Pane -->
+          <div id="guidePaneIncy" style="display: none;">
+            <p style="margin: 0 0 10px 0; color: var(--text-main); font-size: 13px;">
+              Если вы пользуетесь приложением <b>INCY</b>:
+            </p>
+            <div style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px;">
+              <div style="display: flex; gap: 12px; align-items: center; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;">
+                <div onclick="openGuideLightbox('/api/store/assets/incy_step1.jpeg')" title="Нажмите для увеличения" style="position: relative; width: 56px; height: 96px; flex-shrink: 0; cursor: pointer; border-radius: 6px; overflow: hidden; border: 1px solid #cbd5e1;">
+                  <img src="/api/store/assets/incy_step1.jpeg" alt="Шаг 1" style="width: 100%; height: 100%; object-fit: cover; display: block;">
+                  <div style="position: absolute; bottom: 3px; right: 3px; background: rgba(0,0,0,0.65); color: #fff; font-size: 10px; padding: 1px 4px; border-radius: 4px; line-height: 1;">🔍</div>
+                </div>
+                <div style="flex: 1; min-width: 0;">
+                  <strong style="color: #10b981; display: block; margin-bottom: 2px;">Шаг 1</strong>
+                  <span>Нажмите на <b>«...»</b> (три точки) в кружочке рядом с названием подписки.</span>
+                </div>
+              </div>
+              <div style="display: flex; gap: 12px; align-items: center; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;">
+                <div onclick="openGuideLightbox('/api/store/assets/incy_step2.jpeg')" title="Нажмите для увеличения" style="position: relative; width: 56px; height: 96px; flex-shrink: 0; cursor: pointer; border-radius: 6px; overflow: hidden; border: 1px solid #cbd5e1;">
+                  <img src="/api/store/assets/incy_step2.jpeg" alt="Шаг 2" style="width: 100%; height: 100%; object-fit: cover; display: block;">
+                  <div style="position: absolute; bottom: 3px; right: 3px; background: rgba(0,0,0,0.65); color: #fff; font-size: 10px; padding: 1px 4px; border-radius: 4px; line-height: 1;">🔍</div>
+                </div>
+                <div style="flex: 1; min-width: 0;">
+                  <strong style="color: #10b981; display: block; margin-bottom: 2px;">Шаг 2</strong>
+                  <span>Во всплывающем окошке нажмите <b>«Копировать URL»</b>. Ссылка скопируется в буфер обмена.</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <p style="margin: 0 0 10px 0; color: var(--text-main);">
+            Затем вставьте скопированную ссылку в поле выше.
+          </p>
+          <div style="background: rgba(37,99,235,0.05); border-radius: 6px; padding: 10px 12px; font-size: 12px; color: var(--text-muted);">
+            💡 <b>Пример правильной ссылки:</b><br>
+            <code style="word-break: break-all; color: var(--brand-deep); font-size: 11px;">https://domain.com/vpnbot/adapt-sub/05a19dc5-a84f-4568-9994-ad9d8fb61354</code>
+          </div>
+        </div>
+
+        <p class="demo-note" style="margin-top: 12px;">Подходит для подписок, оформленных в Telegram-боте или на сайте.</p>
+      </div>
+
+      <!-- Step 2: Confirmation & Tariff Select -->
+      <div id="quickRenewResultStep" style="display:none;">
+        <h3 style="font-size: 20px; font-weight: 800; margin-bottom: 10px;">Подписка найдена</h3>
+        <div class="quick-renew-card" id="quickRenewCard">
+          <div id="quickRenewStatusBadge" class="quick-renew-badge"></div>
+          <div style="font-size:15px; font-weight:800; color:var(--text);" id="quickRenewPlanName"></div>
+          <div style="font-size:13px; color:var(--muted); margin-top:3px;" id="quickRenewExpiresText"></div>
+          <div style="font-size:11px; font-family:monospace; color:var(--brand-deep); margin-top:6px; word-break:break-all;" id="quickRenewUuidText"></div>
+        </div>
+
+        <div id="quickRenewTabsContainer" class="quick-renew-tabs" style="display:none;">
+          <button type="button" class="quick-tab-btn active" id="quickRenewTabRenew">↻ Продлить этот тариф</button>
+          <button type="button" class="quick-tab-btn" id="quickRenewTabUpgrade">↑ Улучшить тариф</button>
+        </div>
+
+        <div style="font-size:13px; font-weight:700; color:var(--text); margin-bottom:6px;" id="quickRenewSelectLabel">Выберите период продления:</div>
+        <p class="demo-note" id="quickRenewUpgradeNote" hidden>Остаток действующей подписки учтён. Указана доплата за улучшение.</p>
+        <div class="quick-tariffs-list" id="quickTariffsList"></div>
+
+        <input type="text" class="demo-input" id="quickRenewEmailInput" placeholder="Email для чека об оплате" autocomplete="email">
+        <button type="button" class="demo-submit-btn" id="quickRenewPayBtn">Перейти к оплате</button>
+        <button type="button" class="ghost-link" id="quickRenewBackBtn" style="width:100%; justify-content:center; min-height:40px; font-size:13px; margin-top:2px;">← Найти другую подписку</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Lightbox modal for previewing screenshots in-place (top-level fixed) -->
+  <div id="guideLightbox" style="display: none; position: fixed; inset: 0; width: 100vw; height: 100vh; background: rgba(15, 23, 42, 0.94); z-index: 99999999; align-items: center; justify-content: center; padding: 16px; box-sizing: border-box; cursor: pointer; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);">
+    <button type="button" id="guideLightboxClose" style="position: fixed; top: 16px; right: 16px; width: 44px; height: 44px; border-radius: 50%; background: #ffffff; color: #0f172a; border: none; font-size: 22px; font-weight: bold; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 20px rgba(0,0,0,0.5); z-index: 100000000;">✕</button>
+    <div style="position: relative; max-width: 94vw; max-height: 86vh; display: flex; align-items: center; justify-content: center;">
+      <img id="guideLightboxImg" src="" alt="Инструкция" style="max-width: 90vw; max-height: 82vh; border-radius: 14px; object-fit: contain; box-shadow: 0 20px 50px rgba(0,0,0,0.8); border: 2px solid rgba(255,255,255,0.2); display: block;">
+    </div>
+    <div style="position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); color: rgba(255,255,255,0.9); font-size: 13px; font-weight: 500; background: rgba(0,0,0,0.7); padding: 8px 18px; border-radius: 24px; pointer-events: none; white-space: nowrap; backdrop-filter: blur(4px);">
+      Нажмите в любое место, чтобы закрыть
+    </div>
+  </div>
+
+  <!-- Backup Domain Links Modal -->
+  <div class="demo-overlay" id="backupLinkOverlay" role="dialog" aria-modal="true" aria-labelledby="backupLinkModalTitle">
+    <div class="demo-modal backup-link-modal">
+      <button type="button" class="demo-modal-close" id="backupLinkModalClose" aria-label="Закрыть">✕</button>
+      
+      <div id="backupLoading" style="display: none; text-align: center; padding: 24px 0;">
+        <div style="font-size: 28px; margin-bottom: 12px; display: inline-block;">⏳</div>
+        <p style="color: var(--muted); font-size: 14px;">Загружаем ваши ссылки...</p>
+      </div>
+
+      <div id="backupContent" style="display: none;">
+        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+          <span style="font-size: 24px;">🛡</span>
+          <h3 id="backupLinkModalTitle" style="font-size: 18px; font-weight: 800; color: var(--brand-deep); margin: 0;">Резервная ссылка</h3>
+        </div>
+        <p style="color: var(--muted); font-size: 13.5px; line-height: 1.5; margin-bottom: 16px;">
+          Используйте эту ссылку в приложении <b>Happ</b> или <b>INCY</b>, если основная ссылка не подключается или не обновляется:
+        </p>
+
+        <div id="backupList" style="display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; max-height: 360px; overflow-y: auto;">
+          <!-- Dynamically populated subscription cards -->
+        </div>
+
+        <div class="backup-instruction-box" style="background: rgba(12, 140, 140, 0.06); border: 1px solid rgba(12, 140, 140, 0.18); border-radius: var(--radius-md); padding: 12px 14px; font-size: 12.5px; color: var(--text); line-height: 1.5; margin-bottom: 16px;">
+          <strong style="color: var(--brand-deep); display: block; margin-bottom: 4px;">Как обновить в Happ / INCY:</strong>
+          <span>1. Нажмите «...» рядом с названием подписки.<br>2. Выберите «Редактировать».<br>3. Замените адрес на скопированную ссылку и сохраните.</span>
+        </div>
+
+        <div style="display: flex; gap: 10px; justify-content: flex-end;">
+          <a href="/profile" class="ghost-btn" style="text-decoration: none; font-size: 13px; padding: 0 16px; min-height: 38px; display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; border: 1px solid var(--line); color: var(--muted);">Открыть профиль</a>
+        </div>
+      </div>
+
+      <div id="backupEmpty" style="display: none; text-align: center; padding: 12px 0;">
+        <div style="font-size: 32px; margin-bottom: 10px;">ℹ️</div>
+        <h3 style="font-size: 18px; font-weight: 800; margin-bottom: 8px;">Активных подписок не найдено</h3>
+        <p style="color: var(--muted); font-size: 13.5px; line-height: 1.5; margin-bottom: 18px;">
+          В этом профиле нет активных подписок Happ / INCY. Если вы оформляли доступ на другой email или через Telegram, войдите под нужным аккаунтом.
+        </p>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <a href="#tariffs" class="demo-submit-btn" id="backupEmptyTariffBtn" style="text-decoration: none; text-align: center; line-height: 46px; height: 46px;">Выбрать тариф</a>
+          <a href="/profile" class="ghost-btn" style="text-decoration: none; text-align: center; line-height: 40px; height: 40px; border-radius: 999px; border: 1px solid var(--line); color: var(--text);">Перейти в профиль</a>
+        </div>
+      </div>
+
+      <div id="backupError" style="display: none; text-align: center; padding: 12px 0;">
+        <div style="font-size: 32px; margin-bottom: 10px;">⚠️</div>
+        <h3 style="font-size: 18px; font-weight: 800; margin-bottom: 8px;">Не удалось загрузить подписки</h3>
+        <p id="backupErrorText" style="color: var(--muted); font-size: 13.5px; line-height: 1.5; margin-bottom: 18px;">
+          Произошла ошибка при обращении к серверу. Попробуйте ещё раз.
+        </p>
+        <button type="button" class="demo-submit-btn" id="backupRetryBtn" style="height: 44px;">Повторить попытку</button>
+      </div>
     </div>
   </div>
 
@@ -1868,12 +2491,46 @@
   <script>
     const tariffs = {{TARIFFS_JSON}};
     const storeParams = new URLSearchParams(window.location.search);
-    const refSource = storeParams.get("ref") || "";
+    const REF_STORAGE_KEY = "darimiru_ref";
+    const REF_TIME_KEY = "darimiru_ref_ts";
+    const REF_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours within the active session
+
+    // Purge any stale legacy localStorage referral keys
+    try {
+      localStorage.removeItem(REF_STORAGE_KEY);
+      localStorage.removeItem(REF_TIME_KEY);
+    } catch (_) {}
+
+    let refSource = (storeParams.get("ref") || "").trim();
+    if (refSource) {
+      try {
+        sessionStorage.setItem(REF_STORAGE_KEY, refSource);
+        sessionStorage.setItem(REF_TIME_KEY, String(Date.now()));
+      } catch (_) {}
+    } else {
+      try {
+        const storedRef = (sessionStorage.getItem(REF_STORAGE_KEY) || "").trim();
+        const storedTs = Number(sessionStorage.getItem(REF_TIME_KEY) || 0);
+        if (storedRef && storedTs && (Date.now() - storedTs < REF_MAX_AGE_MS)) {
+          refSource = storedRef;
+        } else {
+          sessionStorage.removeItem(REF_STORAGE_KEY);
+          sessionStorage.removeItem(REF_TIME_KEY);
+        }
+      } catch (_) {}
+    }
+
+    function clearStoredReferral() {
+      refSource = "";
+      try {
+        sessionStorage.removeItem(REF_STORAGE_KEY);
+        sessionStorage.removeItem(REF_TIME_KEY);
+        localStorage.removeItem(REF_STORAGE_KEY);
+        localStorage.removeItem(REF_TIME_KEY);
+      } catch (_) {}
+    }
     const purchaseAction = ["new", "renew", "upgrade"].includes(storeParams.get("action")) ? storeParams.get("action") : "new";
     const targetOrderId = storeParams.get("target_order_id") || "";
-    const currentPlanUuid = storeParams.get("current_plan_uuid") || "";
-    const targetExpiresAt = storeParams.get("expires_at") || "";
-    const targetExpired = storeParams.get("expired") === "1";
     const COOKIE_CONSENT_KEY = "webstore_cookie_consent";
     const PROFILE_COOKIE = "webstore_profile_token";
     const PROFILE_COOKIE_MAX_AGE = 60 * 60 * 24 * 30;
@@ -2018,57 +2675,42 @@
       }
     };
 
-    function renderTariffs() {
+    async function renderTariffs() {
       const container = document.getElementById("tariffCards");
-      const currentTariff = tariffs.find(t => t.adapt_plan_uuid === currentPlanUuid);
       const upgradeSummary = document.getElementById("upgradeSummary");
-      let upgradeResidual = null;
-      if (purchaseAction === "upgrade" && currentTariff && !targetExpired && targetExpiresAt) {
-        const expiryMs = Date.parse(targetExpiresAt);
-        if (Number.isFinite(expiryMs)) {
-          const currentPrice = Number(currentTariff.price_rub);
-          const currentDays = Math.max(Number(currentTariff.days), 1);
-          const remainingDays = Math.max(0, (expiryMs - Date.now()) / 86400000);
-          upgradeResidual = Math.min(currentPrice, currentPrice / currentDays * remainingDays);
-          const used = Math.max(0, currentPrice - upgradeResidual);
-          const money = value => Number(value.toFixed(2)).toLocaleString("ru-RU", {
-            minimumFractionDigits: 0,
-            maximumFractionDigits: 2,
+      upgradeSummary.hidden = true;
+      let visibleTariffs = tariffs;
+      if (purchaseAction !== "new") {
+        container.innerHTML = '<div class="empty-state">Загружаем доступные тарифы…</div>';
+        try {
+          const resp = await fetch("/api/store/quick-renew/lookup", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ target_order_id: targetOrderId }),
           });
-          upgradeSummary.innerHTML = `
-            <strong>Улучшение подписки</strong>
-            <p>Текущий тариф: <b>${currentTariff.label}</b><br>
-            Параметры: <b>${currentTariff.days} дн.</b><br>
-            Срок действия до: <b>${new Date(expiryMs).toLocaleDateString("ru-RU")}</b><br>
-            Стоимость: <b>${money(currentPrice)} ₽</b><br>
-            Использовано: <b>${money(used)} ₽</b><br>
-            Остаточная стоимость: <b>${money(upgradeResidual)} ₽</b></p>
-            <p>При выборе нового тарифа вы доплачиваете разницу между стоимостью нового тарифа и остаточной стоимостью текущего.</p>
-            <p>Остаточная стоимость — это сумма, которую вы заплатили по тарифу, за вычетом использованного периода.</p>
-          `;
-          upgradeSummary.hidden = false;
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "Не удалось рассчитать стоимость");
+          visibleTariffs = purchaseAction === "renew" && !data.is_trial
+            ? data.renew_tariffs
+            : [...(data.is_expired ? data.renew_tariffs : []), ...data.upgrade_tariffs];
+          if (purchaseAction === "upgrade" && !data.is_trial && !data.is_expired && data.expires_at) {
+            upgradeSummary.textContent = "Остаток действующей подписки учтён. Указана доплата за улучшение.";
+            upgradeSummary.hidden = false;
+          }
+        } catch (error) {
+          container.innerHTML = '<div class="empty-state"><p></p><button type="button" class="ghost-link">Повторить</button></div>';
+          container.querySelector("p").textContent = error.message || "Не удалось загрузить тарифы";
+          container.querySelector("button").addEventListener("click", renderTariffs);
+          return;
         }
       }
-      const visibleTariffs = tariffs.filter(t => {
-        if (purchaseAction === "renew" && currentPlanUuid) return t.adapt_plan_uuid === currentPlanUuid;
-        if (purchaseAction === "upgrade" && currentTariff) {
-          return !!t.adapt_plan_uuid
-            && (
-              (targetExpired && Number(currentTariff.days) > 7)
-              || (t.adapt_plan_uuid !== currentPlanUuid && Number(t.price_rub) > Number(currentTariff.price_rub))
-            );
-        }
-        return true;
-      });
+      container.innerHTML = "";
       if (!visibleTariffs.length) {
         container.innerHTML = '<div class="empty-state">Для этой подписки сейчас нет подходящих тарифов.</div>';
         return;
       }
       visibleTariffs.forEach((t, i) => {
-        let displayPrice = Number(t.price_rub);
-        if (purchaseAction === "upgrade" && upgradeResidual !== null) {
-          displayPrice = Math.max({{MIN_PURCHASE_PRICE_RUB}}, Math.ceil(Number(t.price_rub) - upgradeResidual - 1e-9));
-        }
+        const displayPrice = purchaseAction === "new" ? t.price_rub : t.payable_price_rub;
         const perDay = (t.price_rub / t.days).toFixed(1);
         const featured = i === visibleTariffs.length - 1;
         const card = document.createElement("div");
@@ -2076,7 +2718,7 @@
         card.innerHTML = `
           ${t.badge ? `<div class="tariff-badge">${t.badge}</div>` : ""}
           <div class="tariff-label">${t.label}</div>
-          <div class="tariff-desc">${t.description}</div>
+          <div class="tariff-desc">${t.description || ""}</div>
           <div class="tariff-price">${displayPrice} <span>₽</span></div>
           <div class="tariff-per-month">${purchaseAction === "upgrade" ? "Доплата за улучшение" : (t.days >= 365 ? Math.round(t.price_rub / 12) + " ₽/мес" : "Оплата одним платежом")}</div>
           <div class="tariff-per-day">${purchaseAction === "upgrade" ? "" : perDay + " ₽ в день"}</div>
@@ -2084,6 +2726,7 @@
             ${(t.features || []).map(f => `<li>${f}</li>`).join("")}
           </ul>
           <button class="buy-btn" data-key="${t.key}">Перейти к оплате</button>
+          ${purchaseAction === "new" ? `<button type="button" class="tariff-renew-link" onclick="openQuickRenewModal()" style="background:none;border:none;color:var(--brand);font-size:13px;cursor:pointer;text-decoration:underline;margin-top:10px;padding:0;width:100%;text-align:center;font-weight:500;">↻ Продлить существующий ключ</button>` : ""}
         `;
         container.appendChild(card);
       });
@@ -2191,16 +2834,21 @@
     function syncAuthButtons() {
       const token = getSavedProfileToken();
       const loginBtn = document.getElementById("loginTopbarBtn");
+      const loginText = document.getElementById("loginTopbarText");
       const registerBtn = document.getElementById("registerTopbarBtn");
       const heroBtn = document.getElementById("authHeroBtn");
       if (!loginBtn || !registerBtn || !heroBtn) return;
 
       if (token) {
-        loginBtn.textContent = "Профиль";
+        if (loginText) loginText.textContent = "Профиль";
+        loginBtn.setAttribute("title", "Мой профиль");
+        loginBtn.setAttribute("aria-label", "Мой профиль");
         registerBtn.classList.add("hidden");
         heroBtn.textContent = "Мой профиль";
       } else {
-        loginBtn.textContent = "Войти";
+        if (loginText) loginText.textContent = "Войти";
+        loginBtn.setAttribute("title", "Войти");
+        loginBtn.setAttribute("aria-label", "Войти");
         registerBtn.classList.remove("hidden");
         heroBtn.textContent = "Войти / зарегистрироваться";
       }
@@ -2210,8 +2858,12 @@
       const token = getSavedProfileToken();
       const section = document.getElementById("inviteSection");
       const link = document.getElementById("inviteProfileLink");
+      const loginLink = document.getElementById("inviteLoginLink");
       const copyBtn = document.getElementById("inviteCopyBtn");
-      if (!section || !link || !copyBtn || !token) {
+      if (!section || !link || !copyBtn) {
+        return;
+      }
+      if (!token) {
         return;
       }
 
@@ -2223,7 +2875,11 @@
         }
         const url = data.referral.site_url;
         link.href = url;
+        link.textContent = "Открыть ссылку";
+        link.target = "_blank";
+        link.rel = "noopener";
         link.style.display = "";
+        if (loginLink) loginLink.style.display = "none";
         copyBtn.style.display = "";
         copyBtn.addEventListener("click", () => {
           navigator.clipboard.writeText(url).then(() => {
@@ -2341,9 +2997,17 @@
       const isRegister = authMode === "register";
       document.getElementById("authTitle").textContent = isRegister ? "Регистрация" : "Войти в личный кабинет";
       document.getElementById("authText").textContent = isRegister
-        ? "Введите email или телефон и придумайте пароль от 8 знаков."
-        : "Введите email или телефон и пароль. После входа мы сразу вернём вас к оплате.";
+        ? "Введите email и придумайте пароль от 8 знаков."
+        : "Введите email или телефон и пароль.";
+      const contactInput = document.getElementById("authContactInput");
+      contactInput.placeholder = isRegister ? "Email" : "Email или телефон";
+      contactInput.inputMode = isRegister ? "email" : "text";
+      if (isRegister && contactInput.value && !contactInput.value.includes("@")) contactInput.value = "";
       document.getElementById("authPassword2Input").style.display = isRegister ? "block" : "none";
+      document.getElementById("authForgotLink").style.display = isRegister ? "none" : "flex";
+      document.getElementById("authNote").textContent = isRegister
+        ? "Мы отправим код для подтверждения email. После оплаты ключ будет доступен в личном кабинете, а чек придёт на email."
+        : "После оплаты ключ будет доступен в личном кабинете, а чек придёт на email.";
       document.getElementById("authPasswordInput").autocomplete = isRegister ? "new-password" : "current-password";
       document.getElementById("authSubmitBtn").textContent = isRegister ? "Зарегистрироваться" : "Войти";
       document.getElementById("authSwitchText").innerHTML = isRegister
@@ -2359,9 +3023,9 @@
       pendingTariffKey = tariffKey || "";
       setAuthMode(mode);
       const contact = document.getElementById("contactInput")?.value.trim() || getSavedContactDraft();
-      if (contact) document.getElementById("authContactInput").value = contact;
+      if (contact && (authMode !== "register" || contact.includes("@"))) document.getElementById("authContactInput").value = contact;
       document.getElementById("authOverlay").classList.add("active");
-      setTimeout(() => document.getElementById("authContactInput").focus(), 50);
+      document.getElementById("authContactInput").focus();
     }
 
     function closeAuthModal() {
@@ -2372,34 +3036,51 @@
       const contact = document.getElementById("authContactInput").value.trim();
       const password = document.getElementById("authPasswordInput").value;
       const password2 = document.getElementById("authPassword2Input").value;
-      if (!contact) { showToast("Введите email или телефон"); return; }
+      const submittedMode = authMode;
+      if (!contact || (authMode === "register" && !contact.includes("@"))) {
+        showToast(authMode === "register" ? "Введите email" : "Введите email или телефон");
+        return;
+      }
       if (password.length < 8) { showToast("Пароль должен быть не короче 8 знаков"); return; }
       if (authMode === "register" && password !== password2) { showToast("Пароли не совпадают"); return; }
       const btn = document.getElementById("authSubmitBtn");
       btn.disabled = true;
       btn.textContent = authMode === "register" ? "Регистрируем…" : "Входим…";
       try {
-        const resp = await fetch(`/api/store/auth/${authMode}`, {
+        const resp = await fetch(submittedMode === "register" ? "/api/store/auth/otp/start" : "/api/store/auth/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contact, password, password2 }),
+          body: JSON.stringify(submittedMode === "register"
+            ? { purpose: "register", email: contact, password, password2 }
+            : { contact, password }),
         });
         const data = await resp.json();
         if (!resp.ok) {
           showToast(data.error || "Не удалось войти");
           return;
         }
+        if (submittedMode === "register") {
+          if (!data.challenge) { showToast("Не удалось начать подтверждение. Попробуйте ещё раз."); return; }
+          const returnSearch = location.search || (refSource ? `?ref=${encodeURIComponent(refSource)}` : "");
+          const returnTo = (refSource || pendingTariffKey || pendingDemoAccess || pendingBackupAccess) ? (location.pathname + returnSearch) : "";
+          sessionStorage.setItem("darimiru_otp", JSON.stringify({challenge: data.challenge, email: contact.trim().toLowerCase(), purpose: "register", returnTo}));
+          window.location.assign("/email-confirm?flow=otp");
+          return;
+        }
         if (data.token) saveProfileToken(data.token);
         saveContactDraft(contact);
         closeAuthModal();
         syncAuthButtons();
-        showToast(authMode === "register" ? "Профиль создан" : "Вы вошли");
+        showToast("Вы вошли");
         const tariff = pendingTariffKey;
         const resumeDemoAccess = pendingDemoAccess;
+        const resumeBackupAccess = pendingBackupAccess;
         pendingTariffKey = "";
         pendingDemoAccess = false;
+        pendingBackupAccess = false;
         if (tariff) buyTariff(tariff);
         if (!tariff && resumeDemoAccess) requestDemoAccess();
+        if (!tariff && !resumeDemoAccess && resumeBackupAccess) openBackupLinkModal();
       } catch {
         showToast("Ошибка сети. Попробуйте ещё раз.");
       } finally {
@@ -2439,6 +3120,7 @@
         const data = await resp.json();
 
         if (data.redirect_url) {
+          clearStoredReferral();
           window.location.href = data.redirect_url;
           return;
         }
@@ -2625,13 +3307,619 @@
     });
     document.getElementById("demoHowLink").addEventListener("click", closeDemoModal);
 
+    // Quick Renew modal
+    let quickRenewData = null;
+    let selectedQuickTariffKey = null;
+    let quickActiveTab = "renew";
+
+    function openQuickRenewModal() {
+      document.getElementById("quickRenewOverlay").classList.add("active");
+      document.getElementById("quickRenewLookupStep").style.display = "block";
+      document.getElementById("quickRenewResultStep").style.display = "none";
+      const input = document.getElementById("quickRenewQueryInput");
+      setTimeout(() => { if (input) input.focus(); }, 150);
+    }
+
+    function closeQuickRenewModal() {
+      document.getElementById("quickRenewOverlay").classList.remove("active");
+    }
+
+    async function lookupQuickRenew() {
+      const query = (document.getElementById("quickRenewQueryInput").value || "").trim();
+      if (!query) {
+        showToast("Вставьте ссылку на подписку или ключ");
+        return;
+      }
+      const btn = document.getElementById("quickRenewFindBtn");
+      btn.disabled = true;
+      btn.textContent = "Поиск подписки…";
+      try {
+        const resp = await fetch("/api/store/quick-renew/lookup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          showToast(data.error || "Подписка не найдена");
+          btn.disabled = false;
+          btn.textContent = "Найти подписку";
+          return;
+        }
+        quickRenewData = data;
+        renderQuickRenewResult();
+      } catch (err) {
+        showToast("Ошибка сети при проверке подписки");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Найти подписку";
+      }
+    }
+
+    function renderQuickRenewResult() {
+      if (!quickRenewData) return;
+      document.getElementById("quickRenewLookupStep").style.display = "none";
+      document.getElementById("quickRenewResultStep").style.display = "block";
+
+      const badge = document.getElementById("quickRenewStatusBadge");
+      if (quickRenewData.is_trial) {
+        badge.className = "quick-renew-badge badge-trial";
+        badge.textContent = "Тестовый доступ";
+      } else if (quickRenewData.is_expired) {
+        badge.className = "quick-renew-badge badge-expired";
+        badge.textContent = "Срок истёк";
+      } else {
+        badge.className = "quick-renew-badge badge-active";
+        badge.textContent = "Активна";
+      }
+
+      document.getElementById("quickRenewPlanName").textContent = quickRenewData.plan_title;
+      let expText = "";
+      if (quickRenewData.expires_at) {
+        const d = new Date(quickRenewData.expires_at);
+        expText = `Действует до: ${d.toLocaleDateString("ru-RU")} ${d.toLocaleTimeString("ru-RU", {hour: '2-digit', minute:'2-digit'})}`;
+      }
+      document.getElementById("quickRenewExpiresText").textContent = expText;
+      document.getElementById("quickRenewUuidText").textContent = `Ключ: ${quickRenewData.adapt_uuid}`;
+
+      const hasRenew = (quickRenewData.renew_tariffs || []).length > 0;
+      const hasUpgrade = (quickRenewData.upgrade_tariffs || []).length > 0;
+      const tabsCont = document.getElementById("quickRenewTabsContainer");
+
+      if (hasRenew && hasUpgrade) {
+        tabsCont.style.display = "flex";
+        quickActiveTab = "renew";
+      } else {
+        tabsCont.style.display = "none";
+        quickActiveTab = hasRenew ? "renew" : "upgrade";
+      }
+      updateQuickRenewTabs();
+    }
+
+    function updateQuickRenewTabs() {
+      const tabRenew = document.getElementById("quickRenewTabRenew");
+      const tabUpgrade = document.getElementById("quickRenewTabUpgrade");
+      if (tabRenew && tabUpgrade) {
+        tabRenew.className = `quick-tab-btn ${quickActiveTab === "renew" ? "active" : ""}`;
+        tabUpgrade.className = `quick-tab-btn ${quickActiveTab === "upgrade" ? "active" : ""}`;
+      }
+      const label = document.getElementById("quickRenewSelectLabel");
+      label.textContent = quickActiveTab === "renew" ? "Выберите период продления:" : "Выберите новый тариф:";
+      document.getElementById("quickRenewUpgradeNote").hidden = !(
+        quickActiveTab === "upgrade" && !quickRenewData.is_trial && !quickRenewData.is_expired && quickRenewData.expires_at
+      );
+
+      const list = document.getElementById("quickTariffsList");
+      list.innerHTML = "";
+      const tariffs = quickActiveTab === "renew" ? (quickRenewData.renew_tariffs || []) : (quickRenewData.upgrade_tariffs || []);
+      if (!tariffs.length) {
+        list.innerHTML = `<div style='color:var(--muted); font-size:13px; padding:10px 0;'>${quickRenewData.unavailable_message || "Нет доступных тарифов"}</div>`;
+        selectedQuickTariffKey = null;
+        return;
+      }
+      selectedQuickTariffKey = tariffs[0].key;
+
+      tariffs.forEach((t) => {
+        const card = document.createElement("div");
+        card.className = `quick-tariff-card ${t.key === selectedQuickTariffKey ? "selected" : ""}`;
+        card.dataset.key = t.key;
+        card.innerHTML = `
+          <div>
+            <strong>${t.label}</strong>
+            <div style="font-size:12px; color:var(--muted);">${t.device_limit ? t.device_limit + ' устр.' : ''} ${t.badge ? '· ' + t.badge : ''}</div>
+          </div>
+          <div class="quick-price">${t.payable_price_rub} ₽</div>
+        `;
+        card.addEventListener("click", () => {
+          selectedQuickTariffKey = t.key;
+          list.querySelectorAll(".quick-tariff-card").forEach((c) => c.classList.remove("selected"));
+          card.classList.add("selected");
+          updatePayBtnText(t);
+        });
+        list.appendChild(card);
+      });
+      updatePayBtnText(tariffs[0]);
+    }
+
+    function updatePayBtnText(t) {
+      const btn = document.getElementById("quickRenewPayBtn");
+      if (btn && t) {
+        btn.textContent = `Оплатить ${t.payable_price_rub} ₽`;
+      }
+    }
+
+    async function submitQuickRenewPayment() {
+      if (!quickRenewData || !selectedQuickTariffKey) {
+        showToast("Выберите тариф для продления");
+        return;
+      }
+      const emailInput = document.getElementById("quickRenewEmailInput");
+      const contact = (emailInput ? emailInput.value : "").trim();
+      if (!contact && !getSavedProfileToken()) {
+        showToast("Введите email для получения чека");
+        if (emailInput) emailInput.focus();
+        return;
+      }
+
+      const btn = document.getElementById("quickRenewPayBtn");
+      btn.disabled = true;
+      btn.textContent = "Переходим к оплате…";
+
+      try {
+        const payload = {
+          tariff_key: selectedQuickTariffKey,
+          contact: contact,
+          purchase_action: quickActiveTab === "renew" ? "renew" : "upgrade",
+          target_order_id: `uuid:${quickRenewData.adapt_uuid}`,
+          ref: refSource || undefined,
+          entry_referrer: getEntryReferrer() || undefined,
+          entry_url: window.location.href || undefined,
+        };
+        const resp = await fetch("/api/store/create-order", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        let data = {};
+        try {
+          data = await resp.json();
+        } catch (_) {
+          data = { error: "Ошибка сервера (код " + resp.status + ")" };
+        }
+        if (!resp.ok) {
+          showToast(data.error || ("Ошибка создания платежа: " + resp.status));
+          btn.disabled = false;
+          btn.textContent = "Перейти к оплате";
+          return;
+        }
+        if (data.redirect_url) {
+          clearStoredReferral();
+          window.location.href = data.redirect_url;
+        } else {
+          showToast("Платёж создан");
+        }
+      } catch (err) {
+        showToast("Ошибка при создании оплаты: " + (err.message || err));
+        btn.disabled = false;
+        btn.textContent = "Перейти к оплате";
+      }
+    }
+
+    function openGuideLightbox(src) {
+      const box = document.getElementById("guideLightbox");
+      const img = document.getElementById("guideLightboxImg");
+      if (box && img) {
+        img.src = src;
+        box.style.display = "flex";
+      }
+    }
+    function closeGuideLightbox() {
+      const box = document.getElementById("guideLightbox");
+      const img = document.getElementById("guideLightboxImg");
+      if (box) box.style.display = "none";
+      if (img) img.src = "";
+    }
+
+    const gBox = document.getElementById("guideLightbox");
+    if (gBox) {
+      gBox.addEventListener("click", () => {
+        closeGuideLightbox();
+      });
+    }
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeGuideLightbox();
+    });
+
+    const gTabHapp = document.getElementById("guideTabHapp");
+    const gTabIncy = document.getElementById("guideTabIncy");
+    const gPaneHapp = document.getElementById("guidePaneHapp");
+    const gPaneIncy = document.getElementById("guidePaneIncy");
+    if (gTabHapp && gTabIncy && gPaneHapp && gPaneIncy) {
+      gTabHapp.addEventListener("click", () => {
+        gTabHapp.style.background = "var(--brand)";
+        gTabHapp.style.color = "#fff";
+        gTabHapp.style.borderColor = "var(--brand)";
+        gTabIncy.style.background = "#f8fafc";
+        gTabIncy.style.color = "var(--text-main)";
+        gTabIncy.style.borderColor = "var(--border)";
+        gPaneHapp.style.display = "block";
+        gPaneIncy.style.display = "none";
+      });
+      gTabIncy.addEventListener("click", () => {
+        gTabIncy.style.background = "#10b981";
+        gTabIncy.style.color = "#fff";
+        gTabIncy.style.borderColor = "#10b981";
+        gTabHapp.style.background = "#f8fafc";
+        gTabHapp.style.color = "var(--text-main)";
+        gTabHapp.style.borderColor = "var(--border)";
+        gPaneIncy.style.display = "block";
+        gPaneHapp.style.display = "none";
+      });
+    }
+
+    const qgToggle = document.getElementById("quickGuideToggle");
+    const qgContent = document.getElementById("quickGuideContent");
+    const qgChevron = document.getElementById("quickGuideChevron");
+    if (qgToggle && qgContent) {
+      qgToggle.addEventListener("click", () => {
+        const isHidden = qgContent.style.display === "none";
+        qgContent.style.display = isHidden ? "block" : "none";
+        if (qgChevron) qgChevron.style.transform = isHidden ? "rotate(180deg)" : "rotate(0deg)";
+      });
+    }
+
+    const qrTopbar = document.getElementById("quickRenewTopbarBtn");
+    if (qrTopbar) qrTopbar.addEventListener("click", openQuickRenewModal);
+    const qrHero = document.getElementById("quickRenewHeroBtn");
+    if (qrHero) qrHero.addEventListener("click", openQuickRenewModal);
+    const qrTariff = document.getElementById("quickRenewTariffBtn");
+    if (qrTariff) qrTariff.addEventListener("click", openQuickRenewModal);
+    document.getElementById("quickRenewModalClose").addEventListener("click", closeQuickRenewModal);
+    document.getElementById("quickRenewOverlay").addEventListener("click", (e) => {
+      if (e.target === e.currentTarget) closeQuickRenewModal();
+    });
+    document.getElementById("quickRenewFindBtn").addEventListener("click", lookupQuickRenew);
+    document.getElementById("quickRenewQueryInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") lookupQuickRenew();
+    });
+    document.getElementById("quickRenewBackBtn").addEventListener("click", () => {
+      document.getElementById("quickRenewLookupStep").style.display = "block";
+      document.getElementById("quickRenewResultStep").style.display = "none";
+    });
+    const qrTabRenew = document.getElementById("quickRenewTabRenew");
+    if (qrTabRenew) {
+      qrTabRenew.addEventListener("click", () => {
+        quickActiveTab = "renew";
+        updateQuickRenewTabs();
+      });
+    }
+    const qrTabUpgrade = document.getElementById("quickRenewTabUpgrade");
+    if (qrTabUpgrade) {
+      qrTabUpgrade.addEventListener("click", () => {
+        quickActiveTab = "upgrade";
+        updateQuickRenewTabs();
+      });
+    }
+    document.getElementById("quickRenewPayBtn").addEventListener("click", submitQuickRenewPayment);
+
+    function checkDirectRenewRoute() {
+      const url = new URL(window.location.href);
+      const isRenew = window.location.pathname === "/renew" || window.location.hash === "#renew" || url.searchParams.get("action") === "renew";
+      if (isRenew) {
+        openQuickRenewModal();
+        const keyParam = url.searchParams.get("key") || url.searchParams.get("link");
+        if (keyParam) {
+          const input = document.getElementById("quickRenewQueryInput");
+          if (input) {
+            input.value = keyParam;
+            lookupQuickRenew();
+          }
+        }
+      }
+    }
+
+    // Backup domain announcement banner and modal
+    const BACKUP_BANNER_STORAGE_KEY = "darimiru_backup_banner_dismissed_v1";
+    let pendingBackupAccess = false;
+
+    function initBackupDomainBanner() {
+      const banner = document.getElementById("backupDomainBanner");
+      if (!banner) return;
+      try {
+        if (localStorage.getItem(BACKUP_BANNER_STORAGE_KEY) === "1") {
+          banner.style.display = "none";
+          return;
+        }
+      } catch (e) {}
+      banner.style.display = "flex";
+    }
+
+    function dismissBackupDomainBanner() {
+      const banner = document.getElementById("backupDomainBanner");
+      if (banner) {
+        banner.style.display = "none";
+      }
+      try {
+        localStorage.setItem(BACKUP_BANNER_STORAGE_KEY, "1");
+      } catch (e) {}
+    }
+
+    function closeBackupLinkModal() {
+      const overlay = document.getElementById("backupLinkOverlay");
+      if (overlay) {
+        overlay.classList.remove("active");
+      }
+    }
+
+    async function handleBackupBannerCta() {
+      const token = getSavedProfileToken();
+      if (!token) {
+        pendingBackupAccess = true;
+        openAuthModal("login");
+        showToast("Войдите в профиль, чтобы получить резервную ссылку");
+        return;
+      }
+      openBackupLinkModal();
+    }
+
+    async function openBackupLinkModal() {
+      const overlay = document.getElementById("backupLinkOverlay");
+      const loading = document.getElementById("backupLoading");
+      const content = document.getElementById("backupContent");
+      const empty = document.getElementById("backupEmpty");
+      const errorBox = document.getElementById("backupError");
+      const list = document.getElementById("backupList");
+      if (!overlay || !loading || !content || !empty || !errorBox || !list) return;
+
+      overlay.classList.add("active");
+      loading.style.display = "block";
+      content.style.display = "none";
+      empty.style.display = "none";
+      errorBox.style.display = "none";
+      list.innerHTML = "";
+
+      const token = getSavedProfileToken();
+      if (!token) {
+        loading.style.display = "none";
+        closeBackupLinkModal();
+        pendingBackupAccess = true;
+        openAuthModal("login");
+        showToast("Войдите в профиль, чтобы получить резервную ссылку");
+        return;
+      }
+
+      try {
+        const resp = await fetch(`/api/store/profile-orders?token=${encodeURIComponent(token)}`, {
+          credentials: "same-origin"
+        });
+        if (resp.status === 401 || resp.status === 403) {
+          loading.style.display = "none";
+          closeBackupLinkModal();
+          pendingBackupAccess = true;
+          openAuthModal("login");
+          showToast("Пожалуйста, войдите в профиль снова");
+          return;
+        }
+        if (!resp.ok) {
+          throw new Error("HTTP error " + resp.status);
+        }
+
+        const data = await resp.json();
+        const now = new Date();
+        const activeItems = [];
+        const seenUrls = new Set();
+
+        function normalizeBackupUrl(rawUrl) {
+          if (!rawUrl) return "";
+          return rawUrl.replace(/^https?:\/\/darimiru\.ru\/vpnbot\/adapt-sub\//i, "https://darimiru.xyz/vpnbot/adapt-sub/");
+        }
+
+        (data.orders || []).forEach(o => {
+          const isAdapt = o.provider === "adapt" || (o.subscription_url && o.subscription_url.includes("/adapt-sub/"));
+          if (isAdapt && ["delivered", "demo"].includes(o.status)) {
+            const isExpired = o.access_expires_at && new Date(o.access_expires_at) <= now;
+            if (!isExpired && o.subscription_url) {
+              const norm = normalizeBackupUrl(o.subscription_url);
+              if (!seenUrls.has(norm)) {
+                seenUrls.add(norm);
+                activeItems.push({
+                  url: norm,
+                  title: o.tariff_label || (o.is_trial ? "Демо-доступ" : "Подписка Adapt"),
+                  expiresAt: o.access_expires_at,
+                });
+              }
+            }
+          }
+        });
+
+        (data.telegram_items || []).forEach(item => {
+          const isAdapt = item.provider === "adapt" || (item.key_value && item.key_value.includes("/adapt-sub/"));
+          if (isAdapt && item.status === "active") {
+            const isExpired = item.expires_at && new Date(item.expires_at) <= now;
+            if (!isExpired && item.key_value) {
+              const norm = normalizeBackupUrl(item.key_value);
+              if (!seenUrls.has(norm)) {
+                seenUrls.add(norm);
+                activeItems.push({
+                  url: norm,
+                  title: item.title || "Подписка из Telegram",
+                  expiresAt: item.expires_at,
+                });
+              }
+            }
+          }
+        });
+
+        loading.style.display = "none";
+
+        if (!activeItems.length) {
+          empty.style.display = "block";
+          return;
+        }
+
+        activeItems.forEach(item => {
+          const card = document.createElement("div");
+          card.className = "backup-sub-card";
+
+          let expiryText = "";
+          if (item.expiresAt) {
+            try {
+              const dt = new Date(item.expiresAt);
+              if (!isNaN(dt.getTime())) {
+                const day = String(dt.getDate()).padStart(2, "0");
+                const mon = String(dt.getMonth() + 1).padStart(2, "0");
+                const yr = dt.getFullYear();
+                expiryText = `до ${day}.${mon}.${yr}`;
+              }
+            } catch (e) {}
+          }
+
+          const header = document.createElement("div");
+          header.className = "backup-sub-card-header";
+          header.innerHTML = `
+            <strong class="backup-sub-title">${escapeHtml(item.title)}</strong>
+            ${expiryText ? `<span class="backup-sub-expiry">${escapeHtml(expiryText)}</span>` : ""}
+          `;
+
+          const row = document.createElement("div");
+          row.className = "backup-sub-row";
+
+          const input = document.createElement("input");
+          input.type = "text";
+          input.readOnly = true;
+          input.className = "backup-sub-input";
+          input.value = item.url;
+          input.onclick = function() { this.select(); };
+
+          const copyBtn = document.createElement("button");
+          copyBtn.type = "button";
+          copyBtn.className = "backup-copy-btn";
+          copyBtn.textContent = "Копировать";
+          copyBtn.onclick = function() { copyBackupUrl(item.url, copyBtn); };
+
+          row.appendChild(input);
+          row.appendChild(copyBtn);
+
+          card.appendChild(header);
+          card.appendChild(row);
+          list.appendChild(card);
+        });
+
+        content.style.display = "block";
+      } catch (err) {
+        loading.style.display = "none";
+        errorBox.style.display = "block";
+      }
+    }
+
+    function copyBackupUrl(url, btn) {
+      if (!url) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(() => {
+          showBackupCopied(btn);
+        }).catch(() => fallbackBackupCopy(url, btn));
+      } else {
+        fallbackBackupCopy(url, btn);
+      }
+    }
+
+    function fallbackBackupCopy(url, btn) {
+      const ta = document.createElement("textarea");
+      ta.value = url;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      try {
+        document.execCommand("copy");
+        showBackupCopied(btn);
+      } catch (e) {
+        showToast("Не удалось скопировать, выделите ссылку вручную");
+      }
+      document.body.removeChild(ta);
+    }
+
+    function showBackupCopied(btn) {
+      if (!btn) return;
+      const orig = btn.textContent;
+      btn.textContent = "✓ Скопировано";
+      btn.classList.add("copied");
+      setTimeout(() => {
+        btn.textContent = orig;
+        btn.classList.remove("copied");
+      }, 2000);
+    }
+
+    function escapeHtml(str) {
+      if (!str) return "";
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    const backupBannerCloseBtn = document.getElementById("backupBannerClose");
+    if (backupBannerCloseBtn) {
+      backupBannerCloseBtn.addEventListener("click", dismissBackupDomainBanner);
+    }
+
+    const backupBannerCtaBtn = document.getElementById("backupBannerCta");
+    if (backupBannerCtaBtn) {
+      backupBannerCtaBtn.addEventListener("click", handleBackupBannerCta);
+    }
+
+    const backupModalCloseBtn = document.getElementById("backupLinkModalClose");
+    if (backupModalCloseBtn) {
+      backupModalCloseBtn.addEventListener("click", closeBackupLinkModal);
+    }
+
+    const backupOverlayEl = document.getElementById("backupLinkOverlay");
+    if (backupOverlayEl) {
+      backupOverlayEl.addEventListener("click", (e) => {
+        if (e.target === e.currentTarget) closeBackupLinkModal();
+      });
+    }
+
+    const backupRetryEl = document.getElementById("backupRetryBtn");
+    if (backupRetryEl) {
+      backupRetryEl.addEventListener("click", openBackupLinkModal);
+    }
+
+    const backupEmptyTariffEl = document.getElementById("backupEmptyTariffBtn");
+    if (backupEmptyTariffEl) {
+      backupEmptyTariffEl.addEventListener("click", closeBackupLinkModal);
+    }
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeBackupLinkModal();
+    });
+
     renderTariffs();
     renderGuides();
     initContactForm();
     initCookieConsent();
-    syncAuthButtons();
-    loadInviteSection();
-    loadWebBalanceHint();
+    async function initializeStore() {
+      try {
+        const response = await fetch("/api/store/auth/me");
+        if (response.ok) {
+          const auth = await response.json();
+          if (auth.authenticated) saveProfileToken(auth.profile_token);
+        }
+      } catch {
+        showToast("Не удалось проверить вход. Попробуйте ещё раз.");
+      }
+      initBackupDomainBanner();
+      syncAuthButtons();
+      loadInviteSection();
+      loadWebBalanceHint();
+      checkDirectRenewRoute();
+      if (new URLSearchParams(window.location.search).get("demo") === "1") openDemoModal();
+      if (new URLSearchParams(window.location.search).get("auth") === "register") openAuthModal("register");
+    }
+    initializeStore();
   </script>
 </body>
 </html>

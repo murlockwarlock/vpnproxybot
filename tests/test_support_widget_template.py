@@ -33,6 +33,36 @@ def test_support_page_can_reset_closed_ticket_when_enabled():
     assert 'document.getElementById("resolvedActions").style.display = "block"' in html
 
 
+def test_support_page_has_messenger_contact_buttons_below_start_chat():
+    html = _template("support.html")
+    start_chat_pos = html.index('id="startChatBtn"')
+    contacts_pos = html.index("Связаться с нами:")
+
+    assert contacts_pos > start_chat_pos
+    assert 'href="https://t.me/darimiru_support"' in html
+    assert 'href="https://vk.me/id1115218916"' in html
+    assert 'href="https://max.ru/u/f9LHodD0cOLRekkBBJUG4DVfHlbqzm1ZEE1C6fp6cGKYXHwcI83LikdFndI"' in html
+
+
+def test_support_page_has_requested_messenger_options():
+    html = _template("support.html")
+    select = html[html.index('<select id="messengerInput">'):html.index("</select>")]
+
+    expected_options = (
+        '<option value="">— не указано —</option>',
+        '<option value="telegram">Telegram</option>',
+        '<option value="vk">ВКонтакте</option>',
+        '<option value="max">MAX</option>',
+        '<option value="whatsapp">WhatsApp</option>',
+        '<option value="email">Email</option>',
+        '<option value="other">Другой</option>',
+    )
+    positions = [select.index(option) for option in expected_options]
+
+    assert positions == sorted(positions)
+    assert '<option value="phone">' not in select
+
+
 def test_deploy_webstore_proxies_support_chat_routes():
     deploy_script = (ROOT / "deploy_webstore.py").read_text(encoding="utf-8")
     assert "location /support" in deploy_script

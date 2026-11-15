@@ -14,17 +14,29 @@ from sqlalchemy.orm import selectinload
 from bot.config import settings
 from bot.database import async_session
 from bot.keyboards.client import profile_kb, renewal_choice_kb
-from bot.models import BalanceTransaction, MTProtoAccount, RecurringPaymentProfile, Subscription, Tariff, User
+from bot.models import (
+    AdaptSubscription,
+    BalanceTransaction,
+    MTProtoAccount,
+    RecurringPaymentProfile,
+    Subscription,
+    Tariff,
+    User,
+)
 from bot.services.adapt_routing import is_adapt_subscription, get_adapt_uuid_from_subscription
 from bot.services.device_slots import get_included_device_slots
-from bot.services.balance_service import get_daily_charge_rub, get_user_balance, next_charge_datetime
+from bot.services.balance_service import DAILY_BILLING_CONTROLS_AVAILABLE, get_daily_charge_rub, get_user_balance, next_charge_datetime
 from bot.services.balance_mode_service import disable_balance_mode, enable_balance_mode
 from bot.services.tariff_utils import format_subscription_duration
 from bot.services.vhq_subscription_proxy import get_subscription_display_key
 from bot.services.vhq_routing import is_vhq_subscription
 from bot.services.webstore_bridge import fetch_linked_web_profile, sync_linked_web_subscriptions, sync_user_profile
 from bot.services.subscription_service import _format_proxy_links
-from bot.services.subscription_semantics import is_demo_subscription_row, paid_access_clause
+from bot.services.subscription_semantics import (
+    get_adapt_plan_tariff,
+    is_adapt_trial_subscription,
+    is_demo_subscription_row,
+)
 from bot.utils.texts import (
     MTPROTO_KEY_INFO,
     NO_SUBSCRIPTIONS,
@@ -75,12 +87,19 @@ def _is_mtproto_placeholder(vpn_key: str | None) -> bool:
 
 
 def _profile_vpn_subscriptions(subscriptions: list[Subscription]) -> list[Subscription]:
-    """Use the same renewable active/expired set in the key list."""
+    """Return active VPN keys and expired paid subscriptions for the key list."""
     return sorted(
         (
             sub for sub in subscriptions
             if sub.status.value in {"active", "expired"}
-            and not is_demo_subscription_row(sub)
+            and not (
+                sub.status.value == "expired"
+                and (
+                    is_adapt_trial_subscription(sub, adapt_sub=getattr(sub, "adapt_sub", None))
+                    if is_adapt_subscription(sub)
+                    else is_demo_subscription_row(sub)
+                )
+            )
             and not _is_mtproto_placeholder(sub.vpn_key)
         ),
         key=lambda item: item.expires_at or datetime.min,
@@ -98,6 +117,13 @@ def _subscription_product_label(sub: Subscription, mtproto_accounts: list[MTProt
 
 
 def _subscription_tariff_label(sub: Subscription, mtproto_accounts: list[MTProtoAccount]) -> str:
+    if is_adapt_subscription(sub) and getattr(sub, "adapt_sub", None):
+        if is_adapt_trial_subscription(sub, adapt_sub=sub.adapt_sub):
+            return "Демо-доступ"
+        current_tariff = getattr(sub, "adapt_current_tariff", None)
+        if current_tariff:
+            return current_tariff.label
+        return _subscription_product_label(sub, mtproto_accounts)
     if getattr(sub, "billing_mode", None) == "demo":
         return "Демо-доступ"
     if getattr(sub, "tariff", None):
@@ -107,6 +133,41 @@ def _subscription_tariff_label(sub: Subscription, mtproto_accounts: list[MTProto
         tariff_months=sub.tariff_months,
     )
     return f"{_subscription_product_label(sub, mtproto_accounts)} - {duration}"
+
+
+async def _attach_adapt_context(session, subscriptions: list[Subscription]) -> None:
+    subscription_ids = [sub.id for sub in subscriptions if is_adapt_subscription(sub)]
+    if not subscription_ids:
+        return
+    records = (
+        await session.execute(
+            select(AdaptSubscription).where(AdaptSubscription.subscription_id.in_(subscription_ids))
+        )
+    ).scalars().all()
+    records_by_subscription_id = {record.subscription_id: record for record in records}
+    plan_uuids = {
+        str(record.adapt_plan_uuid).strip()
+        for record in records
+        if str(record.adapt_plan_uuid or "").strip()
+    }
+    tariffs_by_uuid: dict[str, Tariff] = {}
+    if plan_uuids:
+        tariffs = (
+            await session.execute(
+                select(Tariff)
+                .where(Tariff.adapt_plan_uuid.in_(plan_uuids))
+                .order_by(Tariff.id.desc())
+            )
+        ).scalars().all()
+        for tariff in tariffs:
+            tariffs_by_uuid.setdefault(str(tariff.adapt_plan_uuid).strip(), tariff)
+    for sub in subscriptions:
+        if not is_adapt_subscription(sub):
+            continue
+        adapt_record = records_by_subscription_id.get(sub.id)
+        sub.adapt_sub = adapt_record
+        canonical_uuid = str(getattr(adapt_record, "adapt_plan_uuid", None) or "").strip()
+        sub.adapt_current_tariff = tariffs_by_uuid.get(canonical_uuid) if canonical_uuid else sub.tariff
 
 
 def _subscription_device_slots(sub: Subscription, included_slots: int) -> int:
@@ -137,19 +198,33 @@ async def _build_renewal_options(session, user: User) -> list[tuple[int, str, fl
     from bot.models import Subscription as Sub
     now = datetime.utcnow()
     subs_result = await session.execute(
-        select(Sub)
+        select(Sub, AdaptSubscription)
+        .outerjoin(AdaptSubscription, AdaptSubscription.subscription_id == Sub.id)
         .where(Sub.user_id == user.id)
-        .where(paid_access_clause(Sub))
         .order_by(Sub.expires_at.desc())
     )
-    subs = subs_result.scalars().all()
+    subs: list[Subscription] = []
+    for sub, adapt_record in subs_result.all():
+        if is_adapt_subscription(sub):
+            sub.adapt_sub = adapt_record
+            canonical_uuid = str(getattr(adapt_record, "adapt_plan_uuid", None) or "").strip()
+            if canonical_uuid:
+                sub.adapt_current_tariff = await get_adapt_plan_tariff(session, canonical_uuid)
+            else:
+                sub.adapt_current_tariff = sub.tariff
+            if not is_adapt_trial_subscription(sub, adapt_sub=adapt_record):
+                subs.append(sub)
+        elif not is_demo_subscription_row(sub):
+            subs.append(sub)
 
     seen_tariff_ids: set[int] = set()
     options: list[tuple[int, str, float]] = []
 
     for sub in subs:
-        if sub.tariff_id and sub.tariff_id not in seen_tariff_ids:
+        tariff = getattr(sub, "adapt_current_tariff", None)
+        if not tariff and sub.tariff_id:
             tariff = await session.get(Tariff, sub.tariff_id)
+        if tariff and tariff.id not in seen_tariff_ids:
             if (
                 tariff
                 and tariff.is_active
@@ -157,7 +232,7 @@ async def _build_renewal_options(session, user: User) -> list[tuple[int, str, fl
             ):
                 daily_rate = round(float(tariff.price_rub) / max(tariff.days, 1), 2)
                 options.append((tariff.id, tariff.label, daily_rate))
-                seen_tariff_ids.add(sub.tariff_id)
+                seen_tariff_ids.add(tariff.id)
 
     return options
 
@@ -181,6 +256,7 @@ async def show_profile(callback: CallbackQuery) -> None:
         if not user:
             await callback.answer("Пользователь не найден", show_alert=True)
             return
+        await _attach_adapt_context(session, user.subscriptions)
 
         # Recurring payment profile
         rec_result = await session.execute(
@@ -243,7 +319,12 @@ async def show_profile(callback: CallbackQuery) -> None:
         for sub in user.subscriptions
     )
     has_expired_paid_subs = any(
-        sub.status.value == "expired" and not is_demo_subscription_row(sub)
+        sub.status.value == "expired"
+        and not (
+            is_adapt_trial_subscription(sub, adapt_sub=getattr(sub, "adapt_sub", None))
+            if is_adapt_subscription(sub)
+            else is_demo_subscription_row(sub)
+        )
         for sub in user.subscriptions
     )
     purchase_button_text = (
@@ -382,7 +463,7 @@ async def show_profile(callback: CallbackQuery) -> None:
             balance_mode_enabled=bool(user.balance_mode_enabled),
             balance_autodebit_enabled=bool(user.balance_autodebit_enabled),
             site_profile_url=(
-                f"{settings.webstore_api_base_url.rstrip('/')}/profile"
+                f"{(getattr(settings, 'public_webstore_base_url', None) or settings.webstore_api_base_url).rstrip('/')}/profile"
                 if settings.webstore_public_enabled
                 else None
             ),
@@ -396,6 +477,9 @@ async def show_profile(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "balance_toggle")
 async def balance_toggle(callback: CallbackQuery) -> None:
+    if not DAILY_BILLING_CONTROLS_AVAILABLE:
+        await callback.answer("Ежедневные списания больше недоступны", show_alert=True)
+        return
     async with async_session() as session:
         result = await session.execute(
             select(User).where(User.telegram_id == callback.from_user.id)
@@ -471,6 +555,9 @@ async def balance_history(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "daily_charge_tariff_choice")
 async def daily_charge_tariff_choice(callback: CallbackQuery) -> None:
     """Show available tariffs to choose which one to use for daily auto-charges."""
+    if not DAILY_BILLING_CONTROLS_AVAILABLE:
+        await callback.answer("Ежедневные списания больше недоступны", show_alert=True)
+        return
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     from aiogram.types import InlineKeyboardButton
 
@@ -508,6 +595,9 @@ async def daily_charge_tariff_choice(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("set_daily_tariff_"))
 async def set_daily_tariff(callback: CallbackQuery) -> None:
     """Save chosen tariff for daily auto-charge."""
+    if not DAILY_BILLING_CONTROLS_AVAILABLE:
+        await callback.answer("Ежедневные списания больше недоступны", show_alert=True)
+        return
     tariff_id = int(callback.data.removeprefix("set_daily_tariff_"))
 
     async with async_session() as session:
@@ -570,6 +660,8 @@ async def _build_keys_page(
             .where(User.telegram_id == telegram_id)
         )
         user = result.scalar_one_or_none()
+        if user:
+            await _attach_adapt_context(session, user.subscriptions)
         mtproto_result = await session.execute(
             select(MTProtoAccount)
             .where(MTProtoAccount.user_id == user.id)
@@ -586,9 +678,27 @@ async def _build_keys_page(
         return "Пользователь не найден", None
     included_slots = locals().get("included_slots", 3)
 
+    vpn_subscriptions = _profile_vpn_subscriptions(user.subscriptions)
+    renew_subscription_ids: set[int] = set()
+    upgrade_subscription_ids: set[int] = set()
+    has_paid_adapt = False
+    if any(is_adapt_subscription(sub) for sub in vpn_subscriptions):
+        from bot.handlers.buy import (
+            _has_paid_subscription,
+            _purchase_targets,
+        )
+
+        renew_subscription_ids = {
+            sub.id for sub in await _purchase_targets(telegram_id)
+        }
+        upgrade_subscription_ids = {
+            sub.id for sub in await _purchase_targets(telegram_id, upgrade_only=True)
+        }
+        has_paid_adapt = await _has_paid_subscription(telegram_id)
+
     key_items: list[tuple[str, object]] = []
     seen_subscription_urls: set[str] = set()
-    for sub in _profile_vpn_subscriptions(user.subscriptions):
+    for sub in vpn_subscriptions:
         display_key = get_subscription_display_key(sub) or sub.vpn_key
         key_items.append(("vpn", sub))
         if display_key:
@@ -623,12 +733,23 @@ async def _build_keys_page(
         )
         provider_label = _provider_label(sub)
         tariff_line = ""
-        if getattr(sub, "billing_mode", None) == "demo":
-            tariff_line = f"📦 Тариф: Демо-доступ\n"
-        elif sub.tariff:
-            tariff_line = f"📦 Тариф: {sub.tariff.label}\n"
-        elif provider_label:
-            tariff_line = f"📦 Тариф: {provider_label}\n"
+        adapt_record = getattr(sub, "adapt_sub", None)
+        current_tariff = getattr(sub, "adapt_current_tariff", None)
+        if is_adapt_subscription(sub) and adapt_record:
+            if is_adapt_trial_subscription(sub, adapt_sub=adapt_record):
+                tariff_line = f"📦 Тариф: Демо-доступ\n"
+            elif current_tariff:
+                tariff_line = f"📦 Тариф: {current_tariff.label}\n"
+            elif provider_label:
+                tariff_line = f"📦 Тариф: {provider_label}\n"
+        else:
+            current_tariff = current_tariff or sub.tariff
+            if getattr(sub, "billing_mode", None) == "demo":
+                tariff_line = f"📦 Тариф: Демо-доступ\n"
+            elif current_tariff:
+                tariff_line = f"📦 Тариф: {current_tariff.label}\n"
+            elif provider_label:
+                tariff_line = f"📦 Тариф: {provider_label}\n"
         if is_adapt_subscription(sub) or is_vhq_subscription(sub):
             header = f"🔗 <b>Подписка Darimiru</b>"
         else:
@@ -665,6 +786,34 @@ async def _build_keys_page(
                 adapt_kb_builder.row(InlineKeyboardButton(
                     text="❄️ Заморозить", callback_data=f"adapt_freeze:{sub.id}"
                 ))
+            adapt_kb_builder.row(InlineKeyboardButton(
+                text="📱 Управление устройствами",
+                callback_data=f"manage_devices_{sub.id}",
+            ))
+            action_buttons = []
+            if sub.id in renew_subscription_ids:
+                action_buttons.append(
+                    InlineKeyboardButton(
+                        text="↻ Продлить",
+                        callback_data=f"purchase_renew_{sub.id}",
+                    )
+                )
+            if sub.id in upgrade_subscription_ids:
+                action_buttons.append(
+                    InlineKeyboardButton(
+                        text="↑ Улучшить",
+                        callback_data=f"purchase_upgrade_{sub.id}",
+                    )
+                )
+            if has_paid_adapt:
+                action_buttons.append(
+                    InlineKeyboardButton(
+                        text="➕ Создать новую",
+                        callback_data=f"buy_new_{sub.id}",
+                    )
+                )
+            if action_buttons:
+                adapt_kb_builder.row(*action_buttons)
             # Add nav buttons from standard kb
             nav_buttons = []
             if page > 1:

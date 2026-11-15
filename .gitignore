@@ -34,6 +34,7 @@ Thumbs.db
 
 # Temp
 tmp/
+.webstore-profile-locks/
 
 # SSH keys
 *.pem
@@ -46,5 +47,7 @@ ops/nl-stack/local-packages/
 # Deploy scripts
 deploy_*.py
 deploy_*.sh
+!deploy_prod.sh
+deploy/*.conf
 ssh_exec.py
 ssh_transfer.py

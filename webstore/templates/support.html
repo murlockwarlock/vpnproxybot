@@ -163,6 +163,12 @@
     }
     .new-ticket-form h3 { font-size: 15px; font-weight: 700; margin-bottom: 2px; }
     .new-ticket-form p { font-size: 13px; color: var(--muted); }
+    .recovery-intro { padding: 14px; border-radius: 14px; background: rgba(12,140,140,.08); color: var(--text); line-height: 1.5; }
+    .recovery-intro strong { display: block; margin-bottom: 5px; }
+    .recovery-status { display: none; padding: 14px; border-radius: 14px; background: rgba(239,138,37,.11); color: var(--text); line-height: 1.5; }
+    .recovery-status.active { display: block; }
+    .recovery-status strong { display: block; margin-bottom: 5px; }
+    .recovery-status button { margin-top: 10px; }
     .field label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 5px; }
     .field input, .field textarea, .field select {
       width: 100%; padding: 11px 14px;
@@ -184,18 +190,27 @@
     .btn-primary:hover { background: var(--brand-deep); }
     .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
 
+    .support-contacts { margin-top: 2px; }
+    .support-contacts-title {
+      margin-bottom: 8px; color: var(--muted);
+      font-size: 12px; font-weight: 600;
+    }
     .support-social-links {
-      display: flex; gap: 8px; margin-top: 4px;
+      display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px;
     }
     .support-social-btn {
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 8px 14px; border-radius: 20px;
+      min-width: 0; min-height: 42px;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      padding: 8px 10px; border-radius: 12px;
       font-size: 13px; font-weight: 600; text-decoration: none;
       transition: opacity .15s;
     }
     .support-social-btn:hover { opacity: .8; }
     .support-social-btn svg { width: 16px; height: 16px; fill: currentColor; }
+    .support-social-telegram { background: #229ed9; color: #fff; }
     .support-social-vk { background: #0077FF; color: #fff; }
+    .support-social-max { background: #7657ff; color: #fff; }
+    .support-social-max-icon { font-size: 11px; font-weight: 800; }
 
     /* Input area */
     .chat-input-area {
@@ -221,6 +236,58 @@
     }
     .send-btn:hover { background: var(--brand-deep); }
     .send-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+    .attach-btn {
+      width: 42px; height: 42px; border-radius: 50%;
+      background: rgba(20,34,44,0.06); color: var(--muted);
+      border: 1px solid var(--line); cursor: pointer; font-size: 18px;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0; transition: all .2s;
+    }
+    .attach-btn:hover { background: rgba(20,34,44,0.12); color: var(--text); }
+    .attach-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+    .attachment-preview-bar {
+      display: none; align-items: center; gap: 10px;
+      padding: 8px 16px; border-top: 1px solid var(--line);
+      background: rgba(20,34,44,0.03);
+    }
+    .attachment-preview-bar.active { display: flex; }
+    .attachment-thumb {
+      width: 44px; height: 44px; border-radius: 8px;
+      object-fit: cover; border: 1px solid var(--line);
+      background: #fff;
+    }
+    .attachment-info { flex: 1; min-width: 0; font-size: 12px; }
+    .attachment-name { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+    .attachment-status { color: var(--muted); font-size: 11px; }
+    .attachment-remove-btn {
+      background: none; border: none; font-size: 18px;
+      cursor: pointer; color: var(--muted); padding: 4px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .attachment-remove-btn:hover { color: #c0392b; }
+
+    .msg-media { margin-bottom: 6px; }
+    .msg-media img {
+      max-width: 100%; max-height: 240px; border-radius: 12px;
+      display: block; cursor: pointer; object-fit: cover;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      transition: transform .15s ease-in-out;
+    }
+    .msg-media img:hover { transform: scale(1.02); }
+
+    .new-ticket-attach-wrap {
+      display: flex; align-items: center; gap: 8px;
+    }
+    .new-ticket-attach-btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 8px 12px; border-radius: 10px;
+      border: 1px dashed var(--line); background: rgba(20,34,44,0.02);
+      font-size: 13px; font-weight: 600; color: var(--muted);
+      cursor: pointer; font-family: var(--font); transition: all .15s;
+    }
+    .new-ticket-attach-btn:hover { border-color: var(--brand); color: var(--brand); background: rgba(12,140,140,0.04); }
 
     .resolved-banner {
       text-align: center; padding: 14px;
@@ -255,26 +322,80 @@
         <h3>Написать в поддержку</h3>
         <p>Опишите проблему — мы ответим как можно скорее.</p>
       </div>
-      <div class="field">
+      <div id="recoveryIntro" class="recovery-intro" hidden>
+        <strong>Восстановление доступа через поддержку</strong>
+        Укажите данные для поиска старого профиля. Ссылка подписки или номер заказа помогают найти заказ, но сами по себе не подтверждают владение.
+      </div>
+      <div id="recoveryFields" hidden>
+        <div class="field">
+          <label for="recoveryContact">Старый номер телефона или контакт *</label>
+          <input id="recoveryContact" type="text" maxlength="256" autocomplete="tel" placeholder="Например, +7 900 000-00-00">
+        </div>
+        <div class="field">
+          <label for="recoveryReference">Ссылка VPN-подписки или номер заказа *</label>
+          <input id="recoveryReference" type="text" maxlength="1024" placeholder="Ссылка или номер заказа">
+        </div>
+        <div class="field">
+          <label for="recoveryEmail">Новый email *</label>
+          <input id="recoveryEmail" type="email" maxlength="254" autocomplete="email" placeholder="name@example.com">
+        </div>
+        <div class="field">
+          <label for="recoveryDetails">Дополнительные сведения для проверки</label>
+          <textarea id="recoveryDetails" rows="3" maxlength="4000" placeholder="Например: дата и сумма платежа. Не указывайте пароль, полный номер карты, CVV или коды из SMS."></textarea>
+        </div>
+      </div>
+      <div id="normalQuestionField" class="field">
         <label>Ваш вопрос *</label>
-        <textarea id="firstMsg" rows="3" placeholder="Например: ключ не работает после оплаты..."></textarea>
+        <textarea id="firstMsg" rows="3" placeholder="Например: ключ не работает после оплаты... (можно вставить скриншот Ctrl+V)"></textarea>
+      </div>
+      <div class="new-ticket-attach-wrap">
+        <input type="file" id="newTicketFileInput" accept="image/png,image/jpeg,image/webp,image/gif" style="display:none" onchange="uploadNewTicketFile(this.files[0])">
+        <button type="button" class="new-ticket-attach-btn" onclick="document.getElementById('newTicketFileInput').click()">
+          <span>📎</span> <span id="newTicketAttachLabel">Прикрепить скриншот</span>
+        </button>
+      </div>
+      <div id="newTicketPendingAttachment" class="attachment-preview-bar">
+        <img id="newTicketThumb" class="attachment-thumb" src="" alt="">
+        <div class="attachment-info">
+          <div id="newTicketFileName" class="attachment-name"></div>
+          <div id="newTicketFileStatus" class="attachment-status">Загружено</div>
+        </div>
+        <button type="button" class="attachment-remove-btn" onclick="removeNewTicketAttachment()" title="Удалить">✕</button>
       </div>
       <div class="field">
         <label>Как с вами связаться *</label>
-        <input id="contactInput" type="text" placeholder="Телефон или email..." required>
+        <input id="contactInput" type="text" placeholder="Телефон, email или @telegram..." required>
       </div>
       <div class="field">
         <label>Предпочтительный мессенджер</label>
         <select id="messengerInput">
           <option value="">— не указано —</option>
+          <option value="telegram">Telegram</option>
           <option value="vk">ВКонтакте</option>
-          <option value="phone">Телефон / SMS</option>
+          <option value="max">MAX</option>
+          <option value="whatsapp">WhatsApp</option>
           <option value="email">Email</option>
           <option value="other">Другой</option>
         </select>
       </div>
-      <div class="support-social-links">{{SUPPORT_VK_BTN}}</div>
       <button class="btn-primary" id="startChatBtn" onclick="startChat()">Начать чат</button>
+      <div class="support-contacts">
+        <p class="support-contacts-title">Связаться с нами:</p>
+        <div class="support-social-links">
+          <a href="https://t.me/darimiru_support" target="_blank" rel="noopener noreferrer" class="support-social-btn support-social-telegram">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.8 3.2 18.6 20c-.2 1.2-.9 1.5-1.9.9l-4.9-3.6-2.4 2.3c-.3.3-.5.5-1 .5l.4-5 9-8.1c.4-.4-.1-.6-.6-.2L6.1 13.7l-4.8-1.5c-1-.3-1.1-1 .2-1.5L20.3 3c.9-.3 1.7.2 1.5.2z"/></svg>
+            Telegram
+          </a>
+          <a href="https://vk.me/id1115218916" target="_blank" rel="noopener noreferrer" class="support-social-btn support-social-vk">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13.16 17.5c-5.63 0-8.84-3.87-8.97-10.32H7c.1 5.08 2.33 7.22 4.11 7.67V7.18h2.84v4.1c1.76-.19 3.61-2.17 4.23-4.1H21c-.47 2.41-2.43 4.39-3.82 5.2 1.39.65 3.6 2.4 4.43 5.12h-3.1c-.65-2.02-2.27-3.59-4.35-3.79v3.79h-1z"/></svg>
+            ВКонтакте
+          </a>
+          <a href="https://max.ru/u/f9LHodD0cOLRekkBBJUG4DVfHlbqzm1ZEE1C6fp6cGKYXHwcI83LikdFndI" target="_blank" rel="noopener noreferrer" class="support-social-btn support-social-max">
+            <span class="support-social-max-icon" aria-hidden="true">MAX</span>
+            Макс
+          </a>
+        </div>
+      </div>
     </div>
 
     <!-- chat screen (hidden initially) -->
@@ -287,6 +408,11 @@
         </div>
         <div class="status-dot" id="agentDot"></div>
       </div>
+      <div class="recovery-status" id="recoveryStatus" aria-live="polite">
+        <strong id="recoveryStatusTitle"></strong>
+        <span id="recoveryStatusText"></span>
+        <button class="btn-primary" id="recoveryOtpButton" type="button" style="display:none" onclick="startRecoveryOtp()">Получить код на новый email</button>
+      </div>
       <div class="chat-messages" id="messages">
         <div class="typing-indicator" id="typingIndicator">
           <span></span><span></span><span></span>
@@ -298,20 +424,40 @@
       <div id="resolvedActions" class="resolved-actions">
         <button class="btn-primary" type="button" onclick="startNewTicket()">Новое обращение</button>
       </div>
+      <div id="chatPendingAttachment" class="attachment-preview-bar">
+        <img id="chatThumb" class="attachment-thumb" src="" alt="">
+        <div class="attachment-info">
+          <div id="chatFileName" class="attachment-name"></div>
+          <div id="chatFileStatus" class="attachment-status">Загружено</div>
+        </div>
+        <button type="button" class="attachment-remove-btn" onclick="removeChatAttachment()" title="Удалить">✕</button>
+      </div>
       <div class="chat-input-area" id="inputArea">
-        <textarea class="chat-input" id="chatInput" rows="1" placeholder="Сообщение..." onkeydown="handleKey(event)" oninput="autoResize(this); sendTyping();"></textarea>
-        <button class="send-btn" onclick="sendMessage()">➤</button>
+        <input type="file" id="chatFileInput" accept="image/png,image/jpeg,image/webp,image/gif" style="display:none" onchange="uploadChatFile(this.files[0])">
+        <button type="button" class="attach-btn" id="attachBtn" onclick="document.getElementById('chatFileInput').click()" title="Прикрепить скриншот">📎</button>
+        <textarea class="chat-input" id="chatInput" rows="1" placeholder="Сообщение или вставьте скриншот (Ctrl+V)..." onkeydown="handleKey(event)" oninput="autoResize(this); sendTyping();"></textarea>
+        <button class="send-btn" id="sendBtn" onclick="sendMessage()">➤</button>
       </div>
     </div>
   </div>
 
   <script>
-    const STORAGE_KEY = "support_ticket_token";
+    const recoveryMode = {{SUPPORT_RECOVERY_MODE}};
+    const STORAGE_KEY = recoveryMode ? "support_recovery_ticket_token" : "support_ticket_token";
     let token = localStorage.getItem(STORAGE_KEY);
     let ws = null;
     let typingTimeout = null;
     let audioCtx = null;
     let shouldReconnect = true;
+
+    let newTicketMediaUrl = null;
+    let chatMediaUrl = null;
+    let recoveryState = null;
+
+    function getCookie(name) {
+      const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+      return match ? decodeURIComponent(match[2]) : null;
+    }
 
     function beep(freq = 880, dur = 0.25, vol = 0.08) {
       try {
@@ -332,26 +478,144 @@
       return d.toLocaleTimeString("ru-RU", {hour:"2-digit", minute:"2-digit"});
     }
 
+    function escapeHtml(s) {
+      return String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br>");
+    }
+
     function appendMessage(msg) {
       const area = document.getElementById("messages");
       const typing = document.getElementById("typingIndicator");
       const el = document.createElement("div");
       el.className = `msg ${msg.sender}`;
-      let senderLine = msg.sender === "agent" ? `<div class="msg-sender">${msg.agent_name || "Поддержка"}</div>` : "";
-      el.innerHTML = `${senderLine}<div>${escapeHtml(msg.text)}</div><div class="msg-time">${formatTime(msg.created_at)}</div>`;
+      let senderLine = msg.sender === "agent" ? `<div class="msg-sender">${escapeHtml(msg.agent_name || "Поддержка")}</div>` : "";
+      let mediaHtml = "";
+      if (msg.media_url) {
+        mediaHtml = `<div class="msg-media"><a href="${msg.media_url}" target="_blank" rel="noopener noreferrer"><img src="${msg.media_url}" alt="Скриншот" loading="lazy"></a></div>`;
+      }
+      let textHtml = msg.text ? `<div>${escapeHtml(msg.text)}</div>` : "";
+      el.innerHTML = `${senderLine}${mediaHtml}${textHtml}<div class="msg-time">${formatTime(msg.created_at)}</div>`;
       area.insertBefore(el, typing);
       area.scrollTop = area.scrollHeight;
       if (msg.sender === "agent") beep(660, 0.2);
-    }
-
-    function escapeHtml(s) {
-      return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br>");
     }
 
     function showTyping(visible) {
       document.getElementById("typingIndicator").className = "typing-indicator" + (visible ? " visible" : "");
       if (visible) document.getElementById("messages").scrollTop = 9999;
     }
+
+    // Media upload helper
+    async function doUpload(file, onProgress, onSuccess, onError) {
+      if (!file) return;
+      if (!file.type.startsWith("image/")) {
+        alert("Пожалуйста, выберите изображение (PNG, JPEG, WebP, GIF)");
+        return;
+      }
+      if (file.size > 10 * 1024 * 1024) {
+        alert("Размер файла превышает 10 МБ");
+        return;
+      }
+      onProgress && onProgress("Загрузка...");
+      const formData = new FormData();
+      formData.append("file", file);
+      try {
+        const res = await fetch("/api/support/upload", {
+          method: "POST",
+          body: formData,
+        });
+        const data = await res.json();
+        if (res.ok && data.ok && data.url) {
+          onSuccess(data.url, file.name);
+        } else {
+          onError && onError(data.error || "Ошибка загрузки");
+        }
+      } catch (err) {
+        onError && onError("Ошибка сети");
+      }
+    }
+
+    function uploadNewTicketFile(file) {
+      if (!file) return;
+      const bar = document.getElementById("newTicketPendingAttachment");
+      const thumb = document.getElementById("newTicketThumb");
+      const nameEl = document.getElementById("newTicketFileName");
+      const statusEl = document.getElementById("newTicketFileStatus");
+
+      bar.classList.add("active");
+      nameEl.textContent = file.name;
+      statusEl.textContent = "Загрузка...";
+      thumb.src = URL.createObjectURL(file);
+
+      doUpload(file,
+        status => { statusEl.textContent = status; },
+        (url, name) => {
+          newTicketMediaUrl = url;
+          statusEl.textContent = "Прикреплено";
+        },
+        err => {
+          statusEl.textContent = err;
+          alert("Не удалось загрузить файл: " + err);
+          removeNewTicketAttachment();
+        }
+      );
+    }
+
+    function removeNewTicketAttachment() {
+      newTicketMediaUrl = null;
+      document.getElementById("newTicketFileInput").value = "";
+      document.getElementById("newTicketPendingAttachment").classList.remove("active");
+    }
+
+    function uploadChatFile(file) {
+      if (!file) return;
+      const bar = document.getElementById("chatPendingAttachment");
+      const thumb = document.getElementById("chatThumb");
+      const nameEl = document.getElementById("chatFileName");
+      const statusEl = document.getElementById("chatFileStatus");
+
+      bar.classList.add("active");
+      nameEl.textContent = file.name;
+      statusEl.textContent = "Загрузка...";
+      thumb.src = URL.createObjectURL(file);
+
+      doUpload(file,
+        status => { statusEl.textContent = status; },
+        (url, name) => {
+          chatMediaUrl = url;
+          statusEl.textContent = "Прикреплено";
+        },
+        err => {
+          statusEl.textContent = err;
+          alert("Не удалось загрузить файл: " + err);
+          removeChatAttachment();
+        }
+      );
+    }
+
+    function removeChatAttachment() {
+      chatMediaUrl = null;
+      document.getElementById("chatFileInput").value = "";
+      document.getElementById("chatPendingAttachment").classList.remove("active");
+    }
+
+    // Global paste listener for screenshots
+    document.addEventListener("paste", e => {
+      if (!e.clipboardData || !e.clipboardData.items) return;
+      for (const item of e.clipboardData.items) {
+        if (item.type.indexOf("image") !== -1) {
+          const file = item.getAsFile();
+          if (!file) continue;
+          e.preventDefault();
+          const chatScreen = document.getElementById("chatScreen");
+          if (chatScreen.style.display !== "none") {
+            uploadChatFile(file);
+          } else {
+            uploadNewTicketFile(file);
+          }
+          break;
+        }
+      }
+    });
 
     function connectWS() {
       if (!token) return;
@@ -362,7 +626,7 @@
         const data = JSON.parse(e.data);
         if (data.type === "message") {
           showTyping(false);
-          if (data.sender === "client") return; // already shown optimistically
+          if (data.sender === "client") return;
           appendMessage(data);
         } else if (data.type === "typing" && data.sender === "agent") {
           showTyping(true);
@@ -388,17 +652,88 @@
         const r = await fetch(`/api/support/ticket/${token}`);
         if (!r.ok) { localStorage.removeItem(STORAGE_KEY); token = null; return; }
         const data = await r.json();
+        recoveryState = data.recovery || null;
         showChatScreen();
-        const area = document.getElementById("messages");
-        const typing = document.getElementById("typingIndicator");
         for (const msg of data.messages) appendMessage(msg);
         if (data.status === "resolved") {
           showResolvedState();
         } else {
           showActiveState();
         }
+        if (recoveryState) updateRecoveryStatus(recoveryState);
         connectWS();
+        if (recoveryState && recoveryState.status === "pending") pollRecoveryState();
       } catch(e) {}
+    }
+
+    function updateRecoveryStatus(state) {
+      const panel = document.getElementById("recoveryStatus");
+      if (!panel || !state) return;
+      panel.classList.add("active");
+      const title = document.getElementById("recoveryStatusTitle");
+      const text = document.getElementById("recoveryStatusText");
+      const button = document.getElementById("recoveryOtpButton");
+      const status = state.status;
+      button.style.display = "none";
+      if (status === "pending") {
+        title.textContent = "Обращение принято";
+        text.textContent = "Поддержка проверит данные заказа. Доступ не выдаётся автоматически по ссылке подписки.";
+      } else if (status === "approved") {
+        title.textContent = "Владелец профиля подтверждён";
+        if (state.otp_verified) {
+          text.textContent = "Email уже подтверждён кодом. Завершите установку пароля в открытом окне.";
+        } else {
+          text.textContent = `Код будет отправлен на ${state.new_email}. Разрешение действует ограниченное время.`;
+          button.style.display = "inline-flex";
+        }
+      } else if (status === "completed") {
+        title.textContent = "Восстановление завершено";
+        text.textContent = "Email подтверждён, пароль можно использовать для входа в старый профиль.";
+      } else if (status === "denied") {
+        title.textContent = "Поддержка не смогла подтвердить владение";
+        text.textContent = state.denied_reason || "Предоставьте дополнительные сведения через этот тикет.";
+      } else if (status === "expired") {
+        title.textContent = "Разрешение истекло";
+        text.textContent = "Создайте новое обращение, если поддержка попросила повторить проверку.";
+      }
+    }
+
+    async function pollRecoveryState() {
+      if (!token) return;
+      try {
+        const response = await fetch(`/api/support/recovery/${token}`);
+        if (!response.ok) return;
+        recoveryState = await response.json();
+        updateRecoveryStatus(recoveryState);
+        if (recoveryState.status === "pending") setTimeout(pollRecoveryState, 5000);
+      } catch(e) {}
+    }
+
+    async function startRecoveryOtp() {
+      if (!token || !recoveryState || recoveryState.status !== "approved") return;
+      const button = document.getElementById("recoveryOtpButton");
+      button.disabled = true;
+      button.textContent = "Отправляем…";
+      try {
+        const response = await fetch("/api/store/auth/otp/start", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({purpose: "support", ticket_token: token})
+        });
+        const data = await response.json();
+        if (!response.ok || !data.challenge) {
+          document.getElementById("recoveryStatusText").textContent = data.error || "Не удалось отправить код.";
+          if (response.status === 429 && data.retry_after) setTimeout(pollRecoveryState, data.retry_after * 1000);
+          return;
+        }
+        sessionStorage.setItem("darimiru_otp", JSON.stringify({challenge: data.challenge, email: recoveryState.new_email, purpose: "support", support_recovery_id: data.support_recovery_id, ticket_token: token}));
+        window.location.assign("/password-reset?flow=otp&support=1");
+      } catch(e) {
+        document.getElementById("recoveryStatusText").textContent = "Ошибка сети. Попробуйте ещё раз.";
+      } finally {
+        button.disabled = false;
+        button.textContent = "Получить код на новый email";
+      }
     }
 
     function showActiveState() {
@@ -420,7 +755,10 @@
         ws = null;
       }
       token = null;
+      recoveryState = null;
       localStorage.removeItem(STORAGE_KEY);
+      removeNewTicketAttachment();
+      removeChatAttachment();
       document.getElementById("chatScreen").style.display = "none";
       document.getElementById("newTicketScreen").style.display = "flex";
       document.getElementById("messages").innerHTML = '<div class="typing-indicator" id="typingIndicator"><span></span><span></span><span></span></div>';
@@ -428,6 +766,7 @@
       document.getElementById("chatInput").value = "";
       document.getElementById("startChatBtn").disabled = false;
       document.getElementById("startChatBtn").textContent = "Начать чат";
+      document.getElementById("recoveryStatus").classList.remove("active");
       showActiveState();
       setTimeout(() => document.getElementById("firstMsg").focus(), 50);
     }
@@ -442,9 +781,30 @@
 
     async function startChat() {
       const msgText = document.getElementById("firstMsg").value.trim();
-      if (!msgText) { document.getElementById("firstMsg").focus(); return; }
-      const contactVal = document.getElementById("contactInput").value.trim();
-      if (!contactVal) { document.getElementById("contactInput").focus(); return; }
+      const mediaUrl = newTicketMediaUrl;
+      let recoveryPayload = null;
+      if (recoveryMode) {
+        const oldContact = document.getElementById("recoveryContact").value.trim();
+        const reference = document.getElementById("recoveryReference").value.trim();
+        const newEmail = document.getElementById("recoveryEmail").value.trim();
+        const details = document.getElementById("recoveryDetails").value.trim();
+        if (!oldContact || !reference || !newEmail || !document.getElementById("recoveryEmail").checkValidity()) {
+          document.getElementById("recoveryContact").focus();
+          return;
+        }
+        recoveryPayload = {old_contact: oldContact, reference, new_email: newEmail, details};
+      }
+      if (!msgText && !mediaUrl && !recoveryPayload) {
+        document.getElementById("firstMsg").focus();
+        return;
+      }
+      let contactVal = recoveryPayload ? recoveryPayload.old_contact : document.getElementById("contactInput").value.trim();
+      const profileToken = getCookie("webstore_profile_token");
+      if (!contactVal && !profileToken) {
+        document.getElementById("contactInput").focus();
+        return;
+      }
+
       const btn = document.getElementById("startChatBtn");
       btn.disabled = true;
       btn.textContent = "Отправляем...";
@@ -454,17 +814,34 @@
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({
             message: msgText,
-            contact: document.getElementById("contactInput").value.trim() || null,
+            media_url: mediaUrl,
+            contact: contactVal || null,
             messenger: document.getElementById("messengerInput").value || null,
+            profile_token: profileToken || null,
+            recovery: recoveryPayload,
           })
         });
         const data = await r.json();
         if (data.token) {
           token = data.token;
+          recoveryState = data.recovery || null;
           localStorage.setItem(STORAGE_KEY, token);
+          removeNewTicketAttachment();
           showChatScreen();
-          appendMessage({sender:"client", text:msgText, created_at: new Date().toISOString(), agent_name:null});
+          appendMessage({
+            sender: "client",
+            text: msgText,
+            media_url: mediaUrl,
+            created_at: new Date().toISOString(),
+            agent_name: null,
+          });
           connectWS();
+          if (recoveryState) {
+            updateRecoveryStatus(recoveryState);
+            pollRecoveryState();
+          }
+        } else {
+          btn.disabled = false; btn.textContent = "Начать чат";
         }
       } catch(e) {
         btn.disabled = false; btn.textContent = "Начать чат";
@@ -474,14 +851,24 @@
     async function sendMessage() {
       const input = document.getElementById("chatInput");
       const text = input.value.trim();
-      if (!text || !token) return;
+      const mediaUrl = chatMediaUrl;
+      if ((!text && !mediaUrl) || !token) return;
+
       input.value = ""; autoResize(input);
-      appendMessage({sender:"client", text, created_at: new Date().toISOString(), agent_name:null});
+      removeChatAttachment();
+      appendMessage({
+        sender: "client",
+        text,
+        media_url: mediaUrl,
+        created_at: new Date().toISOString(),
+        agent_name: null,
+      });
+
       try {
         await fetch(`/api/support/ticket/${token}/message`, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({text})
+          body: JSON.stringify({text, media_url: mediaUrl})
         });
       } catch(e) {}
     }
@@ -501,12 +888,45 @@
       el.style.height = Math.min(el.scrollHeight, 120) + "px";
     }
 
+    // Auto-fill contact if logged in
+    async function checkLoggedInProfile() {
+      const pToken = getCookie("webstore_profile_token");
+      if (!pToken) return;
+      try {
+        const res = await fetch("/api/store/profile-orders");
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.profile) {
+            const cInput = document.getElementById("contactInput");
+            if (cInput && !cInput.value) {
+              if (data.profile.telegram_username) {
+                cInput.value = "@" + data.profile.telegram_username;
+                const mSel = document.getElementById("messengerInput");
+                if (mSel) mSel.value = "telegram";
+              } else if (data.profile.contact) {
+                cInput.value = data.profile.contact;
+              }
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
     // Init
+    if (recoveryMode) {
+      document.getElementById("recoveryIntro").hidden = false;
+      document.getElementById("recoveryFields").hidden = false;
+      document.getElementById("normalQuestionField").hidden = true;
+      document.getElementById("contactInput").closest(".field").hidden = true;
+      document.getElementById("messengerInput").closest(".field").hidden = true;
+      document.getElementById("startChatBtn").textContent = "Создать обращение";
+    }
     if (window.top !== window.self) {
       document.body.classList.add("iframe-mode");
     }
     if (token) { loadTicket(); }
-    // unlock AudioContext on first interaction
+    checkLoggedInProfile();
+
     document.addEventListener("click", () => {
       if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     }, {once: true});

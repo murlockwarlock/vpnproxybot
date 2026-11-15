@@ -14,7 +14,7 @@ from sqlalchemy import select
 from bot.database import async_session
 from bot.models import AdaptSubscription, MTProtoAccount, Platform, SubStatus, Subscription, Tariff, User
 from bot.services.adapt_api import AdaptAPI
-from bot.services.adapt_routing import build_adapt_client_name
+from bot.services.adapt_routing import build_adapt_client_name, get_adapt_uuid_from_subscription
 from bot.services.adapt_subscription_proxy import build_adapt_mirror_url
 from bot.services.subscription_service import _format_proxy_links
 from bot.services.tariff_utils import format_subscription_duration
@@ -33,10 +33,22 @@ def _headers() -> dict[str, str]:
     return {"X-Internal-Secret": settings.webstore_bridge_secret}
 
 
+async def load_adapt_subscriptions_map(
+    session, subscription_ids: list[int]
+) -> dict[int, AdaptSubscription]:
+    if not subscription_ids:
+        return {}
+    res = await session.execute(
+        select(AdaptSubscription).where(AdaptSubscription.subscription_id.in_(subscription_ids))
+    )
+    return {rec.subscription_id: rec for rec in res.scalars().all()}
+
+
 def serialize_profile_items(
     user: User,
     subscriptions: list[Subscription],
     mtproto_accounts: list[MTProtoAccount],
+    adapt_map: dict[int, AdaptSubscription] | None = None,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
 
@@ -53,14 +65,40 @@ def serialize_profile_items(
             "vhq" if client_name.startswith("vhq_") else "marzban"
         )
         tariff = getattr(sub, "tariff", None)
+        adapt_sub = (adapt_map or {}).get(sub.id) if (adapt_map and sub.id) else None
+
+        if provider == "adapt":
+            if adapt_sub:
+                adapt_uuid = adapt_sub.adapt_uuid
+                adapt_plan_uuid = adapt_sub.adapt_plan_uuid
+            else:
+                logger.info(
+                    "Falling back to legacy Adapt metadata for sub %s without AdaptSubscription row",
+                    sub.id,
+                )
+                adapt_uuid = get_adapt_uuid_from_subscription(sub)
+                adapt_plan_uuid = str(getattr(tariff, "adapt_plan_uuid", "") or "")
+
+            if tariff and getattr(tariff, "adapt_plan_uuid", None) and adapt_sub and tariff.adapt_plan_uuid != adapt_sub.adapt_plan_uuid:
+                logger.warning(
+                    "Inconsistent Adapt plan metadata for sub %s: tariff=%s adapt_sub=%s",
+                    sub.id,
+                    tariff.adapt_plan_uuid,
+                    adapt_sub.adapt_plan_uuid,
+                )
+            key_value = sub.vpn_key or (build_adapt_mirror_url(adapt_uuid) if adapt_uuid else None)
+        else:
+            adapt_plan_uuid = ""
+            key_value = get_subscription_display_key(sub)
+
         items.append({
             "item_type": "vpn",
             "external_id": f"sub_{sub.id}",
             "title": title,
             "subtitle": subtitle,
-            "key_value": get_subscription_display_key(sub),
+            "key_value": key_value,
             "provider": provider,
-            "adapt_plan_uuid": str(getattr(tariff, "adapt_plan_uuid", "") or ""),
+            "adapt_plan_uuid": adapt_plan_uuid,
             "status": sub.status.value,
             "device_slots": sub.device_slots,
             "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
@@ -88,6 +126,19 @@ def serialize_profile_items(
     return items
 
 
+async def _serialize_profile_items_async(
+    user: User,
+    subscriptions: list[Subscription],
+    mtproto_accounts: list[MTProtoAccount],
+) -> list[dict[str, Any]]:
+    sub_ids = [s.id for s in subscriptions if getattr(s, "id", None) and str(getattr(s, "client_name", "") or "").startswith("adapt_")]
+    adapt_map: dict[int, AdaptSubscription] = {}
+    if sub_ids:
+        async with async_session() as session:
+            adapt_map = await load_adapt_subscriptions_map(session, sub_ids)
+    return serialize_profile_items(user, subscriptions, mtproto_accounts, adapt_map=adapt_map)
+
+
 async def claim_web_link(
     code: str,
     user: User,
@@ -97,12 +148,13 @@ async def claim_web_link(
     if not _bridge_enabled() or not code:
         return False
 
+    items = await _serialize_profile_items_async(user, subscriptions, mtproto_accounts)
     payload = {
         "code": code,
         "telegram_id": user.telegram_id,
         "telegram_username": user.username,
         "telegram_full_name": user.full_name,
-        "items": serialize_profile_items(user, subscriptions, mtproto_accounts),
+        "items": items,
     }
     url = f"{settings.webstore_api_base_url.rstrip('/')}/api/store/internal/telegram-link-claim"
     try:
@@ -123,12 +175,13 @@ async def claim_web_auth(
     if not _bridge_enabled() or not code:
         return False
 
+    items = await _serialize_profile_items_async(user, subscriptions, mtproto_accounts)
     payload = {
         "code": code,
         "telegram_id": user.telegram_id,
         "telegram_username": user.username,
         "telegram_full_name": user.full_name,
-        "items": serialize_profile_items(user, subscriptions, mtproto_accounts),
+        "items": items,
     }
     url = f"{settings.webstore_api_base_url.rstrip('/')}/api/store/internal/telegram-auth-claim"
     try:
@@ -148,11 +201,12 @@ async def sync_user_profile(
     if not _bridge_enabled():
         return
 
+    items = await _serialize_profile_items_async(user, subscriptions, mtproto_accounts)
     payload = {
         "telegram_id": user.telegram_id,
         "telegram_username": user.username,
         "telegram_full_name": user.full_name,
-        "items": serialize_profile_items(user, subscriptions, mtproto_accounts),
+        "items": items,
         "synced_at": datetime.utcnow().isoformat(),
     }
     url = f"{settings.webstore_api_base_url.rstrip('/')}/api/store/internal/telegram-sync"
@@ -234,7 +288,6 @@ async def sync_linked_web_subscriptions(telegram_id: int, profile: dict[str, Any
             return False
 
         api = AdaptAPI()
-        plans_cache: list[dict[str, Any]] | None = None
         for adapt_uuid, order in candidates.items():
             record = await session.scalar(
                 select(AdaptSubscription).where(AdaptSubscription.adapt_uuid == adapt_uuid)
@@ -260,20 +313,10 @@ async def sync_linked_web_subscriptions(telegram_id: int, profile: dict[str, Any
             if not expires_at:
                 continue
             actual_devices = status.get("devices")
-            if actual_devices is None and plan_uuid:
-                try:
-                    if plans_cache is None:
-                        plans_cache = await api.list_plans()
-                    plan = next(
-                        (
-                            item for item in plans_cache
-                            if str(item.get("uuid") or item.get("plan_uuid") or "").strip() == plan_uuid
-                        ),
-                        None,
-                    )
-                    actual_devices = plan.get("devices") if plan else None
-                except Exception as exc:
-                    logger.warning("Failed to resolve Adapt device limit for %s: %s", adapt_uuid, exc)
+            if actual_devices is None and tariff:
+                actual_devices = tariff.device_count
+            if actual_devices is None and subscription:
+                actual_devices = subscription.device_slots
             if actual_devices is None:
                 logger.warning("Cannot import web Adapt subscription %s: provider device limit is missing", adapt_uuid)
                 continue
@@ -309,7 +352,7 @@ async def sync_linked_web_subscriptions(telegram_id: int, profile: dict[str, Any
                 subscription.server_id = server.id
                 subscription.status = SubStatus.ACTIVE if expires_at > datetime.utcnow() else SubStatus.EXPIRED
                 subscription.device_slots = devices
-                subscription.vpn_key = public_url
+                subscription.vpn_key = subscription.vpn_key or public_url
                 subscription.expires_at = expires_at
                 if tariff:
                     subscription.tariff_id = tariff.id

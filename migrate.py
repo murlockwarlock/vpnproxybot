@@ -148,12 +148,20 @@ def migrate(db_path):
     except sqlite3.OperationalError as e:
         print(f"⚠️ payments.tariff_id: {e}")
 
-    # 11. Add platform to payments
-    try:
-        cursor.execute("ALTER TABLE payments ADD COLUMN platform VARCHAR(32)")
-        print("✅ Added 'platform' to payments")
-    except sqlite3.OperationalError as e:
-        print(f"⚠️ payments.platform: {e}")
+    # 12. Partner multi-level commission columns
+    for tbl, col, col_type in [
+        ("partners", "commission_l2_percent", "REAL NOT NULL DEFAULT 0.0"),
+        ("partners", "commission_l3_percent", "REAL NOT NULL DEFAULT 0.0"),
+        ("partner_earnings", "depth", "INTEGER NOT NULL DEFAULT 1"),
+        ("partner_earnings", "commission_percent", "REAL NOT NULL DEFAULT 0.0"),
+        ("web_partner_earnings", "depth", "INTEGER NOT NULL DEFAULT 1"),
+        ("web_partner_earnings", "commission_percent", "REAL NOT NULL DEFAULT 0.0"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_type}")
+            print(f"✅ Added '{col}' to {tbl}")
+        except sqlite3.OperationalError as e:
+            print(f"⚠️ {tbl}.{col}: {e}")
 
     conn.commit()
     conn.close()

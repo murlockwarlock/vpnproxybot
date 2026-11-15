@@ -50,16 +50,20 @@ def test_disabled_without_credentials():
     assert api.enabled is False
 
 
-def test_minimum_custom_renew_upgrade_requires_positive_delta():
+def test_minimum_custom_renew_upgrade_requires_positive_provider_quote():
     current = {"uuid": "old", "price_usd": 1.0, "days": 10}
 
     assert can_upgrade_after_minimum_custom_renew(
         current,
-        {"uuid": "higher", "price_usd": 0.31, "days": 7},
+        {"uuid": "higher", "price_usd": 0.80, "days": 7},
     ) is True
     assert can_upgrade_after_minimum_custom_renew(
         current,
-        {"uuid": "lower", "price_usd": 0.30, "days": 7},
+        {"uuid": "lower_cost", "price_usd": 0.35, "days": 7},
+    ) is True
+    assert can_upgrade_after_minimum_custom_renew(
+        current,
+        {"uuid": "nonpositive_quote", "price_usd": 0.25, "days": 2},
     ) is False
 
 

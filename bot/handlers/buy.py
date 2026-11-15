@@ -42,10 +42,17 @@ from bot.services.purchase_intent import (
     decode_intent,
     effective_expired_adapt_action,
     encode_intent,
+    get_paid_adapt_upgrade_plans,
+    get_active_paid_adapt_upgrade_plans,
     get_purchase_price_rub,
 )
 from bot.services.adapt_routing import is_adapt_subscription
+from bot.services.vhq_routing import is_vhq_subscription, is_vhq_tariff
 from bot.services.subscription_semantics import (
+    is_adapt_customer_upgrade_eligible,
+    has_adapt_plan_metadata,
+    get_adapt_plan_tariff,
+    is_explicit_demo_subscription,
     is_adapt_trial_subscription,
     is_adapt_trial_tariff,
     paid_access_clause,
@@ -141,7 +148,7 @@ async def _get_active_locations(session) -> str:
     return "  •  ".join(parts)
 
 
-async def _has_non_vpn_tariffs(session, user_id: int = 0) -> bool:
+async def _has_non_vpn_tariffs(session, *, user_id: int) -> bool:
     """Check if any active TG proxy or Both tariffs exist."""
     q = (
         select(Tariff.id)
@@ -155,14 +162,65 @@ async def _has_non_vpn_tariffs(session, user_id: int = 0) -> bool:
     return result.scalar_one_or_none() is not None
 
 
+async def _has_paid_subscription(telegram_id: int) -> bool:
+    from bot.models import AdaptSubscription
+    async with async_session() as session:
+        rows = (
+            await session.execute(
+                select(Subscription, AdaptSubscription)
+                .outerjoin(AdaptSubscription, AdaptSubscription.subscription_id == Subscription.id)
+                .options(selectinload(Subscription.tariff))
+                .where(Subscription.user.has(telegram_id=telegram_id))
+            )
+        ).all()
+    return any(
+        not is_adapt_trial_subscription(sub, adapt_sub=adapt_sub)
+        for sub, adapt_sub in rows
+        if is_adapt_subscription(sub)
+    )
+
+
+async def _has_active_paid_subscription(telegram_id: int) -> bool:
+    from bot.models import AdaptSubscription
+    async with async_session() as session:
+        rows = (
+            await session.execute(
+                select(Subscription, AdaptSubscription)
+                .outerjoin(AdaptSubscription, AdaptSubscription.subscription_id == Subscription.id)
+                .options(selectinload(Subscription.tariff))
+                .where(Subscription.user.has(telegram_id=telegram_id))
+            )
+        ).all()
+    now = datetime.utcnow()
+    return any(
+        sub.status.value == "active"
+        and (sub.expires_at is None or sub.expires_at > now)
+        and not is_adapt_trial_subscription(sub, adapt_sub=adapt_sub)
+        for sub, adapt_sub in rows
+        if is_adapt_subscription(sub)
+    )
+
+
 @router.callback_query(F.data == "buy")
 async def start_purchase(callback: CallbackQuery) -> None:
     """Step 0 - Show product type selection, or skip to tariffs if only VPN."""
     async with async_session() as session:
         has_extra = await _has_non_vpn_tariffs(session, user_id=callback.from_user.id)
     purchase_targets = await _purchase_targets(callback.from_user.id)
+    has_paid = await _has_paid_subscription(callback.from_user.id)
 
     if purchase_targets:
+        if (
+            len(purchase_targets) == 1
+            and is_adapt_trial_subscription(
+                purchase_targets[0],
+                adapt_sub=getattr(purchase_targets[0], "adapt_sub", None),
+            )
+            and not has_paid
+        ):
+            await _open_renew_target(callback, purchase_targets[0].id)
+            return
+
         only_expires_at = (
             getattr(purchase_targets[0], "expires_at", None)
             if len(purchase_targets) == 1
@@ -176,20 +234,14 @@ async def start_purchase(callback: CallbackQuery) -> None:
                     sub.id,
                     position=0,
                     total=1,
-                    show_upgrade=False,
+                    show_upgrade=True,
+                    show_new=has_paid,
                     back_callback="profile",
                 ),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
             await callback.answer()
-            return
-        if (
-            len(purchase_targets) == 1
-            and is_adapt_trial_subscription(purchase_targets[0])
-            and not await _has_completed_payment(callback.from_user.id)
-        ):
-            await _open_renew_target(callback, purchase_targets[0].id)
             return
         await callback.message.edit_text(
             "<b>Оплата подписки</b>\n\n"
@@ -239,22 +291,37 @@ async def _quote_tariff_list(
     target_subscription_id: int,
 ) -> tuple[list[Tariff], dict[int, float]]:
     """Use the same quote as checkout for every tariff shown to the client."""
+    from bot.models import AdaptSubscription
     async with async_session() as session:
         user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
         target = await session.get(Subscription, target_subscription_id)
-        current_tariff = (
-            await session.get(Tariff, target.tariff_id)
-            if target and target.tariff_id
+        target_adapt_sub = (
+            await session.scalar(
+                select(AdaptSubscription).where(AdaptSubscription.subscription_id == target.id).limit(1)
+            )
+            if target
             else None
+        )
+        current_tariff = (
+            None
+        )
+        canonical_uuid = str(getattr(target_adapt_sub, "adapt_plan_uuid", None) or "").strip()
+        if canonical_uuid:
+            current_tariff = await get_adapt_plan_tariff(session, canonical_uuid)
+        if not canonical_uuid and target and target.tariff_id:
+            current_tariff = await session.get(Tariff, target.tariff_id)
+        current_plan_uuid = (
+            getattr(target_adapt_sub, "adapt_plan_uuid", None)
+            or getattr(current_tariff, "adapt_plan_uuid", None)
         )
         priced_tariffs: list[Tariff] = []
         prices: dict[int, float] = {}
         for tariff in tariffs:
             candidate_action = action
-            if target and current_tariff:
+            if target and current_plan_uuid:
                 candidate_action = effective_expired_adapt_action(
                     action,
-                    current_plan_uuid=current_tariff.adapt_plan_uuid,
+                    current_plan_uuid=current_plan_uuid,
                     selected_plan_uuid=tariff.adapt_plan_uuid,
                     expires_at=target.expires_at,
                 )
@@ -282,8 +349,16 @@ async def _quote_tariff_list(
 def _purchase_subscription_text(sub: Subscription, position: int, total: int) -> str:
     status = "активна" if sub.status.value == "active" else "срок закончился"
     expires = sub.expires_at.strftime("%d.%m.%Y") if sub.expires_at else "—"
-    days = int(getattr(sub.tariff, "days", 0) or sub.tariff_days or 0)
-    devices = int(sub.device_slots or getattr(sub.tariff, "device_count", 0) or 1)
+    canonical_uuid = str(
+        getattr(getattr(sub, "adapt_sub", None), "adapt_plan_uuid", None) or ""
+    ).strip()
+    current_tariff = (
+        getattr(sub, "adapt_current_tariff", None)
+        if canonical_uuid
+        else (getattr(sub, "adapt_current_tariff", None) or sub.tariff)
+    )
+    days = int(getattr(current_tariff, "days", 0) or sub.tariff_days or 0)
+    devices = int(sub.device_slots or getattr(current_tariff, "device_count", 0) or 1)
     url = get_subscription_display_key(sub) or sub.vpn_key or "Ссылка недоступна"
     return (
         f"<b>Подписка {position + 1}/{total}</b>\n\n"
@@ -341,7 +416,7 @@ async def browse_purchase_subscriptions(callback: CallbackQuery) -> None:
             reply_markup=purchase_intro_kb(),
         )
         return
-    position = requested_position % len(targets)
+    position = max(0, min(requested_position, len(targets) - 1))
     sub = targets[position]
     upgrade_ids = {
         item.id
@@ -350,6 +425,7 @@ async def browse_purchase_subscriptions(callback: CallbackQuery) -> None:
             upgrade_only=True,
         )
     }
+    has_paid = await _has_paid_subscription(callback.from_user.id)
     try:
         await callback.message.edit_text(
             _purchase_subscription_text(sub, position, len(targets)),
@@ -358,6 +434,7 @@ async def browse_purchase_subscriptions(callback: CallbackQuery) -> None:
                 position=position,
                 total=len(targets),
                 show_upgrade=sub.id in upgrade_ids,
+                show_new=has_paid,
             ),
             parse_mode="HTML",
             disable_web_page_preview=True,
@@ -397,6 +474,7 @@ async def return_to_purchase_subscription(callback: CallbackQuery) -> None:
         )
     }
     sub = targets[position]
+    has_paid = await _has_paid_subscription(callback.from_user.id)
     try:
         await callback.message.edit_text(
             _purchase_subscription_text(sub, position, len(targets)),
@@ -405,6 +483,7 @@ async def return_to_purchase_subscription(callback: CallbackQuery) -> None:
                 position=position,
                 total=len(targets),
                 show_upgrade=sub.id in upgrade_ids,
+                show_new=has_paid and not is_vhq_subscription(sub),
                 back_callback=(
                     "profile"
                     if len(targets) == 1 and sub.expires_at <= datetime.utcnow()
@@ -421,6 +500,14 @@ async def return_to_purchase_subscription(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "buy_new")
 async def start_new_purchase(callback: CallbackQuery) -> None:
+    targets = await _purchase_targets(callback.from_user.id)
+    has_paid = await _has_paid_subscription(callback.from_user.id)
+    if targets and not has_paid:
+        if len(targets) == 1 and is_adapt_trial_subscription(
+            targets[0], adapt_sub=getattr(targets[0], "adapt_sub", None)
+        ):
+            await _open_renew_target(callback, targets[0].id)
+            return
     await _open_new_purchase(callback, source_subscription_id=None)
 
 
@@ -431,15 +518,23 @@ async def start_new_purchase_from_subscription(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer("Не удалось открыть тарифы. Попробуйте ещё раз.", show_alert=True)
         return
+    targets = await _purchase_targets(callback.from_user.id)
     if not any(
         sub.id == source_subscription_id
-        for sub in await _purchase_targets(callback.from_user.id)
+        for sub in targets
     ):
         await callback.answer(
             "Подписка не найдена. Попробуйте ещё раз или напишите в поддержку.",
             show_alert=True,
         )
         return
+    has_paid = await _has_paid_subscription(callback.from_user.id)
+    if not has_paid:
+        if len(targets) == 1 and is_adapt_trial_subscription(
+            targets[0], adapt_sub=getattr(targets[0], "adapt_sub", None)
+        ):
+            await _open_renew_target(callback, targets[0].id)
+            return
     await _open_new_purchase(callback, source_subscription_id=source_subscription_id)
 
 
@@ -483,56 +578,136 @@ async def _purchase_targets(
     *,
     upgrade_only: bool = False,
 ) -> list[Subscription]:
+    from bot.models import AdaptSubscription
     async with async_session() as session:
         query = (
-            select(Subscription)
+            select(Subscription, AdaptSubscription)
+            .outerjoin(AdaptSubscription, AdaptSubscription.subscription_id == Subscription.id)
             .options(selectinload(Subscription.tariff))
             .where(Subscription.user.has(telegram_id=telegram_id))
-            .where(paid_access_clause(Subscription))
             .order_by(Subscription.expires_at.desc(), Subscription.id.desc())
         )
         result = await session.execute(query)
-        items = result.scalars().all()
-        upgrade_tariffs: list[tuple[str, float]] = []
+        rows = result.all()
+        canonical_uuids = {
+            str(adapt_sub.adapt_plan_uuid).strip()
+            for _, adapt_sub in rows
+            if adapt_sub and str(adapt_sub.adapt_plan_uuid or "").strip()
+        }
+        current_tariffs_by_uuid: dict[str, Tariff] = {}
+        if canonical_uuids:
+            current_result = await session.execute(
+                select(Tariff)
+                .where(Tariff.adapt_plan_uuid.in_(canonical_uuids))
+                .order_by(Tariff.id.desc())
+            )
+            for tariff in current_result.scalars().all():
+                current_tariffs_by_uuid.setdefault(str(tariff.adapt_plan_uuid).strip(), tariff)
+        items: list[Subscription] = []
+        for sub, adapt_sub in rows:
+            sub.adapt_sub = adapt_sub
+            canonical_uuid = str(getattr(adapt_sub, "adapt_plan_uuid", None) or "").strip()
+            sub.adapt_current_tariff = (
+                current_tariffs_by_uuid.get(canonical_uuid)
+                if canonical_uuid
+                else sub.tariff
+            )
+            items.append(sub)
+        all_upgrade_tariffs: list[Tariff] = []
         if upgrade_only:
             tariff_query = (
-                select(Tariff.adapt_plan_uuid, Tariff.price_rub)
+                select(Tariff)
                 .where(Tariff.is_active == True)  # noqa: E712
                 .where(Tariff.adapt_plan_uuid.is_not(None))
             )
             if not settings.is_admin(telegram_id):
                 tariff_query = tariff_query.where(Tariff.is_admin_only == False)  # noqa: E712
-            upgrade_tariffs = [
-                (str(plan_uuid).strip(), float(price))
-                for plan_uuid, price in (await session.execute(tariff_query)).all()
-                if str(plan_uuid or "").strip()
-            ]
-    items = [
-        sub
-        for sub in items
-        if sub.status.value in {"active", "expired"}
-        and bool(sub.vpn_key)
-        and is_adapt_subscription(sub)
-        and sub.tariff is not None
-        and sub.tariff.is_active
-    ]
-    if not settings.is_admin(telegram_id):
-        items = [sub for sub in items if not sub.tariff.is_admin_only]
-    if not upgrade_only:
-        return items
-    now = datetime.utcnow()
-    return [
-        sub for sub in items
-        if is_adapt_subscription(sub)
-        and not is_adapt_trial_subscription(sub)
-        and sub.expires_at > now
-        and sub.tariff
-        and any(
-            plan_uuid != str(sub.tariff.adapt_plan_uuid or "").strip()
-            and price > float(sub.tariff.price_rub)
-            for plan_uuid, price in upgrade_tariffs
-        )
-    ]
+            all_upgrade_tariffs = (await session.execute(tariff_query)).scalars().all()
+        filtered_items = []
+        for sub in items:
+            current_tariff = getattr(sub, "adapt_current_tariff", None)
+            canonical_uuid = str(
+                getattr(getattr(sub, "adapt_sub", None), "adapt_plan_uuid", None) or ""
+            ).strip()
+            is_valid_target = is_adapt_subscription(sub) or (not upgrade_only and is_vhq_subscription(sub))
+            if (
+                sub.status.value not in {"active", "expired"}
+                or not bool(sub.vpn_key)
+                or not is_valid_target
+            ):
+                continue
+            if (
+                not canonical_uuid
+                and current_tariff
+                and (
+                    not current_tariff.is_active
+                    or (
+                        current_tariff.is_admin_only
+                        and not settings.is_admin(telegram_id)
+                    )
+                )
+            ):
+                continue
+            filtered_items.append(sub)
+        if not upgrade_only:
+            return filtered_items
+
+        user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+        if not user:
+            return []
+        upgrade_items = []
+        for sub in filtered_items:
+            current_tariff = getattr(sub, "adapt_current_tariff", None)
+            if not current_tariff:
+                continue
+            is_demo = is_adapt_trial_subscription(
+                sub,
+                adapt_sub=getattr(sub, "adapt_sub", None),
+            ) or bool(
+                sub.expires_at
+                and sub.expires_at <= datetime.utcnow()
+                and is_explicit_demo_subscription(sub)
+            )
+            is_expired = bool(sub.expires_at and sub.expires_at <= datetime.utcnow()) or getattr(getattr(sub, "status", None), "value", None) == "expired"
+            if is_expired and not is_demo:
+                continue
+            for candidate in all_upgrade_tariffs:
+                if int(candidate.price_rub or 0) <= 0 or is_adapt_trial_tariff(candidate):
+                    continue
+                if is_demo:
+                    if not is_adapt_customer_upgrade_eligible(
+                        current_tariff,
+                        candidate,
+                        expires_at=sub.expires_at,
+                        is_demo=True,
+                    ):
+                        continue
+                else:
+                    validation_plans = await get_paid_adapt_upgrade_plans(
+                        session,
+                        current_tariff,
+                        candidate,
+                    )
+                    if not validation_plans or not is_adapt_customer_upgrade_eligible(
+                        validation_plans[0],
+                        validation_plans[1],
+                        expires_at=sub.expires_at,
+                        is_demo=False,
+                    ):
+                        continue
+                try:
+                    await get_purchase_price_rub(
+                        session,
+                        user=user,
+                        tariff=candidate,
+                        action="upgrade",
+                        target_subscription_id=sub.id,
+                    )
+                except ValueError:
+                    continue
+                upgrade_items.append(sub)
+                break
+        return upgrade_items
 
 
 def _subscription_count_text(count: int, action: str) -> str:
@@ -575,6 +750,7 @@ async def choose_renew_target(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("purchase_tariffs_"))
 async def return_to_subscription_tariffs(callback: CallbackQuery) -> None:
     """Return from payment to the tariff list for the same subscription."""
+    from bot.models import AdaptSubscription
     try:
         sub_id = int(callback.data.removeprefix("purchase_tariffs_"))
     except ValueError:
@@ -583,7 +759,14 @@ async def return_to_subscription_tariffs(callback: CallbackQuery) -> None:
 
     async with async_session() as session:
         sub = await session.get(Subscription, sub_id)
-        tariff = await session.get(Tariff, sub.tariff_id) if sub and sub.tariff_id else None
+        adapt_sub = await session.scalar(
+            select(AdaptSubscription).where(AdaptSubscription.subscription_id == sub_id).limit(1)
+        ) if sub else None
+        tariff = None
+        if adapt_sub and adapt_sub.adapt_plan_uuid:
+            tariff = await get_adapt_plan_tariff(session, adapt_sub.adapt_plan_uuid)
+        if not str(getattr(adapt_sub, "adapt_plan_uuid", None) or "").strip() and not tariff and sub and sub.tariff_id:
+            tariff = await session.get(Tariff, sub.tariff_id)
         owner_ok = bool(
             sub
             and await session.scalar(
@@ -599,47 +782,93 @@ async def return_to_subscription_tariffs(callback: CallbackQuery) -> None:
             show_alert=True,
         )
         return
-    if sub.expires_at <= datetime.utcnow() and not is_adapt_trial_tariff(tariff):
+    is_trial = is_adapt_trial_subscription(sub, adapt_sub=adapt_sub)
+    if sub.expires_at <= datetime.utcnow() and not is_trial:
         await _open_expired_tariff_choice(callback, sub_id)
-    elif is_adapt_trial_tariff(tariff):
+    elif is_trial:
         await _open_renew_target(callback, sub_id)
     else:
         await _open_upgrade_target(callback, sub_id)
 
 
 async def _open_renew_target(callback: CallbackQuery, sub_id: int) -> None:
+    from bot.models import AdaptSubscription
     async with async_session() as session:
         sub = await session.get(Subscription, sub_id)
-        tariff = await session.get(Tariff, sub.tariff_id) if sub and sub.tariff_id else None
+        adapt_sub = await session.scalar(
+            select(AdaptSubscription).where(AdaptSubscription.subscription_id == sub_id).limit(1)
+        ) if sub else None
+        tariff = None
+        canonical_uuid = str(getattr(adapt_sub, "adapt_plan_uuid", None) or "").strip()
+        if canonical_uuid:
+            tariff = await get_adapt_plan_tariff(session, canonical_uuid)
+        if not canonical_uuid and not tariff and sub and sub.tariff_id:
+            tariff = await session.get(Tariff, sub.tariff_id)
         owner_ok = bool(sub and await session.scalar(select(User.id).where(User.id == sub.user_id, User.telegram_id == callback.from_user.id)))
-    if (
-        not owner_ok
-        or not sub
-        or not is_adapt_subscription(sub)
-        or not tariff
-        or not tariff.adapt_plan_uuid
-        or not tariff.is_active
-    ):
-        await callback.answer("Тариф этой подписки больше недоступен", show_alert=True)
+    if not owner_ok or not sub or not (is_adapt_subscription(sub) or is_vhq_subscription(sub)):
+        await callback.answer("Подписка не найдена", show_alert=True)
         return
-    if tariff.is_admin_only and not settings.is_admin(callback.from_user.id):
-        await callback.answer("Тариф этой подписки больше недоступен", show_alert=True)
+
+    if is_vhq_subscription(sub):
+        if not tariff:
+            async with async_session() as session:
+                tariff = await session.scalar(
+                    select(Tariff)
+                    .where(Tariff.is_active == True, Tariff.vhq_tier == "basic", Tariff.days == 30)
+                    .order_by(Tariff.id.desc())
+                    .limit(1)
+                )
+        if not tariff:
+            await callback.answer("Тариф Baza Pro недоступен. Напишите в поддержку.", show_alert=True)
+            return
+        await _select_tariff_token(callback, f"{tariff.id}~r~{sub_id}")
         return
-    if sub.expires_at <= datetime.utcnow() and not is_adapt_trial_tariff(tariff):
-        await _open_expired_tariff_choice(callback, sub_id)
-        return
-    if is_adapt_trial_tariff(tariff):
+
+    is_trial = is_adapt_trial_subscription(sub, adapt_sub=adapt_sub)
+    if not is_trial:
+        if not tariff or not has_adapt_plan_metadata(tariff):
+            await callback.answer(
+                "Параметры этой подписки недоступны. Напишите в поддержку.",
+                show_alert=True,
+            )
+            return
+        if sub.expires_at <= datetime.utcnow():
+            await _open_expired_tariff_choice(callback, sub_id)
+            return
+        if not tariff.is_active or (
+            tariff.is_admin_only and not settings.is_admin(callback.from_user.id)
+        ):
+            async with async_session() as session:
+                replacement_query = (
+                    select(Tariff)
+                    .where(Tariff.adapt_plan_uuid == tariff.adapt_plan_uuid)
+                    .where(Tariff.is_active == True)  # noqa: E712
+                    .order_by(Tariff.id.desc())
+                    .limit(1)
+                )
+                if not settings.is_admin(callback.from_user.id):
+                    replacement_query = replacement_query.where(Tariff.is_admin_only == False)  # noqa: E712
+                tariff = await session.scalar(replacement_query)
+            if not tariff:
+                await callback.answer(
+                    "Текущий тариф больше недоступен для продления. Выберите улучшение.",
+                    show_alert=True,
+                )
+                await _open_upgrade_target(callback, sub_id)
+                return
+
+    if is_trial:
         async with async_session() as session:
             query = (
                 select(Tariff)
                 .where(Tariff.is_active == True)  # noqa: E712
                 .where(Tariff.adapt_plan_uuid.is_not(None))
-                .where(Tariff.price_rub > tariff.price_rub)
                 .order_by(Tariff.price_rub, Tariff.days, Tariff.id)
             )
             if not settings.is_admin(callback.from_user.id):
                 query = query.where(Tariff.is_admin_only == False)  # noqa: E712
-            tariffs = (await session.execute(query)).scalars().all()
+            all_tariffs = (await session.execute(query)).scalars().all()
+            tariffs = [t for t in all_tariffs if not is_adapt_trial_tariff(t)]
             stars_enabled = await _get_stars_enabled(session)
         tariffs, price_overrides = await _quote_tariff_list(
             callback.from_user.id,
@@ -656,7 +885,7 @@ async def _open_renew_target(callback: CallbackQuery, sub_id: int) -> None:
                 tariffs,
                 stars_enabled,
                 intent_suffix=f"~u~{sub_id}",
-                back_callback=f"purchase_return_{sub_id}",
+                back_callback="profile",
                 price_overrides_rub=price_overrides,
             ),
         )
@@ -672,35 +901,64 @@ async def choose_upgrade_target(callback: CallbackQuery) -> None:
 
 
 async def _open_upgrade_target(callback: CallbackQuery, sub_id: int) -> None:
+    from bot.models import AdaptSubscription
+    from bot.services.subscription_semantics import (
+        is_adapt_trial_subscription,
+    )
     async with async_session() as session:
         sub = await session.get(Subscription, sub_id)
-        current = await session.get(Tariff, sub.tariff_id) if sub and sub.tariff_id else None
+        adapt_sub = await session.scalar(
+            select(AdaptSubscription).where(AdaptSubscription.subscription_id == sub_id).limit(1)
+        )
+        if sub:
+            sub.adapt_sub = adapt_sub
+        current = None
+        canonical_uuid = str(getattr(adapt_sub, "adapt_plan_uuid", None) or "").strip()
+        if canonical_uuid:
+            current = await get_adapt_plan_tariff(session, canonical_uuid)
+        if not canonical_uuid and sub and sub.tariff_id:
+            current = await session.get(Tariff, sub.tariff_id)
         owner_ok = bool(sub and await session.scalar(select(User.id).where(User.id == sub.user_id, User.telegram_id == callback.from_user.id)))
         if (
             not owner_ok
             or not is_adapt_subscription(sub)
             or not current
-            or not current.adapt_plan_uuid
-            or (current.is_admin_only and not settings.is_admin(callback.from_user.id))
         ):
             await callback.answer("Эту подписку сейчас нельзя улучшить", show_alert=True)
             return
-        if is_adapt_trial_tariff(current):
+        is_trial = is_adapt_trial_subscription(sub, adapt_sub=adapt_sub)
+        if is_trial:
             await _open_renew_target(callback, sub_id)
+            return
+        if sub.expires_at <= datetime.utcnow():
+            await _open_expired_tariff_choice(callback, sub_id)
             return
         query = (
             select(Tariff)
             .where(Tariff.is_active == True)  # noqa: E712
             .where(Tariff.adapt_plan_uuid.is_not(None))
             .where(Tariff.adapt_plan_uuid != current.adapt_plan_uuid)
-            .order_by(Tariff.price_rub)
+            .order_by(Tariff.price_rub, Tariff.days, Tariff.id)
         )
-        if sub.expires_at > datetime.utcnow():
-            query = query.where(Tariff.price_rub > current.price_rub)
         if not settings.is_admin(callback.from_user.id):
             query = query.where(Tariff.is_admin_only == False)  # noqa: E712
         result = await session.execute(query)
-        tariffs = result.scalars().all()
+        candidate_tariffs = result.scalars().all()
+        tariffs = []
+        for candidate in candidate_tariffs:
+            if is_adapt_trial_tariff(candidate):
+                continue
+            validation_plans = await get_active_paid_adapt_upgrade_plans(
+                session,
+                current,
+                candidate,
+            )
+            if validation_plans and is_adapt_customer_upgrade_eligible(
+                validation_plans[0],
+                validation_plans[1],
+                expires_at=sub.expires_at,
+            ):
+                tariffs.append(candidate)
         stars_enabled = await _get_stars_enabled(session)
     tariffs, price_overrides = await _quote_tariff_list(
         callback.from_user.id,
@@ -726,10 +984,29 @@ async def _open_upgrade_target(callback: CallbackQuery, sub_id: int) -> None:
 
 
 async def _open_expired_tariff_choice(callback: CallbackQuery, sub_id: int) -> None:
-    """Show every available Adapt tariff for one expired subscription."""
+    """Show available Adapt tariffs for one expired subscription (same-plan renew or provider-eligible upgrades)."""
+    from bot.models import AdaptSubscription
+    from bot.services.subscription_semantics import (
+        is_adapt_customer_upgrade_eligible,
+        is_adapt_trial_subscription,
+    )
     async with async_session() as session:
         sub = await session.get(Subscription, sub_id)
-        current = await session.get(Tariff, sub.tariff_id) if sub and sub.tariff_id else None
+        adapt_sub = await session.scalar(
+            select(AdaptSubscription).where(AdaptSubscription.subscription_id == sub_id).limit(1)
+        )
+        if sub:
+            sub.adapt_sub = adapt_sub
+        is_trial = bool(
+            is_adapt_trial_subscription(sub, adapt_sub=adapt_sub)
+            or is_explicit_demo_subscription(sub)
+        )
+        current = None
+        canonical_uuid = str(getattr(adapt_sub, "adapt_plan_uuid", None) or "").strip()
+        if canonical_uuid:
+            current = await get_adapt_plan_tariff(session, canonical_uuid)
+        if not canonical_uuid and sub and sub.tariff_id:
+            current = await session.get(Tariff, sub.tariff_id)
         owner_ok = bool(
             sub
             and await session.scalar(
@@ -745,7 +1022,7 @@ async def _open_expired_tariff_choice(callback: CallbackQuery, sub_id: int) -> N
             or sub.expires_at > datetime.utcnow()
             or not is_adapt_subscription(sub)
             or not current
-            or not current.adapt_plan_uuid
+            or not has_adapt_plan_metadata(current)
         ):
             await callback.answer("Не удалось открыть тарифы для этой подписки", show_alert=True)
             return
@@ -757,7 +1034,13 @@ async def _open_expired_tariff_choice(callback: CallbackQuery, sub_id: int) -> N
         )
         if not settings.is_admin(callback.from_user.id):
             query = query.where(Tariff.is_admin_only == False)  # noqa: E712
-        tariffs = (await session.execute(query)).scalars().all()
+        candidate_tariffs = (await session.execute(query)).scalars().all()
+        # For expired subscriptions, any active paid Adapt plan is eligible
+        # (user pays full price of chosen tariff and can switch device counts or duration freely).
+        tariffs = [
+            t for t in candidate_tariffs
+            if int(t.price_rub or 0) > 0 and not is_adapt_trial_tariff(t)
+        ]
         stars_enabled = await _get_stars_enabled(session)
     tariffs, price_overrides = await _quote_tariff_list(
         callback.from_user.id,
@@ -992,13 +1275,20 @@ async def _select_tariff_token(callback: CallbackQuery, encoded_tariff: str) -> 
             await callback.answer("Этот тариф больше недоступен", show_alert=True)
             return
         if purchase_action == "upgrade" and target_subscription_id:
+            from bot.models import AdaptSubscription
             target = await session.get(Subscription, target_subscription_id)
-            current_tariff = (
-                await session.get(Tariff, target.tariff_id)
-                if target and target.tariff_id
-                else None
-            )
-            if target and current_tariff and not is_adapt_trial_tariff(current_tariff):
+            adapt_sub = await session.scalar(
+                select(AdaptSubscription)
+                .where(AdaptSubscription.subscription_id == target_subscription_id)
+                .limit(1)
+            ) if target else None
+            current_tariff = None
+            canonical_uuid = str(getattr(adapt_sub, "adapt_plan_uuid", None) or "").strip()
+            if canonical_uuid:
+                current_tariff = await get_adapt_plan_tariff(session, canonical_uuid)
+            if not canonical_uuid and not current_tariff and target and target.tariff_id:
+                current_tariff = await session.get(Tariff, target.tariff_id)
+            if target and current_tariff and not is_adapt_trial_subscription(target, adapt_sub=adapt_sub):
                 purchase_action = effective_expired_adapt_action(
                     purchase_action,
                     current_plan_uuid=current_tariff.adapt_plan_uuid,

@@ -284,6 +284,7 @@ async def check_server_health(bot=None) -> None:
 
         await _check_relay_health(session, bot=bot)
         await _check_cross_upstreams(session, bot=bot)
+        await _check_webhook_domain_health(session, bot=bot)
 
         # Check Xray status on individual nodes via /api/nodes
         for server in servers:
@@ -294,3 +295,51 @@ async def check_server_health(bot=None) -> None:
         await session.commit()
 
     logger.info("Periodic server health check completed.")
+
+
+async def _check_webhook_domain_health(session, bot=None) -> None:
+    """Check host-side DNS resolution (getaddrinfo) of webhook domain without alert spam."""
+    webhook_url = settings.base_webhook_url
+    if not webhook_url:
+        return
+
+    parsed = urlparse(webhook_url)
+    hostname = parsed.hostname
+    if not hostname or hostname in ("localhost", "127.0.0.1"):
+        return
+
+    marker = await session.get(BotSettings, "webhook_domain_dns_alert_sent")
+    is_dns_ok = False
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.getaddrinfo(hostname, 443)
+        is_dns_ok = True
+    except Exception as exc:
+        logger.warning("DNS resolution check failed for webhook host %s: %s", hostname, exc)
+        is_dns_ok = False
+
+    if not is_dns_ok:
+        if not marker or marker.value != "1":
+            if marker:
+                marker.value = "1"
+            else:
+                session.add(BotSettings(key="webhook_domain_dns_alert_sent", value="1"))
+            await session.commit()
+            if bot:
+                await _alert_admins(
+                    bot,
+                    f"⚠️ <b>СБОЙ DNS ДОМЕНА ВЕБХУКОВ!</b>\n\n"
+                    f"Домен: <code>{hostname}</code> не резолвится локальным DNS на сервере (getaddrinfo).\n"
+                    f"Входящие вебхуки платежей YooKassa могут задерживаться.\n\n"
+                    f"<i>Фоновая сверка платежей активна и автоматически обрабатывает успешные оплаты.</i>",
+                )
+    else:
+        if marker and marker.value == "1":
+            marker.value = "0"
+            await session.commit()
+            if bot:
+                await _alert_admins(
+                    bot,
+                    f"✅ <b>DNS домена вебхуков восстановлен</b>\n\n"
+                    f"Домен <code>{hostname}</code> снова успешно резолвится на сервере.",
+                )

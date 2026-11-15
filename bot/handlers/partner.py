@@ -223,7 +223,10 @@ def _format_application_status(status: PartnerApplicationStatus) -> str:
 def _build_partner_web_link(code: str) -> str | None:
     if not settings.webstore_public_enabled:
         return None
-    base_url = settings.webstore_api_base_url.strip()
+    base_url = (
+        getattr(settings, "public_webstore_base_url", None)
+        or "https://darimiru.xyz"
+    ).strip()
     if not base_url:
         return None
     return f"{base_url.rstrip('/')}/buy?ref=p_{code}"
@@ -405,6 +408,8 @@ async def _build_partners_csv(session) -> bytes:
         "is_active",
         "telegram_id",
         "commission_percent",
+        "commission_l2_percent",
+        "commission_l3_percent",
         "audience_discount_percent",
         "audience_bonus_days",
         "payouts_enabled",
@@ -451,6 +456,8 @@ async def _build_partners_csv(session) -> bytes:
             int(bool(partner.is_active)),
             partner.telegram_id or "",
             partner.commission_percent,
+            partner.commission_l2_percent or 0.0,
+            partner.commission_l3_percent or 0.0,
             partner.audience_discount_percent,
             partner.audience_bonus_days,
             int(bool(partner.payouts_enabled)),
@@ -524,6 +531,8 @@ async def _build_partner_earnings_csv(session, partner_id: int) -> bytes:
         "partner_id",
         "partner_name",
         "amount",
+        "depth",
+        "commission_percent",
         "created_at",
         "user_id",
         "user_telegram_id",
@@ -558,6 +567,8 @@ async def _build_partner_earnings_csv(session, partner_id: int) -> bytes:
             partner.id,
             partner.name,
             earning.amount,
+            earning.depth or 1,
+            earning.commission_percent or 0.0,
             earning.created_at.isoformat(sep=" ", timespec="seconds"),
             earning.user_id,
             user.telegram_id if user else "",
@@ -576,6 +587,8 @@ async def _build_partner_earnings_csv(session, partner_id: int) -> bytes:
             partner.id,
             partner.name,
             earning.earning_amount_rub,
+            earning.depth or 1,
+            earning.commission_percent or 0.0,
             earning.created_at.isoformat(sep=" ", timespec="seconds"),
             "",
             "",
@@ -684,6 +697,8 @@ async def _build_single_partner_report_csv(session, partner_id: int) -> bytes:
     writer.writerow(["telegram_id", partner.telegram_id or ""])
     writer.writerow(["is_active", int(bool(partner.is_active))])
     writer.writerow(["commission_percent", partner.commission_percent])
+    writer.writerow(["commission_l2_percent", partner.commission_l2_percent or 0.0])
+    writer.writerow(["commission_l3_percent", partner.commission_l3_percent or 0.0])
     writer.writerow(["audience_discount_percent", partner.audience_discount_percent])
     writer.writerow(["audience_bonus_days", partner.audience_bonus_days])
     writer.writerow(["payouts_enabled", int(bool(partner.payouts_enabled))])
@@ -940,6 +955,8 @@ async def admin_partner_application_approve(callback: CallbackQuery) -> None:
             contact_info=application.contact_info,
             notes=application.notes,
             commission_percent=20.0,
+            commission_l2_percent=0.0,
+            commission_l3_percent=0.0,
             payouts_enabled=False,
         )
         session.add(partner)
@@ -1124,7 +1141,7 @@ async def _show_partner_detail(message, partner_id: int, edit: bool = True) -> N
         f"<b>{period_stats['web_orders_30']}</b> веб / "
         f"<b>{period_stats['web_earn_30']:.0f}₽</b>\n\n"
         f"⚙️ <b>Настройки:</b>\n"
-        f"  Комиссия: <b>{partner.commission_percent:.0f}%</b>\n"
+        f"  Комиссия: <b>1 ур. {partner.commission_percent:.0f}% / 2 ур. {(partner.commission_l2_percent or 0.0):.0f}% / 3+ ур. {(partner.commission_l3_percent or 0.0):.0f}%</b>\n"
         f"  Скидка для аудитории: <b>{partner.audience_discount_percent:.0f}%</b>\n"
         f"  Бонусные дни: <b>{partner.audience_bonus_days}</b>\n"
         f"  Выводы: <b>{'включены' if partner.payouts_enabled else 'выключены'}</b>\n"
@@ -1326,6 +1343,8 @@ async def partner_create_commission(message: Message, state: FSMContext) -> None
             telegram_id=data.get("pt_tg_id"),
             contact_info=data.get("pt_contact_info"),
             commission_percent=commission,
+            commission_l2_percent=0.0,
+            commission_l3_percent=0.0,
             payouts_enabled=False,
         )
         session.add(partner)
@@ -1449,7 +1468,9 @@ async def admin_partner_export_single(callback: CallbackQuery) -> None:
 # ── Admin: Edit Partner Settings ─────────────────────
 
 EDITABLE_FIELDS = {
-    "commission": ("Комиссия %", "commission_percent", float, 0, 100),
+    "commission": ("Комиссия 1 ур. %", "commission_percent", float, 0, 100),
+    "commission_l2": ("Комиссия 2 ур. %", "commission_l2_percent", float, 0, 100),
+    "commission_l3": ("Комиссия 3+ ур. %", "commission_l3_percent", float, 0, 100),
     "discount": ("Скидка для аудитории %", "audience_discount_percent", float, 0, 100),
     "bonus": ("Бонусные дни для аудитории", "audience_bonus_days", int, 0, 365),
     "minpay": ("Мин. выплата ₽", "min_payout", float, 0, 1000000),
@@ -2189,7 +2210,7 @@ async def partner_dashboard(callback: CallbackQuery) -> None:
         f"Сайт начислено: <b>{web_earned:.0f}₽</b>\n"
         f"Заработано всего: <b>{total_earned:.0f}₽</b>\n"
         f"Текущий баланс: <b>{partner.partner_balance:.0f}₽</b>\n"
-        f"Комиссия: <b>{partner.commission_percent:.0f}%</b>\n"
+        f"Комиссия: <b>1 ур. {partner.commission_percent:.0f}% / 2 ур. {(partner.commission_l2_percent or 0.0):.0f}% / 3+ ур. {(partner.commission_l3_percent or 0.0):.0f}%</b>\n"
         f"\n📅 <b>За 7 дней:</b> TG {period_stats['regs_7']} рег. / {period_stats['pays_7']} покуп. / {period_stats['earn_7']:.0f}₽; "
         f"WEB {period_stats['web_orders_7']} заказ. / {period_stats['web_earn_7']:.0f}₽\n"
         f"📅 <b>За 30 дней:</b> TG {period_stats['regs_30']} рег. / {period_stats['pays_30']} покуп. / {period_stats['earn_30']:.0f}₽; "

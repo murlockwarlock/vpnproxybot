@@ -121,7 +121,7 @@ class TestProfileKbRenewalOptions:
         assert "buy" in callbacks
         assert "renewal_choice" not in callbacks
 
-    def test_profile_kb_daily_charge_button_when_multiple_tariffs(self):
+    def test_profile_kb_hides_daily_charge_button_when_multiple_tariffs(self):
         from bot.keyboards.client import profile_kb
         options = [(1, "Лайт", 4.17), (2, "Базовый", 8.30)]
         kb = profile_kb(
@@ -131,7 +131,7 @@ class TestProfileKbRenewalOptions:
         )
         all_buttons = [btn for row in kb.inline_keyboard for btn in row]
         callbacks = [b.callback_data for b in all_buttons if b.callback_data]
-        assert "daily_charge_tariff_choice" in callbacks
+        assert "daily_charge_tariff_choice" not in callbacks
 
     def test_profile_kb_no_daily_charge_button_when_single_tariff(self):
         from bot.keyboards.client import profile_kb
@@ -323,7 +323,7 @@ class TestRenewTariffHandler:
 
 class TestSetDailyTariffHandler:
     @pytest.mark.asyncio
-    async def test_set_daily_tariff_saves_tariff_id(self):
+    async def test_set_daily_tariff_is_unavailable(self):
         from bot.handlers.profile import set_daily_tariff
 
         tariff = _make_tariff(2, "Базовый")
@@ -345,9 +345,9 @@ class TestSetDailyTariffHandler:
 
             await set_daily_tariff(callback)
 
-        assert user.daily_charge_tariff_id == 2
-        mock_sess.commit.assert_called_once()
-        callback.answer.assert_called_once()
+        assert user.daily_charge_tariff_id is None
+        mock_sess.commit.assert_not_called()
+        callback.answer.assert_called_once_with("Ежедневные списания больше недоступны", show_alert=True)
 
     @pytest.mark.asyncio
     async def test_set_daily_tariff_inactive_shows_alert(self):
@@ -370,7 +370,7 @@ class TestSetDailyTariffHandler:
 
             await set_daily_tariff(callback)
 
-        callback.answer.assert_called_once_with("Тариф недоступен", show_alert=True)
+        callback.answer.assert_called_once_with("Ежедневные списания больше недоступны", show_alert=True)
 
 
 # ── _format_proxy_links is importable ────────────────────────────────────────

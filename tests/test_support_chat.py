@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -17,7 +17,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from webstore import routes as webstore_routes
-from webstore.models import Base, SupportAgentSession, SupportMessage, SupportTicket
+from webstore.models import (
+    Base,
+    SupportAgentSession,
+    SupportMessage,
+    SupportTicket,
+    WebBalanceAccount,
+    WebOrder,
+    WebProfileLink,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -512,3 +520,159 @@ async def test_full_support_flow(patched, db_session_factory):
     assert len(all_msgs) == 3
     assert all_msgs[2].sender == "agent"
     assert all_msgs[2].agent_telegram_id == 111222333
+
+
+# ── LK & Attachments Tests ───────────────────────────────────────────────────
+
+
+async def test_client_ticket_with_profile_token_and_lk(patched, db_session_factory):
+    """Ticket created with profile_token retrieves client LK (TG, balance, subscription)."""
+    async with db_session_factory() as session:
+        session.add(WebProfileLink(
+            profile_token="prof_test_123",
+            telegram_id=987654321,
+            telegram_username="superclient",
+            telegram_full_name="Super Client",
+            contact="client@test.com",
+        ))
+        session.add(WebBalanceAccount(
+            profile_token="prof_test_123",
+            ref_code="ref123",
+            balance_rub=350,
+        ))
+        session.add(WebOrder(
+            order_id="ord_123",
+            profile_token="prof_test_123",
+            tariff_key="month_1",
+            tariff_label="1 месяц",
+            days=30,
+            amount_rub=100,
+            status="paid",
+            access_expires_at=datetime.utcnow() + timedelta(days=20),
+        ))
+        await session.commit()
+
+    create_data = json.loads((await webstore_routes.handle_support_new_ticket(
+        _make_request(
+            {"message": "Вопрос по ЛК", "profile_token": "prof_test_123"}
+        )
+    )).text)
+    ticket_id = create_data["ticket_id"]
+
+    agent_token = await _login_agent(patched)
+    ticket_data = json.loads((await _call(webstore_routes.handle_support_admin_ticket_messages(
+        _make_request(headers={"X-Support-Agent-Token": agent_token}, path_args={"ticket_id": str(ticket_id)})
+    ))).text)
+
+    lk = ticket_data["ticket"]["client_lk"]
+    assert lk is not None
+    assert lk["telegram_username"] == "superclient"
+    assert lk["telegram_id"] == 987654321
+    assert lk["balance_rub"] == 350
+    assert lk["subscription"]["status"] == "active"
+    assert lk["subscription"]["tariff"] == "1 месяц"
+    assert "profile?token=prof_test_123" in lk["profile_url"]
+
+
+async def test_client_ticket_auto_contact_from_profile(patched, db_session_factory):
+    """When contact is omitted, it auto-fills from the linked Telegram username."""
+    async with db_session_factory() as session:
+        session.add(WebProfileLink(
+            profile_token="prof_auto_contact",
+            telegram_id=123123123,
+            telegram_username="autouser",
+        ))
+        await session.commit()
+
+    create_data = json.loads((await webstore_routes.handle_support_new_ticket(
+        _make_request(
+            {"message": "Привет"},
+            cookies={"webstore_profile_token": "prof_auto_contact"}
+        )
+    )).text)
+    ticket_id = create_data["ticket_id"]
+
+    async with db_session_factory() as session:
+        ticket = await session.get(SupportTicket, ticket_id)
+        assert ticket.profile_token == "prof_auto_contact"
+        assert ticket.client_contact == "@autouser"
+
+
+async def test_support_upload_and_media_serving(tmp_path, monkeypatch):
+    """File upload endpoint saves image and media serving endpoint serves it with correct content type."""
+    monkeypatch.setattr(webstore_routes, "SUPPORT_UPLOAD_DIR", tmp_path)
+
+    png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 30
+
+    class _MockField:
+        async def read_chunk(self, size):
+            if not hasattr(self, "_read"):
+                self._read = True
+                return png_bytes
+            return b""
+
+    class _MockReader:
+        async def next(self):
+            return _MockField()
+
+    req = _make_request()
+    req.can_read_body = True
+
+    async def _multipart():
+        return _MockReader()
+
+    req.multipart = _multipart
+
+    resp = await webstore_routes.handle_support_upload(req)
+    assert resp.status == 200
+    data = json.loads(resp.text)
+    assert data["ok"] is True
+    assert data["media_type"] == "image"
+    assert data["url"].startswith("/api/support/media/sup_")
+    assert data["url"].endswith(".png")
+
+    filename = data["filename"]
+    media_req = _make_request(path_args={"filename": filename})
+    media_resp = await webstore_routes.handle_support_media(media_req)
+    assert media_resp.status == 200
+    assert media_resp.headers["Content-Type"] == "image/png"
+
+
+async def test_client_and_agent_send_message_with_media(patched, db_session_factory):
+    """Client and agent can attach screenshots with or without message text."""
+    create_data = json.loads((await webstore_routes.handle_support_new_ticket(
+        _make_request({"message": "Скриншот ошибки", "media_url": "/api/support/media/test1.jpg", "contact": "user"})
+    )).text)
+    token = create_data["token"]
+    ticket_id = create_data["ticket_id"]
+
+    # Client sends another image with empty text
+    send_resp = await webstore_routes.handle_support_send_message(
+        _make_request({"text": "", "media_url": "/api/support/media/test2.png"}, path_args={"token": token})
+    )
+    assert send_resp.status == 200
+
+    info_data = json.loads((await webstore_routes.handle_support_ticket_info(
+        _make_request(path_args={"token": token})
+    )).text)
+    assert len(info_data["messages"]) == 2
+    assert info_data["messages"][0]["media_url"] == "/api/support/media/test1.jpg"
+    assert info_data["messages"][1]["media_url"] == "/api/support/media/test2.png"
+
+    # Agent replies with image
+    agent_token = await _login_agent(patched)
+    agent_resp = await _call(webstore_routes.handle_support_admin_send_message(
+        _make_request(
+            {"text": "Вот инструкция", "media_url": "/api/support/media/guide.png"},
+            headers={"X-Support-Agent-Token": agent_token},
+            path_args={"ticket_id": str(ticket_id)},
+        )
+    ))
+    assert agent_resp.status == 200
+
+    admin_data = json.loads((await _call(webstore_routes.handle_support_admin_ticket_messages(
+        _make_request(headers={"X-Support-Agent-Token": agent_token}, path_args={"ticket_id": str(ticket_id)})
+    ))).text)
+    assert len(admin_data["messages"]) == 3
+    assert admin_data["messages"][2]["sender"] == "agent"
+    assert admin_data["messages"][2]["media_url"] == "/api/support/media/guide.png"

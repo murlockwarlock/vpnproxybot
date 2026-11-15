@@ -42,31 +42,31 @@ SSH_USER="yc-user"
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=15"
 
 # Серверы (куда relay пробрасывает трафик)
-ESTONIA_IP="45.92.174.214"
-NETHERLANDS_IP="72.56.71.124"
+NETHERLANDS_1_IP="72.56.71.124"
+NETHERLANDS_2_IP="185.70.185.209"
 GERMANY_IP="81.200.156.43"
 
 # Marzban API
 MARZBAN_API="https://vpn.psysoldatov.ru:8443"
-MARZBAN_USER="xlist"
-MARZBAN_PASS="Kereekin95"
+MARZBAN_USER="${MARZBAN_USER:-}"
+MARZBAN_PASS="${MARZBAN_PASS:-}"
 
 # SNI → Сервер маппинг для relay
 # Формат: SNI|TARGET_IP|INBOUND_TAG|ОБХОД_NAME
 RELAY_ROUTES=(
-    "ads.x5.ru|${ESTONIA_IP}|VLESS_REALITY_X5|ОБХОД {N}-1"
-    "api-maps.yandex.ru|${ESTONIA_IP}|VLESS_REALITY_YANDEX|ОБХОД {N}-2"
-    "eh1.vk.com|${NETHERLANDS_IP}|VLESS_REALITY_VK|ОБХОД {N}-3"
-    "smartcaptcha.yandexcloud.net|${NETHERLANDS_IP}|VLESS_REALITY_CAPTCHA|ОБХОД {N}-4"
+    "ads.x5.ru|${NETHERLANDS_2_IP}|VLESS_REALITY_X5|ОБХОД {N}-1"
+    "api-maps.yandex.ru|${NETHERLANDS_2_IP}|VLESS_REALITY_YANDEX|ОБХОД {N}-2"
+    "eh1.vk.com|${NETHERLANDS_1_IP}|VLESS_REALITY_VK|ОБХОД {N}-3"
+    "smartcaptcha.yandexcloud.net|${NETHERLANDS_1_IP}|VLESS_REALITY_CAPTCHA|ОБХОД {N}-4"
     "io.ozone.ru|${GERMANY_IP}|VLESS_REALITY_OZONE|ОБХОД {N}-5"
 )
 
 # Дополнительные SNI (не для ОБХОД'ов, но роутятся через relay)
 EXTRA_ROUTES=(
-    "www.ietf.org|${NETHERLANDS_IP}"
-    "ietf.org|${NETHERLANDS_IP}"
-    "www.microsoft.com|${ESTONIA_IP}"
-    "microsoft.com|${ESTONIA_IP}"
+    "www.ietf.org|${NETHERLANDS_1_IP}"
+    "ietf.org|${NETHERLANDS_1_IP}"
+    "www.microsoft.com|${NETHERLANDS_2_IP}"
+    "microsoft.com|${NETHERLANDS_2_IP}"
 )
 
 # ─── Параметры ───────────────────────────────────────────────────
@@ -112,6 +112,10 @@ check_deps() {
     command -v curl    >/dev/null || err "curl не установлен"
     command -v python3 >/dev/null || err "python3 не установлен"
     command -v ssh     >/dev/null || err "ssh не установлен"
+    if ! $DRY_RUN; then
+        [[ -n "$MARZBAN_USER" ]] || err "MARZBAN_USER не задан"
+        [[ -n "$MARZBAN_PASS" ]] || err "MARZBAN_PASS не задан"
+    fi
 }
 
 ensure_ssh_key() {
@@ -251,7 +255,7 @@ configure_nginx_relay() {
         relay_conf+="    ${sni}    ${target_ip}:443;\n"
     done
 
-    relay_conf+="    default    ${ESTONIA_IP}:443;\n"
+    relay_conf+="    default    ${NETHERLANDS_2_IP}:443;\n"
     relay_conf+="}\n\n"
     relay_conf+="server {\n"
     relay_conf+="    listen 443;\n"
@@ -294,7 +298,7 @@ verify_relay() {
     result=$(echo | openssl s_client -connect "$RELAY_IP:443" -servername ads.x5.ru -brief 2>&1 | head -3)
 
     if echo "$result" | grep -q "CONNECTION ESTABLISHED"; then
-        log "Relay работает! TLS handshake через $RELAY_IP → Estonia OK"
+        log "Relay работает! TLS handshake через $RELAY_IP → Netherlands 2 OK"
     else
         warn "TLS handshake не прошёл. Проверьте вручную."
         echo "$result"

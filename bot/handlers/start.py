@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 from datetime import datetime, timedelta
 
@@ -16,7 +17,7 @@ from sqlalchemy.orm import selectinload
 from bot.config import settings
 from bot.database import async_session
 from bot.keyboards.client import back_to_menu_kb, demo_key_kb, guide_platform_kb, help_kb, main_menu_kb
-from bot.models import AdTrackingLink, BotSettings, Feedback, Partner, PartnerLink, Platform, ProxyAccount, ReferralConfig, Server, Subscription, User
+from bot.models import AdTrackingLink, BotSettings, Feedback, FeedbackMessage, Partner, PartnerLink, Platform, ProxyAccount, ReferralConfig, Server, Subscription, User
 from bot.services.balance_service import get_user_balance
 from bot.services.subscription_semantics import is_demo_subscription_row
 from bot.services.webstore_bridge import claim_web_auth, claim_web_link
@@ -24,6 +25,8 @@ from bot.services.webstore_bridge import claim_web_auth, claim_web_link
 
 class FeedbackStates(StatesGroup):
     waiting_message = State()
+    waiting_reply = State()
+
 from bot.services.device_slots import get_included_device_slots
 from bot.services.guide_service import send_guide
 from bot.services.legal_docs import LEGAL_DOCS, get_legal_doc_url
@@ -221,7 +224,7 @@ async def _maybe_create_adapt_demo_key(message: Message, user_db_id: int) -> Non
         f"<i>Нажмите на ссылку выше, чтобы скопировать её.</i>\n\n"
         f"📱 Демо-доступ работает на <b>1 устройстве</b>.\n"
         f"Полный тариф даёт доступ на <b>3 устройства</b>.\n\n"
-        f"Найти ключ позже: «👤 Мой профиль» → «🔑 Мои ключи».",
+        f"Найти ключ позже: «👤 Мой профиль» → «🔑 Мои подписки».",
         parse_mode="HTML",
         reply_markup=demo_key_kb(),
     )
@@ -307,7 +310,7 @@ async def _maybe_create_marzban_demo_key(message: Message, user_db_id: int) -> N
         f"<i>Нажмите на ссылку выше, чтобы скопировать её.</i>\n\n"
         f"📱 Демо-доступ работает на <b>1 устройстве</b>.\n"
         f"Полный тариф даёт доступ на <b>3 устройства</b>.\n\n"
-        f"Найти ключ позже: «👤 Мой профиль» → «🔑 Мои ключи».",
+        f"Найти ключ позже: «👤 Мой профиль» → «🔑 Мои подписки».",
         parse_mode="HTML",
         reply_markup=demo_key_kb(),
     )
@@ -371,7 +374,10 @@ async def _handle_web_auth(message: Message, code: str) -> None:
 
     if success:
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        site_url = settings.webstore_api_base_url.rstrip("/") if settings.webstore_public_enabled else None
+        site_url = (
+            getattr(settings, "public_webstore_base_url", None)
+            or settings.webstore_api_base_url
+        ).rstrip("/") if settings.webstore_public_enabled else None
         kb = None
         if site_url:
             kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -713,15 +719,18 @@ async def feedback_receive(message: Message, state: FSMContext) -> None:
     media_file_id = None
     media_type = None
 
-    if message.photo:
+    if getattr(message, "photo", None):
         media_file_id = message.photo[-1].file_id
         media_type = "photo"
-    elif message.video:
+    elif getattr(message, "video", None):
         media_file_id = message.video.file_id
         media_type = "video"
+    elif getattr(message, "document", None):
+        media_file_id = message.document.file_id
+        media_type = "document"
 
     if not text and not media_file_id:
-        await message.answer("❌ Отправьте текст, фото или видео.", reply_markup=_FEEDBACK_CANCEL_KB)
+        await message.answer("❌ Отправьте текст, фото, видео или скриншот файлом.", reply_markup=_FEEDBACK_CANCEL_KB)
         return
 
     # Save to DB
@@ -751,15 +760,44 @@ async def feedback_receive(message: Message, state: FSMContext) -> None:
     )
 
     # Forward to admins
-    user_name = message.from_user.full_name or ""
-    user_username = f"@{message.from_user.username}" if message.from_user.username else ""
+    user_name = html.escape(message.from_user.full_name or "")
+    user_username = f"@{html.escape(message.from_user.username)}" if message.from_user.username else ""
     header = (
         f"📝 <b>Фидбэк #{fb_id}</b>\n"
         f"От: {user_name} {user_username} (ID: <code>{message.from_user.id}</code>)\n"
         f"{'─' * 20}"
     )
+    admin_markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💬 Ответить", callback_data=f"feedback_admin_reply_{fb_id}"),
+        InlineKeyboardButton(text="👤 Профиль", callback_data=f"adm_usr_info_{message.from_user.id}"),
+    ]])
 
-    # Collect all admin IDs from env settings AND database
+    admin_ids_to_notify = await _get_feedback_admin_ids()
+    for admin_id in admin_ids_to_notify:
+        try:
+            if media_file_id and media_type:
+                caption = f"{header}\n\n{text}" if text else header
+                if len(caption) > 1024:
+                    caption = caption[:1020] + "..."
+                if media_type == "photo":
+                    send_fn = message.bot.send_photo
+                elif media_type == "video":
+                    send_fn = message.bot.send_video
+                else:
+                    send_fn = message.bot.send_document
+                await send_fn(admin_id, media_file_id, caption=caption, reply_markup=admin_markup, parse_mode="HTML")
+            else:
+                await message.bot.send_message(
+                    admin_id,
+                    f"{header}\n\n{text}",
+                    reply_markup=admin_markup,
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.warning("Failed to send feedback to admin %s: %s", admin_id, e)
+
+
+async def _get_feedback_admin_ids() -> set[int]:
     admin_ids_to_notify = set(settings.notification_recipient_ids)
     try:
         async with async_session() as db_sess:
@@ -769,18 +807,137 @@ async def feedback_receive(message: Message, state: FSMContext) -> None:
                     admin_ids_to_notify.add(int(db_adm_id))
     except Exception as e:
         logger.warning("Error fetching DB admins for feedback: %s", e)
+    return admin_ids_to_notify
 
+
+@router.callback_query(F.data.startswith("feedback_reply_"))
+async def feedback_client_reply_start(callback: CallbackQuery, state: FSMContext) -> None:
+    raw_id = callback.data.removeprefix("feedback_reply_")
+    if raw_id == "cancel":
+        await state.clear()
+        await callback.message.edit_text("Ответ отменён.")
+        await callback.answer()
+        return
+
+    try:
+        feedback_id = int(raw_id)
+    except ValueError:
+        await callback.answer("Обращение не найдено", show_alert=True)
+        return
+
+    async with async_session() as session:
+        fb = await session.get(Feedback, feedback_id)
+
+    if not fb or fb.telegram_id != callback.from_user.id:
+        await callback.answer("Обращение не найдено", show_alert=True)
+        return
+
+    await state.set_state(FeedbackStates.waiting_reply)
+    await state.update_data(client_reply_feedback_id=feedback_id)
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀️ Отмена", callback_data="feedback_reply_cancel"),
+    ]])
+    await callback.message.answer(
+        f"💬 <b>Ответ на обращение #{feedback_id}</b>\n\n"
+        "Напишите ваше сообщение — текст, фото или видео.",
+        reply_markup=cancel_kb,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(FeedbackStates.waiting_reply)
+async def feedback_client_reply_receive(message: Message, state: FSMContext) -> None:
+    text = message.text or message.caption or ""
+    media_file_id = None
+    media_type = None
+
+    if getattr(message, "photo", None):
+        media_file_id = message.photo[-1].file_id
+        media_type = "photo"
+    elif getattr(message, "video", None):
+        media_file_id = message.video.file_id
+        media_type = "video"
+    elif getattr(message, "document", None):
+        media_file_id = message.document.file_id
+        media_type = "document"
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀️ Отмена", callback_data="feedback_reply_cancel"),
+    ]])
+
+    if not text and not media_file_id:
+        await message.answer("❌ Отправьте текст, фото, видео или скриншот файлом.", reply_markup=cancel_kb)
+        return
+
+    data = await state.get_data()
+    feedback_id = data.get("client_reply_feedback_id")
+    if not feedback_id:
+        await message.answer("❌ Сессия ответа устарела.")
+        await state.clear()
+        return
+
+    async with async_session() as session:
+        fb = await session.get(Feedback, feedback_id)
+        if not fb or fb.telegram_id != message.from_user.id:
+            await message.answer("❌ Обращение не найдено.")
+            await state.clear()
+            return
+
+        reply_msg = FeedbackMessage(
+            feedback_id=feedback_id,
+            sender_type="user",
+            sender_telegram_id=message.from_user.id,
+            text=text or None,
+            media_file_id=media_file_id,
+            media_type=media_type,
+        )
+        session.add(reply_msg)
+        await session.commit()
+
+    await state.clear()
+    await message.answer(
+        "✅ Спасибо! Ваш ответ отправлен в поддержку.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_main")],
+        ]),
+    )
+
+    user_name = html.escape(message.from_user.full_name or "")
+    user_username = f"@{html.escape(message.from_user.username)}" if message.from_user.username else ""
+    user_id = message.from_user.id
+    header = (
+        f"💬 <b>Ответ клиента · обращение #{feedback_id}</b>\n"
+        f"От: {user_name} {user_username} (ID: <code>{user_id}</code>)\n"
+        f"{'─' * 20}"
+    )
+    caption = f"{header}\n\n{text}" if text else header
+    admin_reply_markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💬 Ответить", callback_data=f"feedback_admin_reply_{feedback_id}"),
+        InlineKeyboardButton(text="👤 Профиль", callback_data=f"adm_usr_info_{user_id}"),
+    ]])
+
+    if media_file_id and len(caption) > 1024:
+        caption = caption[:1020] + "..."
+
+    admin_ids_to_notify = await _get_feedback_admin_ids()
     for admin_id in admin_ids_to_notify:
         try:
             if media_file_id and media_type:
-                caption = f"{header}\n\n{text}" if text else header
-                send_fn = message.bot.send_photo if media_type == "photo" else message.bot.send_video
-                await send_fn(admin_id, media_file_id, caption=caption, parse_mode="HTML")
+                if media_type == "photo":
+                    send_fn = message.bot.send_photo
+                elif media_type == "video":
+                    send_fn = message.bot.send_video
+                else:
+                    send_fn = message.bot.send_document
+                await send_fn(admin_id, media_file_id, caption=caption, reply_markup=admin_reply_markup, parse_mode="HTML")
             else:
                 await message.bot.send_message(
                     admin_id,
-                    f"{header}\n\n{text}",
+                    caption,
+                    reply_markup=admin_reply_markup,
                     parse_mode="HTML",
                 )
         except Exception as e:
-            logger.warning("Failed to send feedback to admin %s: %s", admin_id, e)
+            logger.warning("Failed to send feedback reply to admin %s: %s", admin_id, e)

@@ -187,6 +187,11 @@ class Settings:
     subscription_base_url: str = field(
         default_factory=lambda: os.getenv("SUBSCRIPTION_BASE_URL", "")
     )
+    # Preferred base URL for Adapt subscription delivery links (e.g. "https://darimiru.xyz")
+    # Generates https://darimiru.xyz/vpnbot/adapt-sub/<uuid>
+    adapt_subscription_base_url: str = field(
+        default_factory=lambda: os.getenv("ADAPT_SUBSCRIPTION_BASE_URL", "https://darimiru.xyz")
+    )
     subscription_profile_title: str = field(
         default_factory=lambda: os.getenv("SUB_PROFILE_TITLE", "Ускоритель интернета")
     )
@@ -221,6 +226,10 @@ class Settings:
     webstore_api_base_url: str = field(
         default_factory=lambda: os.getenv("WEBSTORE_API_BASE_URL", "https://darimiru.ru")
     )
+    # Public webstore base URL for referral links and customer-facing site links
+    public_webstore_base_url: str = field(
+        default_factory=lambda: os.getenv("PUBLIC_WEBSTORE_BASE_URL", "https://darimiru.xyz")
+    )
     webstore_bridge_secret: str = field(
         default_factory=lambda: os.getenv("WEBSTORE_BRIDGE_SECRET", "")
     )
@@ -235,6 +244,18 @@ class Settings:
     )
     vhq_partner_api_key: str = field(
         default_factory=lambda: os.getenv("VHQ_PARTNER_API_KEY", "")
+    )
+    vhq_subscription_proxy_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "VHQ_SUBSCRIPTION_PROXY_BASE_URL",
+            os.getenv("SUBSCRIPTION_BASE_URL", "https://darimiru.ru"),
+        )
+    )
+    vhq_subscription_proxy_secret: str = field(
+        default_factory=lambda: os.getenv(
+            "VHQ_SUBSCRIPTION_PROXY_SECRET",
+            os.getenv("WEBSTORE_BRIDGE_SECRET", ""),
+        )
     )
 
     # Adapt Group VPN API

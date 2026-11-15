@@ -1058,7 +1058,7 @@ async def test_build_partner_earnings_csv_contains_user_rows(db_session):
     file_bytes = await partner_handler._build_partner_earnings_csv(db_session, partner.id)
     text = file_bytes.decode("utf-8-sig")
 
-    assert "source;earning_id;partner_id;partner_name;amount;created_at" in text
+    assert "source;earning_id;partner_id;partner_name;amount;depth;commission_percent;created_at" in text
     assert "EarnCsv" in text
     assert "earn_user" in text
     assert "web;1;" in text
