@@ -718,10 +718,61 @@ async def test_admin_demo_upgrade_fulfillment_preserves_adapt_uuid(
     api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, paid_plan_uuid)
 
 
+@pytest.mark.parametrize(
+    "issue_case",
+    [
+        pytest.param(
+            AccessProvisionError(
+                provider="adapt",
+                code="adapt_api_402",
+                client_message="Оплата прошла, но доступ задержан.",
+                admin_message="Adapt balance rejected",
+                status=402,
+                raw_message="Insufficient balance",
+                stage="pre_mutation",
+                confirmed_rejection=True,
+                safe_retry_eligible=True,
+            ),
+            id="adapt-confirmed-rejection",
+        ),
+        pytest.param(
+            AccessProvisionError(
+                provider="vhq",
+                code="vhq_supplier",
+                client_message="Оплата прошла, но доступ задержан.",
+                admin_message="supplier unavailable",
+                status=503,
+                raw_message=(
+                    "Service temporarily unavailable token=synthetic-secret "
+                    "Authorization: Bearer synthetic-bearer https://supplier.invalid/error"
+                ),
+                stage="unknown",
+                confirmed_rejection=False,
+                safe_retry_eligible=False,
+            ),
+            id="vhq-temporary-unavailable",
+        ),
+        pytest.param(
+            AccessProvisionError(
+                provider="adapt",
+                code="adapt_upgrade_failed",
+                client_message="Оплата прошла, но доступ задержан.",
+                admin_message="upgrade result unknown",
+                status=None,
+                raw_message="request timed out api_key=synthetic-secret",
+                stage="unknown",
+                confirmed_rejection=False,
+                safe_retry_eligible=False,
+            ),
+            id="adapt-unknown-result-without-status",
+        ),
+    ],
+)
 @pytest.mark.asyncio
 async def test_admin_manual_adapt_failure_alerts_admin_and_uses_neutral_client_text(
     db_session_factory,
     monkeypatch,
+    issue_case,
 ):
     current_plan_uuid = "adapt-manual-current"
     higher_plan_uuid = "adapt-manual-higher"
@@ -760,15 +811,7 @@ async def test_admin_manual_adapt_failure_alerts_admin_and_uses_neutral_client_t
         subscription_service,
         "create_or_extend_paid_access",
         AsyncMock(
-            side_effect=AccessProvisionError(
-                provider="adapt",
-                code="adapt_upgrade_failed",
-                client_message="Оплата прошла, но улучшение временно недоступно. Мы уже получили уведомление.",
-                admin_message="Adapt upgrade failed: Service temporarily unavailable",
-                status=503,
-                stage="unknown",
-                confirmed_rejection=False,
-            )
+            side_effect=issue_case,
         ),
     )
 
@@ -788,12 +831,28 @@ async def test_admin_manual_adapt_failure_alerts_admin_and_uses_neutral_client_t
     detail_text = "\n".join(details)
     assert "Подписка:" in detail_text
     assert "Действие: upgrade" in detail_text
-    assert "Код: adapt_upgrade_failed" in detail_text
-    assert "HTTP статус: 503" in detail_text
-    assert "Подтверждение провайдера: неизвестно" in detail_text
+    assert f"Код: {issue_case.code}" in detail_text
+    assert f"HTTP статус: {issue_case.status or 'неизвестен'}" in detail_text
+    if issue_case.confirmed_rejection:
+        assert "подтверждённый отказ" in detail_text.lower()
+        assert "Повторить можно" in detail_text
+    elif issue_case.status == 503:
+        assert "временная недоступность" in detail_text.lower()
+        assert "Не повторять вслепую" in detail_text
+    else:
+        assert "неизвестный результат" in detail_text.lower()
+        assert "проверить поставщика" in detail_text.lower()
+    assert "synthetic-secret" not in detail_text
+    assert "synthetic-bearer" not in detail_text
+    assert "supplier.invalid" not in detail_text
 
     client_text = callback.message.edit_text.await_args.args[0]
     assert "Ручная операция не выполнена" in client_text
+    assert f"Клиент:" in client_text
+    assert f"Подписка: <code>{subscription_id}</code>" in client_text
+    assert f"Код: <code>{issue_case.code}</code>" in client_text
+    assert "synthetic-secret" not in client_text
+    assert "synthetic-bearer" not in client_text
     assert "Оплата прошла" not in client_text
     assert "уведомление" not in client_text
 
