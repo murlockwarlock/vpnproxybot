@@ -29,12 +29,16 @@ class AccessProvisionError(RuntimeError):
 
 
 _TRANSIENT_PROVIDER_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
-_SENSITIVE_VALUE_RE = re.compile(
+_SENSITIVE_FIELD_RE = re.compile(
     r"(?i)\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|secret|password|authorization|cookie)\b"
-    r"\s*[:=]\s*['\"]?[^\s,;}'\"]+"
+    r"\s*[:=]"
 )
-_BEARER_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[^\s,;]+")
-_URL_RE = re.compile(r"https?://[^\s]+")
+_BEARER_RE = re.compile(r"(?i)\b(?:bearer|basic)\b")
+_URL_RE = re.compile(r"(?i)https?://")
+_UNSAFE_DELIMITER_RE = re.compile(r"[{}\[\]\"'`]")
+_KNOWN_SAFE_REASONS = {
+    "service temporarily unavailable": "Service temporarily unavailable",
+}
 _DEFAULT_REASON_BY_CODE = {
     "adapt_api_402": "Поставщик отклонил запрос из-за недостатка средств.",
     "vhq_balance": "Поставщик отклонил запрос из-за недостатка средств.",
@@ -49,11 +53,9 @@ def describe_access_provision_result(issue: AccessProvisionError) -> str:
     """Return a safe operational classification for an admin-facing report."""
     if issue.confirmed_rejection:
         return "Подтверждённый отказ поставщика до изменения"
-    if issue.stage == "post_mutation":
-        return "Изменение у поставщика подтверждено, локальная обработка не завершена"
     if issue.status in _TRANSIENT_PROVIDER_STATUSES:
         return "Временная недоступность поставщика; результат запроса не подтверждён"
-    return "Неизвестный результат уже отправленного запроса"
+    return "Запрос к поставщику выполнялся, итог операции требует сверки"
 
 
 def recommend_access_provision_action(issue: AccessProvisionError) -> str:
@@ -62,25 +64,42 @@ def recommend_access_provision_action(issue: AccessProvisionError) -> str:
         return "Повторить можно после устранения причины"
     if issue.confirmed_rejection:
         return "Не повторять до проверки параметров и причины отказа"
-    if issue.stage == "post_mutation":
-        return "Не повторять; проверить поставщика и выполнить ручное вмешательство"
     if issue.status in _TRANSIENT_PROVIDER_STATUSES:
         return "Не повторять вслепую; проверить поставщика, затем решить о повторе"
-    return "Не повторять; проверить поставщика и принять ручное решение"
+    return "Не повторяйте действие до проверки"
+
+
+def _safe_reason_fallback(issue: AccessProvisionError) -> str:
+    reason = _DEFAULT_REASON_BY_CODE.get(issue.code) or f"Операция {issue.code} не подтверждена"
+    if issue.status is not None:
+        return f"{reason} HTTP {issue.status}"
+    return reason
+
+
+def _extract_known_safe_reason(value: str) -> str | None:
+    if not value or any(char in value for char in "\r\n"):
+        return None
+    if (
+        _UNSAFE_DELIMITER_RE.search(value)
+        or _URL_RE.search(value)
+        or _SENSITIVE_FIELD_RE.search(value)
+        or _BEARER_RE.search(value)
+    ):
+        return None
+    normalized = " ".join(value.split()).casefold()
+    for known_reason, display_reason in _KNOWN_SAFE_REASONS.items():
+        if known_reason in normalized:
+            return display_reason
+    return None
 
 
 def safe_access_provision_reason(issue: AccessProvisionError, *, limit: int = 240) -> str:
-    """Return a bounded provider reason with credentials and URLs removed."""
-    reason = str(issue.raw_message or "").strip()
-    if not reason:
-        reason = str(issue.admin_message or "").strip() or _DEFAULT_REASON_BY_CODE.get(issue.code) or issue.code
-    reason = _URL_RE.sub("[url скрыт]", reason)
-    reason = _BEARER_RE.sub("[учётные данные скрыты]", reason)
-    reason = _SENSITIVE_VALUE_RE.sub("[чувствительное значение скрыто]", reason)
-    reason = " ".join(reason.split())
-    if len(reason) > limit:
-        reason = reason[: max(1, limit - 1)].rstrip() + "…"
-    return reason
+    """Return only an allowlisted provider reason or a code/status fallback."""
+    for candidate in (issue.raw_message, issue.admin_message):
+        safe_reason = _extract_known_safe_reason(str(candidate or "").strip())
+        if safe_reason:
+            return safe_reason
+    return _safe_reason_fallback(issue)[:limit]
 
 
 def build_internal_access_error(

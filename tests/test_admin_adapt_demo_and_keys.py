@@ -766,6 +766,20 @@ async def test_admin_demo_upgrade_fulfillment_preserves_adapt_uuid(
             ),
             id="adapt-unknown-result-without-status",
         ),
+        pytest.param(
+            AccessProvisionError(
+                provider="vhq",
+                code="vhq_missing_config",
+                client_message="Доступ задержан.",
+                admin_message="VHQ response did not contain config_url",
+                status=None,
+                raw_message="missing config_url",
+                stage="post_mutation",
+                confirmed_rejection=False,
+                safe_retry_eligible=False,
+            ),
+            id="post-mutation-without-confirmation",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -840,8 +854,9 @@ async def test_admin_manual_adapt_failure_alerts_admin_and_uses_neutral_client_t
         assert "временная недоступность" in detail_text.lower()
         assert "Не повторять вслепую" in detail_text
     else:
-        assert "неизвестный результат" in detail_text.lower()
-        assert "проверить поставщика" in detail_text.lower()
+        assert "запрос к поставщику выполнялся" in detail_text.lower()
+        assert "не повторяйте действие до проверки" in detail_text.lower()
+        assert "подтверждение провайдера: неизвестно" in detail_text.lower()
     assert "synthetic-secret" not in detail_text
     assert "synthetic-bearer" not in detail_text
     assert "supplier.invalid" not in detail_text

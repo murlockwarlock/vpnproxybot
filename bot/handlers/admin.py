@@ -125,9 +125,7 @@ async def _notify_manual_provisioning_issue(
     action: str,
     issue,
 ) -> None:
-    if issue.stage == "post_mutation":
-        confirmation = "изменение подтверждено"
-    elif issue.confirmed_rejection:
+    if issue.confirmed_rejection:
         confirmation = "отклонено до изменения"
     else:
         confirmation = "неизвестно"
