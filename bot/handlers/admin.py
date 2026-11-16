@@ -6286,6 +6286,41 @@ _LOG_LINES = 50  # number of tail lines to display
 _MAX_MSG = 4000  # Telegram message char limit (safe margin)
 
 
+def _truncate_escaped_log_body(body: str, limit: int) -> str:
+    if len(body) <= limit:
+        return body
+    if limit <= 1:
+        return "…"[:limit]
+
+    truncated = body[: limit - 1]
+    entity_start = truncated.rfind("&")
+    entity_end = truncated.rfind(";")
+    if entity_start > entity_end:
+        truncated = truncated[:entity_start]
+    return truncated.rstrip() + "…"
+
+
+def _payment_logs_text(lines: list[str]) -> str:
+    escaped_lines = [html.escape(str(line)) for line in lines]
+    first_line = 0
+
+    while True:
+        display = escaped_lines[first_line:]
+        heading = f"📋 <b>Последние {len(display)} событий оплаты</b>\n\n"
+        omitted_prefix = "…\n" if first_line else ""
+        body_limit = _MAX_MSG - len(heading) - len("<pre>") - len("</pre>") - len(omitted_prefix)
+        body = "\n".join(display)
+
+        if len(body) <= body_limit:
+            return f"{heading}<pre>{omitted_prefix}{body}</pre>"
+        if len(display) > 1:
+            first_line += 1
+            continue
+
+        body = _truncate_escaped_log_body(body, body_limit)
+        return f"{heading}<pre>{omitted_prefix}{body}</pre>"
+
+
 @router.callback_query(F.data == "adm_logs")
 async def admin_logs(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
@@ -6297,14 +6332,7 @@ async def admin_logs(callback: CallbackQuery) -> None:
     if not lines:
         text = "📋 <b>Логи оплат</b>\n\nФайл логов пуст или ещё не создан."
     else:
-        # Trim lines from the front until the body fits within the Telegram limit
-        display = list(lines)
-        body = "\n".join(display)
-        while len(body) > _MAX_MSG and len(display) > 1:
-            display = display[1:]
-            body = "\n".join(display)
-        prefix = "…\n" if len(display) < len(lines) else ""
-        text = f"📋 <b>Последние {len(display)} событий оплаты</b>\n\n<pre>{prefix}{body}</pre>"
+        text = _payment_logs_text(lines)
 
     back_kb = InlineKeyboardBuilder()
     back_kb.row(InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back"))
