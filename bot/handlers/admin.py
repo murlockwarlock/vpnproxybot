@@ -71,6 +71,7 @@ from bot.services.legal_docs import LEGAL_DOCS, get_all_legal_doc_urls
 from bot.services.tariff_utils import format_duration_days, format_subscription_duration
 from bot.services.adapt_routing import is_adapt_subscription, is_adapt_tariff, get_adapt_uuid_from_subscription
 from bot.services.purchase_intent import get_paid_adapt_upgrade_plans
+from bot.services.notifications import notify_admins_issue
 from bot.services.subscription_semantics import (
     is_adapt_customer_upgrade_eligible,
     is_adapt_trial_subscription,
@@ -109,6 +110,55 @@ from bot.utils.texts import (
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin")
+
+
+async def _notify_manual_provisioning_issue(
+    callback: CallbackQuery,
+    *,
+    user: User,
+    subscription_id: int | None,
+    action: str,
+    issue,
+) -> None:
+    if issue.stage == "post_mutation":
+        confirmation = "изменение подтверждено"
+    elif issue.confirmed_rejection:
+        confirmation = "отклонено до изменения"
+    else:
+        confirmation = "неизвестно"
+    reason = issue.raw_message or issue.admin_message or issue.code
+    details = [
+        f"Пользователь: {user.telegram_id}",
+        f"Подписка: {subscription_id or 'новая'}",
+        f"Действие: {action or 'manual'}",
+        f"Провайдер: {issue.provider}",
+        f"Код: {issue.code}",
+        f"HTTP статус: {issue.status or 'неизвестен'}",
+        f"Причина: {reason}",
+        f"Стадия операции: {issue.stage}",
+        f"Подтверждение провайдера: {confirmation}",
+    ]
+    try:
+        delivered = await notify_admins_issue(
+            callback.bot,
+            title="Ошибка ручной выдачи или улучшения",
+            details=details,
+        )
+        if not delivered:
+            logger.error(
+                "manual provisioning alert delivery failed: provider=%s code=%s reason=%s result=false",
+                issue.provider,
+                issue.code,
+                reason,
+            )
+    except Exception as alert_error:
+        logger.error(
+            "manual provisioning alert delivery failed: provider=%s code=%s reason=%s error=%s",
+            issue.provider,
+            issue.code,
+            reason,
+            alert_error,
+        )
 
 import asyncio
 from typing import Any, Callable, Awaitable
@@ -4553,6 +4603,13 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
                     await callback.answer()
                     return
 
+                await _notify_manual_provisioning_issue(
+                    callback,
+                    user=user,
+                    subscription_id=target_subscription_id,
+                    action=purchase_action,
+                    issue=issue,
+                )
                 logger.error(
                     "Manual key issuance VPN/VHQ failed: admin_id=%s target_user_id=%s tariff_id=%s code=%s reason=%s",
                     callback.from_user.id,
@@ -4574,10 +4631,10 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
                         manual_op.status = "failed"
                     await session.commit()
                 await callback.message.edit_text(
-                    "❌ Оплата/выдача вручную не выполнена.\n\n"
+                    "❌ Ручная операция не выполнена.\n\n"
                     f"Провайдер: <code>{html.escape(issue.provider)}</code>\n"
                     f"Код: <code>{html.escape(issue.code)}</code>\n"
-                    f"Причина: {html.escape(issue.client_message)}",
+                    "Результат операции у провайдера не подтверждён.",
                     reply_markup=admin_back_kb(),
                     parse_mode="HTML",
                 )

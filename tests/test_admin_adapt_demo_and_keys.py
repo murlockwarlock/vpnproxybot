@@ -14,6 +14,7 @@ from bot.handlers import admin as admin_handler
 from bot.handlers import profile as profile_handler
 from bot.models import AdaptSubscription, Base, Platform, Server, SubStatus, Subscription, Tariff, User
 from bot.services import guide_service, subscription_service
+from bot.services.provisioning_issues import AccessProvisionError
 
 
 @pytest_asyncio.fixture
@@ -715,6 +716,158 @@ async def test_admin_demo_upgrade_fulfillment_preserves_adapt_uuid(
     assert adapt_record.adapt_uuid == adapt_uuid
     assert adapt_record.adapt_plan_uuid == paid_plan_uuid
     api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, paid_plan_uuid)
+
+
+@pytest.mark.asyncio
+async def test_admin_manual_adapt_failure_alerts_admin_and_uses_neutral_client_text(
+    db_session_factory,
+    monkeypatch,
+):
+    current_plan_uuid = "adapt-manual-current"
+    higher_plan_uuid = "adapt-manual-higher"
+    current_tariff = Tariff(
+        label="Текущий тариф",
+        days=30,
+        price_rub=200,
+        adapt_plan_uuid=current_plan_uuid,
+        adapt_cost_price_usd=None,
+    )
+    higher_tariff = Tariff(
+        label="Улучшенный тариф",
+        days=30,
+        price_rub=300,
+        adapt_plan_uuid=higher_plan_uuid,
+        adapt_cost_price_usd=None,
+    )
+    async with db_session_factory() as session:
+        user, _, subscription, _ = await _seed_adapt_subscription(
+            session,
+            tariff=current_tariff,
+            adapt_uuid="manual-upgrade-uuid",
+            status=SubStatus.ACTIVE,
+            billing_mode="tariff",
+            expires_at=datetime.utcnow() + timedelta(days=10),
+            additional_tariffs=[higher_tariff],
+        )
+        subscription_id = subscription.id
+        higher_tariff_id = higher_tariff.id
+
+    monkeypatch.setattr(admin_handler, "_is_admin", lambda user_id: True)
+    monkeypatch.setattr(admin_handler, "async_session", db_session_factory)
+    notify_admins = AsyncMock(return_value=True)
+    monkeypatch.setattr(admin_handler, "notify_admins_issue", notify_admins, raising=False)
+    monkeypatch.setattr(
+        subscription_service,
+        "create_or_extend_paid_access",
+        AsyncMock(
+            side_effect=AccessProvisionError(
+                provider="adapt",
+                code="adapt_upgrade_failed",
+                client_message="Оплата прошла, но улучшение временно недоступно. Мы уже получили уведомление.",
+                admin_message="Adapt upgrade failed: Service temporarily unavailable",
+                status=503,
+                stage="unknown",
+                confirmed_rejection=False,
+            )
+        ),
+    )
+
+    callback = _make_callback(f"adm_key_tariff_{higher_tariff_id}")
+    state = _State(
+        {
+            "manual_key_user": user.telegram_id,
+            "manual_purchase_action": "renew",
+            "manual_target_subscription_id": subscription_id,
+        }
+    )
+
+    await admin_handler.admin_gen_key_tariff(callback, state)
+
+    notify_admins.assert_awaited_once()
+    details = notify_admins.await_args.kwargs["details"]
+    detail_text = "\n".join(details)
+    assert "Подписка:" in detail_text
+    assert "Действие: upgrade" in detail_text
+    assert "Код: adapt_upgrade_failed" in detail_text
+    assert "HTTP статус: 503" in detail_text
+    assert "Подтверждение провайдера: неизвестно" in detail_text
+
+    client_text = callback.message.edit_text.await_args.args[0]
+    assert "Ручная операция не выполнена" in client_text
+    assert "Оплата прошла" not in client_text
+    assert "уведомление" not in client_text
+
+
+@pytest.mark.asyncio
+async def test_admin_manual_adapt_failure_logs_alert_delivery_error(
+    db_session_factory,
+    monkeypatch,
+    caplog,
+):
+    current_tariff = Tariff(
+        label="Текущий тариф",
+        days=30,
+        price_rub=200,
+        adapt_plan_uuid="adapt-alert-current",
+        adapt_cost_price_usd=None,
+    )
+    higher_tariff = Tariff(
+        label="Улучшенный тариф",
+        days=30,
+        price_rub=300,
+        adapt_plan_uuid="adapt-alert-higher",
+        adapt_cost_price_usd=None,
+    )
+    async with db_session_factory() as session:
+        user, _, subscription, _ = await _seed_adapt_subscription(
+            session,
+            tariff=current_tariff,
+            adapt_uuid="alert-upgrade-uuid",
+            status=SubStatus.ACTIVE,
+            billing_mode="tariff",
+            expires_at=datetime.utcnow() + timedelta(days=10),
+            additional_tariffs=[higher_tariff],
+        )
+        subscription_id = subscription.id
+        higher_tariff_id = higher_tariff.id
+
+    monkeypatch.setattr(admin_handler, "_is_admin", lambda user_id: True)
+    monkeypatch.setattr(admin_handler, "async_session", db_session_factory)
+    monkeypatch.setattr(
+        admin_handler,
+        "notify_admins_issue",
+        AsyncMock(side_effect=RuntimeError("telegram unavailable")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        subscription_service,
+        "create_or_extend_paid_access",
+        AsyncMock(
+            side_effect=AccessProvisionError(
+                provider="adapt",
+                code="adapt_upgrade_failed",
+                client_message="Оплата прошла, но улучшение временно недоступно.",
+                admin_message="Adapt upgrade failed: Service temporarily unavailable",
+                status=503,
+            )
+        ),
+    )
+
+    callback = _make_callback(f"adm_key_tariff_{higher_tariff_id}")
+    state = _State(
+        {
+            "manual_key_user": user.telegram_id,
+            "manual_purchase_action": "upgrade",
+            "manual_target_subscription_id": subscription_id,
+        }
+    )
+
+    with caplog.at_level("ERROR", logger=admin_handler.__name__):
+        await admin_handler.admin_gen_key_tariff(callback, state)
+
+    assert "manual provisioning alert delivery failed" in caplog.text
+    assert "adapt_upgrade_failed" in caplog.text
+    assert "Service temporarily unavailable" in caplog.text
 
 
 @pytest.mark.asyncio
