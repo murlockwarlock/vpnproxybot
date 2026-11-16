@@ -30,3 +30,7 @@ jobs:
       - name: Run critical payment acceptance suite
         run: |
           pytest tests/test_payment_recovery_acceptance.py -v
+
+      - name: Run admin payment logs regressions
+        run: |
+          pytest -q tests/test_admin_payment_logs.py tests/test_payment_logger.py tests/test_admin_stats.py
