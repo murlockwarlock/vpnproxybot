@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from bot.services.adapt_api import AdaptAPIError
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -194,6 +196,69 @@ async def test_create_adapt_paid_subscription_402_is_safe_waiting_funds():
     assert payment.provisioning_failure_code == "adapt_api_402"
 
 
+@pytest.mark.parametrize(
+    ("provider_error", "expected_status"),
+    [
+        pytest.param(AdaptAPIError("Adapt unavailable", status=503), 503, id="http-status"),
+        pytest.param(RuntimeError("request result unavailable"), None, id="unknown-result"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_adapt_upgrade_failure_preserves_safe_operation_classification(
+    provider_error,
+    expected_status,
+):
+    from bot.services.provisioning_issues import AccessProvisionError
+    from bot.services.subscription_service import _create_adapt_paid_subscription
+
+    session = AsyncMock()
+    user = _make_user()
+    tariff = _make_tariff(adapt_plan_uuid="target-plan")
+    server = _make_server()
+    existing = MagicMock(
+        id=801,
+        expires_at=datetime.utcnow() + timedelta(days=5),
+        device_slots=3,
+    )
+    adapt_record = MagicMock(
+        adapt_uuid="adapt-upgrade-failure",
+        adapt_plan_uuid="current-plan",
+        end_date=existing.expires_at,
+    )
+
+    with (
+        patch("bot.services.subscription_service.get_primary_active_server", new=AsyncMock(return_value=server)),
+        patch("bot.services.subscription_service._adapt_subscription_by_id", new=AsyncMock(return_value=(existing, adapt_record))),
+        patch("bot.services.subscription_service.AdaptAPI") as api_cls,
+        patch("bot.services.subscription_service.plog"),
+    ):
+        api = AsyncMock()
+        api.get_status.return_value = {
+            "plan_uuid": "current-plan",
+            "end_date": existing.expires_at.isoformat(),
+            "devices": 3,
+        }
+        api.upgrade_subscription = AsyncMock(side_effect=provider_error)
+        api_cls.return_value = api
+
+        with pytest.raises(AccessProvisionError) as raised:
+            await _create_adapt_paid_subscription(
+                session,
+                user=user,
+                tariff=tariff,
+                platform=MagicMock(),
+                purchase_action="upgrade",
+                target_subscription_id=existing.id,
+            )
+
+    issue = raised.value
+    assert issue.code == "adapt_upgrade_failed"
+    assert issue.status == expected_status
+    assert issue.stage == "unknown"
+    assert issue.confirmed_rejection is False
+    assert issue.safe_retry_eligible is False
+
+
 @pytest.mark.asyncio
 async def test_renew_adapt_subscription_propagates_confirmed_402():
     from bot.services.adapt_api import AdaptAPIError
@@ -293,7 +358,11 @@ async def test_create_adapt_paid_subscription_renews_existing_for_same_plan():
         )
 
     mock_renew.assert_awaited_once_with(
-        session, adapt_record=adapt_record, tariff_days=tariff.days, manage_freeze=False
+        session,
+        adapt_record=adapt_record,
+        tariff_days=tariff.days,
+        manage_freeze=False,
+        raise_api_errors=True,
     )
     mock_adapt_cls.return_value.create_subscription.assert_not_called()
     assert sub is existing

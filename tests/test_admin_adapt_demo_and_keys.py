@@ -14,6 +14,7 @@ from bot.handlers import admin as admin_handler
 from bot.handlers import profile as profile_handler
 from bot.models import AdaptSubscription, Base, Platform, Server, SubStatus, Subscription, Tariff, User
 from bot.services import guide_service, subscription_service
+from bot.services.provisioning_issues import AccessProvisionError
 
 
 @pytest_asyncio.fixture
@@ -715,6 +716,232 @@ async def test_admin_demo_upgrade_fulfillment_preserves_adapt_uuid(
     assert adapt_record.adapt_uuid == adapt_uuid
     assert adapt_record.adapt_plan_uuid == paid_plan_uuid
     api.upgrade_subscription.assert_awaited_once_with(adapt_uuid, paid_plan_uuid)
+
+
+@pytest.mark.parametrize(
+    "issue_case",
+    [
+        pytest.param(
+            AccessProvisionError(
+                provider="adapt",
+                code="adapt_api_402",
+                client_message="Оплата прошла, но доступ задержан.",
+                admin_message="Adapt balance rejected",
+                status=402,
+                raw_message="Insufficient balance",
+                stage="pre_mutation",
+                confirmed_rejection=True,
+                safe_retry_eligible=True,
+            ),
+            id="adapt-confirmed-rejection",
+        ),
+        pytest.param(
+            AccessProvisionError(
+                provider="vhq",
+                code="vhq_supplier",
+                client_message="Оплата прошла, но доступ задержан.",
+                admin_message="supplier unavailable",
+                status=503,
+                raw_message=(
+                    "Service temporarily unavailable token=synthetic-secret "
+                    "Authorization: Bearer synthetic-bearer https://supplier.invalid/error"
+                ),
+                stage="unknown",
+                confirmed_rejection=False,
+                safe_retry_eligible=False,
+            ),
+            id="vhq-temporary-unavailable",
+        ),
+        pytest.param(
+            AccessProvisionError(
+                provider="adapt",
+                code="adapt_upgrade_failed",
+                client_message="Оплата прошла, но доступ задержан.",
+                admin_message="upgrade result unknown",
+                status=None,
+                raw_message="request timed out api_key=synthetic-secret",
+                stage="unknown",
+                confirmed_rejection=False,
+                safe_retry_eligible=False,
+            ),
+            id="adapt-unknown-result-without-status",
+        ),
+        pytest.param(
+            AccessProvisionError(
+                provider="vhq",
+                code="vhq_missing_config",
+                client_message="Доступ задержан.",
+                admin_message="VHQ response did not contain config_url",
+                status=None,
+                raw_message="missing config_url",
+                stage="post_mutation",
+                confirmed_rejection=False,
+                safe_retry_eligible=False,
+            ),
+            id="post-mutation-without-confirmation",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_admin_manual_adapt_failure_alerts_admin_and_uses_neutral_client_text(
+    db_session_factory,
+    monkeypatch,
+    issue_case,
+):
+    current_plan_uuid = "adapt-manual-current"
+    higher_plan_uuid = "adapt-manual-higher"
+    current_tariff = Tariff(
+        label="Текущий тариф",
+        days=30,
+        price_rub=200,
+        adapt_plan_uuid=current_plan_uuid,
+        adapt_cost_price_usd=None,
+    )
+    higher_tariff = Tariff(
+        label="Улучшенный тариф",
+        days=30,
+        price_rub=300,
+        adapt_plan_uuid=higher_plan_uuid,
+        adapt_cost_price_usd=None,
+    )
+    async with db_session_factory() as session:
+        user, _, subscription, _ = await _seed_adapt_subscription(
+            session,
+            tariff=current_tariff,
+            adapt_uuid="manual-upgrade-uuid",
+            status=SubStatus.ACTIVE,
+            billing_mode="tariff",
+            expires_at=datetime.utcnow() + timedelta(days=10),
+            additional_tariffs=[higher_tariff],
+        )
+        subscription_id = subscription.id
+        higher_tariff_id = higher_tariff.id
+
+    monkeypatch.setattr(admin_handler, "_is_admin", lambda user_id: True)
+    monkeypatch.setattr(admin_handler, "async_session", db_session_factory)
+    notify_admins = AsyncMock(return_value=True)
+    monkeypatch.setattr(admin_handler, "notify_admins_issue", notify_admins, raising=False)
+    monkeypatch.setattr(
+        subscription_service,
+        "create_or_extend_paid_access",
+        AsyncMock(
+            side_effect=issue_case,
+        ),
+    )
+
+    callback = _make_callback(f"adm_key_tariff_{higher_tariff_id}")
+    state = _State(
+        {
+            "manual_key_user": user.telegram_id,
+            "manual_purchase_action": "renew",
+            "manual_target_subscription_id": subscription_id,
+        }
+    )
+
+    await admin_handler.admin_gen_key_tariff(callback, state)
+
+    notify_admins.assert_awaited_once()
+    details = notify_admins.await_args.kwargs["details"]
+    detail_text = "\n".join(details)
+    assert "Подписка:" in detail_text
+    assert "Действие: upgrade" in detail_text
+    assert f"Код: {issue_case.code}" in detail_text
+    assert f"HTTP статус: {issue_case.status or 'неизвестен'}" in detail_text
+    if issue_case.confirmed_rejection:
+        assert "подтверждённый отказ" in detail_text.lower()
+        assert "Повторить можно" in detail_text
+    elif issue_case.status == 503:
+        assert "временная недоступность" in detail_text.lower()
+        assert "Не повторять вслепую" in detail_text
+    else:
+        assert "запрос к поставщику выполнялся" in detail_text.lower()
+        assert "не повторяйте действие до проверки" in detail_text.lower()
+        assert "подтверждение провайдера: неизвестно" in detail_text.lower()
+    assert "synthetic-secret" not in detail_text
+    assert "synthetic-bearer" not in detail_text
+    assert "supplier.invalid" not in detail_text
+
+    client_text = callback.message.edit_text.await_args.args[0]
+    assert "Ручная операция не выполнена" in client_text
+    assert f"Клиент:" in client_text
+    assert f"Подписка: <code>{subscription_id}</code>" in client_text
+    assert f"Код: <code>{issue_case.code}</code>" in client_text
+    assert "synthetic-secret" not in client_text
+    assert "synthetic-bearer" not in client_text
+    assert "Оплата прошла" not in client_text
+    assert "уведомление" not in client_text
+
+
+@pytest.mark.asyncio
+async def test_admin_manual_adapt_failure_logs_alert_delivery_error(
+    db_session_factory,
+    monkeypatch,
+    caplog,
+):
+    current_tariff = Tariff(
+        label="Текущий тариф",
+        days=30,
+        price_rub=200,
+        adapt_plan_uuid="adapt-alert-current",
+        adapt_cost_price_usd=None,
+    )
+    higher_tariff = Tariff(
+        label="Улучшенный тариф",
+        days=30,
+        price_rub=300,
+        adapt_plan_uuid="adapt-alert-higher",
+        adapt_cost_price_usd=None,
+    )
+    async with db_session_factory() as session:
+        user, _, subscription, _ = await _seed_adapt_subscription(
+            session,
+            tariff=current_tariff,
+            adapt_uuid="alert-upgrade-uuid",
+            status=SubStatus.ACTIVE,
+            billing_mode="tariff",
+            expires_at=datetime.utcnow() + timedelta(days=10),
+            additional_tariffs=[higher_tariff],
+        )
+        subscription_id = subscription.id
+        higher_tariff_id = higher_tariff.id
+
+    monkeypatch.setattr(admin_handler, "_is_admin", lambda user_id: True)
+    monkeypatch.setattr(admin_handler, "async_session", db_session_factory)
+    monkeypatch.setattr(
+        admin_handler,
+        "notify_admins_issue",
+        AsyncMock(side_effect=RuntimeError("telegram unavailable")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        subscription_service,
+        "create_or_extend_paid_access",
+        AsyncMock(
+            side_effect=AccessProvisionError(
+                provider="adapt",
+                code="adapt_upgrade_failed",
+                client_message="Оплата прошла, но улучшение временно недоступно.",
+                admin_message="Adapt upgrade failed: Service temporarily unavailable",
+                status=503,
+            )
+        ),
+    )
+
+    callback = _make_callback(f"adm_key_tariff_{higher_tariff_id}")
+    state = _State(
+        {
+            "manual_key_user": user.telegram_id,
+            "manual_purchase_action": "upgrade",
+            "manual_target_subscription_id": subscription_id,
+        }
+    )
+
+    with caplog.at_level("ERROR", logger=admin_handler.__name__):
+        await admin_handler.admin_gen_key_tariff(callback, state)
+
+    assert "manual provisioning alert delivery failed" in caplog.text
+    assert "adapt_upgrade_failed" in caplog.text
+    assert "Service temporarily unavailable" in caplog.text
 
 
 @pytest.mark.asyncio

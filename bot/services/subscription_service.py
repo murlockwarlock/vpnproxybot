@@ -1764,19 +1764,14 @@ async def _adapt_create_new_subscription(
                 ),
             )
         else:
-            issue = build_internal_access_error(
-                provider="adapt",
+            issue = build_adapt_access_error(
+                status=exc.status,
+                message=str(exc),
                 code=failure_code,
-                admin_message=(
-                    f"Adapt API error during subscription creation: {exc} "
+                context=(
                     f"user_id={user.id} telegram_id={user.telegram_id} "
-                    f"tariff_id={getattr(tariff, 'id', None)} plan_uuid={plan_uuid} status={exc.status}"
+                    f"tariff_id={getattr(tariff, 'id', None)} plan_uuid={plan_uuid}"
                 ),
-                client_message=(
-                    "Оплата прошла, но выдача доступа временно недоступна. "
-                    "Мы уже получили уведомление и разбираемся."
-                ),
-                raw_message=str(exc),
             )
         plog(
             "ОШИБКА_ВЫДАЧИ",
@@ -2313,16 +2308,14 @@ async def _create_adapt_paid_subscription(
                     ),
                 )
             else:
-                issue = build_internal_access_error(
-                    provider="adapt",
+                issue = build_adapt_access_error(
+                    status=exc.status,
+                    message=str(exc),
                     code="adapt_upgrade_failed",
-                    admin_message=(
-                        "Adapt upgrade failed "
+                    context=(
                         f"subscription_id={existing.id} adapt_uuid={adapt_record.adapt_uuid} "
-                        f"new_plan_uuid={plan_uuid}: {exc}"
+                        f"new_plan_uuid={plan_uuid}"
                     ),
-                    client_message="Оплата прошла, но улучшение подписки временно недоступно. Мы уже получили уведомление.",
-                    raw_message=str(exc),
                 )
             raise issue
         except Exception as exc:
@@ -2375,23 +2368,49 @@ async def _create_adapt_paid_subscription(
         else:
             try:
                 renewed = await renew_adapt_subscription(
-                    session, adapt_record=adapt_record, tariff_days=tariff.days, manage_freeze=False,
+                    session,
+                    adapt_record=adapt_record,
+                    tariff_days=tariff.days,
+                    manage_freeze=False,
+                    raise_api_errors=True,
                 )
             except AdaptAPIError as exc:
-                if provisioning_payment is not None and exc.status == 402:
-                    provisioning_payment.provisioning_failure_code = "adapt_api_402"
-                    await session.commit()
-                if exc.status == 402:
-                    issue = build_adapt_access_error(
-                        status=exc.status,
-                        message=str(exc),
-                        context=(
-                            f"subscription_id={existing.id} adapt_uuid={adapt_record.adapt_uuid} "
-                            f"tariff_id={getattr(tariff, 'id', None)}"
-                        ),
+                if provisioning_payment is not None:
+                    provisioning_payment.provisioning_failure_code = (
+                        "adapt_api_402" if exc.status == 402 else "adapt_renew_failed"
                     )
-                    raise issue
-                raise
+                    await session.commit()
+                issue = build_adapt_access_error(
+                    status=exc.status,
+                    message=str(exc),
+                    code="adapt_renew_failed",
+                    context=(
+                        f"subscription_id={existing.id} adapt_uuid={adapt_record.adapt_uuid} "
+                        f"tariff_id={getattr(tariff, 'id', None)}"
+                    ),
+                )
+                raise issue
+            except Exception as exc:
+                if provisioning_payment is not None:
+                    provisioning_payment.provisioning_failure_code = "adapt_renew_failed"
+                    await session.commit()
+                issue = build_internal_access_error(
+                    provider="adapt",
+                    code="adapt_renew_failed",
+                    admin_message=(
+                        "Adapt renewal result is unknown "
+                        f"subscription_id={existing.id} adapt_uuid={adapt_record.adapt_uuid}: {exc}"
+                    ),
+                    client_message=(
+                        "Оплата получена, но результат продления не подтверждён. "
+                        "Доступ не изменён автоматически."
+                    ),
+                    raw_message=str(exc),
+                    stage="unknown",
+                    confirmed_rejection=False,
+                    safe_retry_eligible=False,
+                )
+                raise issue
             if renewed:
                 try:
                     response = await api.get_status(adapt_record.adapt_uuid)
@@ -2647,6 +2666,7 @@ async def renew_adapt_subscription(
     adapt_record: "AdaptSubscription",
     tariff_days: int,
     manage_freeze: bool = True,
+    raise_api_errors: bool = False,
 ) -> bool:
     """Renew an Adapt subscription (e.g. after user payment).
 
@@ -2718,7 +2738,7 @@ async def renew_adapt_subscription(
             exc,
             exc.status,
         )
-        if exc.status == 402:
+        if raise_api_errors or exc.status == 402:
             raise
         return False
     except Exception as exc:
@@ -2729,6 +2749,8 @@ async def renew_adapt_subscription(
             exc,
             getattr(exc, "status", None),
         )
+        if raise_api_errors:
+            raise
         return False
 
 

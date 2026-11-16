@@ -71,6 +71,12 @@ from bot.services.legal_docs import LEGAL_DOCS, get_all_legal_doc_urls
 from bot.services.tariff_utils import format_duration_days, format_subscription_duration
 from bot.services.adapt_routing import is_adapt_subscription, is_adapt_tariff, get_adapt_uuid_from_subscription
 from bot.services.purchase_intent import get_paid_adapt_upgrade_plans
+from bot.services.notifications import notify_admins_issue
+from bot.services.provisioning_issues import (
+    describe_access_provision_result,
+    recommend_access_provision_action,
+    safe_access_provision_reason,
+)
 from bot.services.subscription_semantics import (
     is_adapt_customer_upgrade_eligible,
     is_adapt_trial_subscription,
@@ -109,6 +115,65 @@ from bot.utils.texts import (
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin")
+
+
+async def _notify_manual_provisioning_issue(
+    callback: CallbackQuery,
+    *,
+    user: User,
+    subscription_id: int | None,
+    action: str,
+    issue,
+) -> None:
+    if issue.confirmed_rejection:
+        confirmation = "отклонено до изменения"
+    else:
+        confirmation = "неизвестно"
+    reason = safe_access_provision_reason(issue)
+    result = describe_access_provision_result(issue)
+    recommendation = recommend_access_provision_action(issue)
+    username = f"@{user.username}" if getattr(user, "username", None) else "без username"
+    client = f"{getattr(user, 'full_name', None) or 'без имени'} ({username}, Telegram ID {user.telegram_id})"
+    details = [
+        f"Клиент: {client}",
+        f"Подписка: {subscription_id or 'новая'}",
+        f"Действие: {action or 'manual'}",
+        f"Провайдер: {issue.provider}",
+        f"Код: {issue.code}",
+        f"HTTP статус: {issue.status or 'неизвестен'}",
+        f"Причина: {reason}",
+        f"Результат операции: {result}",
+        f"Рекомендация: {recommendation}",
+        f"Стадия операции: {issue.stage}",
+        f"Подтверждение провайдера: {confirmation}",
+    ]
+    try:
+        delivered = await notify_admins_issue(
+            callback.bot,
+            title="Ошибка ручной выдачи или улучшения",
+            details=details,
+        )
+        if not delivered:
+            logger.error(
+                "manual provisioning alert delivery failed: provider=%s code=%s reason=%s result=false",
+                issue.provider,
+                issue.code,
+                reason,
+            )
+        else:
+            logger.info(
+                "manual provisioning alert delivered: provider=%s code=%s result=true",
+                issue.provider,
+                issue.code,
+            )
+    except Exception as alert_error:
+        logger.error(
+            "manual provisioning alert delivery failed: provider=%s code=%s reason=%s error=%s",
+            issue.provider,
+            issue.code,
+            reason,
+            alert_error,
+        )
 
 import asyncio
 from typing import Any, Callable, Awaitable
@@ -4553,13 +4618,20 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
                     await callback.answer()
                     return
 
+                await _notify_manual_provisioning_issue(
+                    callback,
+                    user=user,
+                    subscription_id=target_subscription_id,
+                    action=purchase_action,
+                    issue=issue,
+                )
                 logger.error(
                     "Manual key issuance VPN/VHQ failed: admin_id=%s target_user_id=%s tariff_id=%s code=%s reason=%s",
                     callback.from_user.id,
                     user.id,
                     tariff.id,
                     issue.code,
-                    issue.admin_message,
+                    safe_access_provision_reason(issue),
                 )
                 if manual_op:
                     fulfillment = await session.scalar(
@@ -4574,10 +4646,16 @@ async def admin_gen_key_tariff(callback: CallbackQuery, state: FSMContext) -> No
                         manual_op.status = "failed"
                     await session.commit()
                 await callback.message.edit_text(
-                    "❌ Оплата/выдача вручную не выполнена.\n\n"
+                    "❌ Ручная операция не выполнена.\n\n"
+                    f"Клиент: <code>{html.escape(str(user.telegram_id))}</code>\n"
+                    f"Подписка: <code>{html.escape(str(target_subscription_id or 'новая'))}</code>\n"
+                    f"Действие: <code>{html.escape(str(purchase_action or 'manual'))}</code>\n"
                     f"Провайдер: <code>{html.escape(issue.provider)}</code>\n"
                     f"Код: <code>{html.escape(issue.code)}</code>\n"
-                    f"Причина: {html.escape(issue.client_message)}",
+                    f"HTTP статус: <code>{html.escape(str(issue.status or 'неизвестен'))}</code>\n"
+                    f"Причина: {html.escape(safe_access_provision_reason(issue))}\n"
+                    f"Результат: {html.escape(describe_access_provision_result(issue))}\n"
+                    f"Рекомендация: {html.escape(recommend_access_provision_action(issue))}",
                     reply_markup=admin_back_kb(),
                     parse_mode="HTML",
                 )

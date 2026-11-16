@@ -34,3 +34,8 @@ jobs:
       - name: Run admin payment logs regressions
         run: |
           pytest -q tests/test_admin_payment_logs.py tests/test_payment_logger.py tests/test_admin_stats.py
+
+      - name: Run manual Adapt admin alert regressions
+        run: |
+          pytest -q tests/test_admin_adapt_demo_and_keys.py -k manual_adapt_failure
+          pytest -q tests/test_adapt_subscription_service.py -k adapt_upgrade_failure_preserves_safe_operation_classification
