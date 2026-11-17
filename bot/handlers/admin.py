@@ -2687,33 +2687,284 @@ async def _fetch_webstore_search_profiles(query: str) -> list[dict]:
             return list(data.get("profiles") or [])
 
 
+_SEARCH_GENERIC_URL_SEGMENTS = frozenset({
+    "",
+    "sub",
+    "vpnbot",
+    "adapt-sub",
+    "vhq-sub",
+    "proxy-subscription",
+    "subscribe",
+    "api",
+    "v1",
+    "v2",
+    "client",
+    "functions",
+    "partner-api",
+    "proxy",
+    "socks",
+})
+_SEARCH_VHQ_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$")
+_SEARCH_VPN_URI_SCHEMES = (
+    "vless://",
+    "vmess://",
+    "trojan://",
+    "ss://",
+    "ssr://",
+    "hy2://",
+    "hysteria2://",
+    "tuic://",
+    "tg://",
+)
+
+
+def _sql_exact_url_cs(col, target_url: str):
+    """Case-sensitive exact URL comparison ignoring trailing slashes."""
+    return func.rtrim(col, "/") == target_url.rstrip("/")
+
+
+def _sql_suffix_cs(col, suffix: str):
+    """Case-sensitive exact suffix comparison ignoring trailing slashes on column."""
+    return func.substr(func.rtrim(col, "/"), -len(suffix)) == suffix
+
+
+def _sql_adapt_url_uuid_match(col, canon_uuid: str):
+    """Exact UUID match at the end of a stored Adapt URL (with optional query/fragment)."""
+    suffix = f"/{canon_uuid.lower()}"
+    lowered_trimmed = func.lower(func.rtrim(col, "/"))
+    lowered_raw = func.lower(col)
+    return or_(
+        func.substr(lowered_trimmed, -len(suffix)) == suffix,
+        lowered_raw.like(f"%{suffix}?%"),
+        lowered_raw.like(f"%{suffix}/?%"),
+        lowered_raw.like(f"%{suffix}#%"),
+        lowered_raw.like(f"%{suffix}/#%"),
+    )
+
+
+def _classify_admin_search_query(raw_query: str) -> dict:
+    """Classify a search query into strict link/key/UUID matchers or plain text."""
+    from urllib.parse import urlparse
+    from bot.services.adapt_routing import ADAPT_CLIENT_PREFIX
+    from bot.services.vhq_subscription_proxy import resolve_vhq_mirror_token
+
+    raw = str(raw_query or "").strip()
+    if not raw:
+        return {"kind": "invalid_link"}
+
+    # 1. VHQ mirror link (/vhq-sub/<payload>.<sig>) or bare signed VHQ token
+    if "/vhq-sub/" in raw:
+        path_part = urlparse(raw).path if "://" in raw else raw.split("?", 1)[0].split("#", 1)[0]
+        token_part = path_part.rsplit("/vhq-sub/", 1)[-1].strip("/")
+        if not token_part or "/" in token_part or not _SEARCH_VHQ_TOKEN_RE.fullmatch(token_part):
+            return {"kind": "invalid_link"}
+        resolved = resolve_vhq_mirror_token(token_part)
+        return {"kind": "vhq_mirror", "token": token_part, "resolved": resolved}
+
+    if " " not in raw and "://" not in raw and "/" not in raw and _SEARCH_VHQ_TOKEN_RE.fullmatch(raw):
+        resolved = resolve_vhq_mirror_token(raw)
+        return {"kind": "vhq_mirror", "token": raw, "resolved": resolved}
+
+    # 2. Adapt mirror link (/adapt-sub/<uuid>)
+    if "/adapt-sub/" in raw.lower():
+        path_part = urlparse(raw).path if "://" in raw else raw.split("?", 1)[0].split("#", 1)[0]
+        idx = path_part.lower().rfind("/adapt-sub/")
+        seg = path_part[idx + len("/adapt-sub/"):].strip("/")
+        if "/" in seg or len(seg) != 36:
+            return {"kind": "invalid_link"}
+        try:
+            return {"kind": "adapt_uuid", "adapt_uuid": str(uuid.UUID(seg)).lower()}
+        except (ValueError, AttributeError):
+            return {"kind": "invalid_link"}
+
+    # 3. HTTP(S) URLs (Adapt upstream, VHQ upstream, Marzban /sub/, TG proxy)
+    if raw.lower().startswith(("http://", "https://")):
+        parsed = urlparse(raw)
+        host = (parsed.netloc or "").strip().lower()
+        norm_path = (parsed.path or "").rstrip("/")
+        if not host:
+            return {"kind": "invalid_link"}
+
+        sub_idx = norm_path.lower().rfind("/sub/")
+        if sub_idx != -1:
+            seg = norm_path[sub_idx + len("/sub/"):]
+            if "/" not in seg and len(seg) == 36:
+                try:
+                    return {"kind": "adapt_uuid", "adapt_uuid": str(uuid.UUID(seg)).lower()}
+                except (ValueError, AttributeError):
+                    pass
+
+        if "adaptgroup." in host:
+            return {"kind": "invalid_link"}
+
+        last_seg = norm_path.rsplit("/", 1)[-1] if norm_path else ""
+        has_specific_token = bool(
+            last_seg and last_seg.lower() not in _SEARCH_GENERIC_URL_SEGMENTS and len(last_seg) >= 4
+        )
+        if not parsed.query and not has_specific_token:
+            return {"kind": "invalid_link"}
+
+        base_no_query = f"{parsed.scheme.lower()}://{host}{norm_path}"
+        full_no_frag = f"{base_no_query}?{parsed.query}" if parsed.query else base_no_query
+        allow_path_suffix = bool(has_specific_token and norm_path.count("/") >= 2)
+        return {
+            "kind": "http_url",
+            "raw": raw,
+            "full_no_frag": full_no_frag,
+            "has_query": bool(parsed.query),
+            "base_no_query": base_no_query if has_specific_token else None,
+            "path_suffix": norm_path if allow_path_suffix else None,
+        }
+
+    # 4. Raw VPN / Proxy protocol URIs (vless://, vmess://, tg://, etc.)
+    if raw.lower().startswith(_SEARCH_VPN_URI_SCHEMES):
+        after_scheme = raw.split("://", 1)[-1].strip()
+        if len(after_scheme) < 8:
+            return {"kind": "invalid_link"}
+        return {"kind": "uri_key", "uri": raw}
+
+    # 5. Pure UUID or prefixed Adapt UUID (adapt_<uuid>, uuid:<uuid>, adapt:<uuid>)
+    candidate = raw
+    for prefix in (ADAPT_CLIENT_PREFIX, "uuid:", "adapt:"):
+        if candidate.lower().startswith(prefix):
+            candidate = candidate[len(prefix):].strip()
+            break
+    if len(candidate) == 36:
+        try:
+            return {"kind": "adapt_uuid", "adapt_uuid": str(uuid.UUID(candidate)).lower()}
+        except (ValueError, AttributeError):
+            pass
+
+    return {"kind": "plain", "raw": raw}
+
+
+def _build_subscription_search_user_ids_subquery(clean: str, *, link_only: bool = False):
+    parsed = _classify_admin_search_query(clean)
+    kind = parsed["kind"]
+
+    if kind == "invalid_link":
+        return select(Subscription.user_id).where(Subscription.id == -1)
+
+    conditions = []
+    if kind == "adapt_uuid":
+        canon_uuid = parsed["adapt_uuid"]
+        conditions.extend([
+            func.lower(AdaptSubscription.adapt_uuid) == canon_uuid,
+            func.lower(Subscription.client_name) == f"adapt_{canon_uuid}",
+            _sql_adapt_url_uuid_match(Subscription.vpn_key, canon_uuid),
+        ])
+    elif kind == "vhq_mirror":
+        token = parsed["token"]
+        resolved = parsed["resolved"]
+        conditions.append(_sql_suffix_cs(Subscription.vpn_key, f"/vhq-sub/{token}"))
+        if resolved:
+            if resolved.get("subscription_id"):
+                conditions.append(Subscription.id == int(resolved["subscription_id"]))
+            if resolved.get("upstream_url"):
+                conditions.append(_sql_exact_url_cs(Subscription.vpn_key, str(resolved["upstream_url"])))
+            if resolved.get("order_id"):
+                ord_id = str(resolved["order_id"])
+                conditions.append(Subscription.vhq_order_id == ord_id)
+                conditions.append(Subscription.client_name == f"vhq_{ord_id}")
+    elif kind == "http_url":
+        if parsed["has_query"]:
+            conditions.append(Subscription.vpn_key == parsed["raw"])
+            conditions.append(Subscription.vpn_key == parsed["full_no_frag"])
+        if parsed["base_no_query"]:
+            conditions.append(_sql_exact_url_cs(Subscription.vpn_key, parsed["base_no_query"]))
+        if parsed["path_suffix"]:
+            conditions.append(_sql_suffix_cs(Subscription.vpn_key, parsed["path_suffix"]))
+    elif kind == "uri_key":
+        conditions.append(Subscription.vpn_key == parsed["uri"])
+    else:
+        # Plain text search
+        if clean.lower().startswith("vhq_"):
+            ord_id = clean[4:].strip()
+            if ord_id:
+                conditions.append(Subscription.vhq_order_id == ord_id)
+                conditions.append(func.lower(Subscription.client_name) == clean.lower())
+        elif clean.lower().startswith("adapt_"):
+            conditions.append(func.lower(Subscription.client_name) == clean.lower())
+        else:
+            conditions.append(Subscription.vhq_order_id == clean)
+            if link_only:
+                conditions.append(Subscription.client_name == clean)
+            else:
+                conditions.append(Subscription.client_name.ilike(f"%{clean}%"))
+            if len(clean) >= 8 and " " not in clean and "/" not in clean and clean != "mtproto_only":
+                conditions.append(_sql_suffix_cs(Subscription.vpn_key, f"/{clean}"))
+
+    if not conditions:
+        return select(Subscription.user_id).where(Subscription.id == -1)
+
+    return (
+        select(Subscription.user_id)
+        .outerjoin(AdaptSubscription, AdaptSubscription.subscription_id == Subscription.id)
+        .where(or_(*conditions))
+    )
+
+
+def _build_proxy_search_user_ids_subquery(clean: str, *, link_only: bool = False):
+    parsed = _classify_admin_search_query(clean)
+    kind = parsed["kind"]
+
+    if kind in ("invalid_link", "adapt_uuid", "vhq_mirror"):
+        return select(ProxyAccount.user_id).where(ProxyAccount.id == -1)
+
+    conditions = []
+    if kind == "http_url":
+        if parsed["has_query"]:
+            conditions.append(ProxyAccount.sub_url == parsed["raw"])
+            conditions.append(ProxyAccount.sub_url == parsed["full_no_frag"])
+        if parsed["base_no_query"]:
+            conditions.append(_sql_exact_url_cs(ProxyAccount.sub_url, parsed["base_no_query"]))
+        if parsed["path_suffix"]:
+            conditions.append(_sql_suffix_cs(ProxyAccount.sub_url, parsed["path_suffix"]))
+    elif kind == "uri_key":
+        conditions.append(ProxyAccount.sub_url == parsed["uri"])
+    else:
+        if link_only:
+            conditions.append(ProxyAccount.marzban_username == clean)
+        else:
+            conditions.append(ProxyAccount.marzban_username.ilike(f"%{clean}%"))
+        if len(clean) >= 8 and " " not in clean and "/" not in clean:
+            conditions.append(_sql_suffix_cs(ProxyAccount.sub_url, f"/{clean}"))
+
+    if not conditions:
+        return select(ProxyAccount.user_id).where(ProxyAccount.id == -1)
+    return select(ProxyAccount.user_id).where(or_(*conditions))
+
+
 async def _run_unified_user_search(query: str) -> tuple[list[dict], str | None]:
     clean = query.strip()
-    username = clean.removeprefix("@")
-    numeric = int(clean) if clean.isdigit() else -1
-    like = f"%{clean}%"
-    username_like = f"%{username}%"
+    parsed = _classify_admin_search_query(clean)
+    if parsed["kind"] == "invalid_link":
+        return [], None
 
-    sub_user_ids = select(Subscription.user_id).outerjoin(
-        AdaptSubscription, AdaptSubscription.subscription_id == Subscription.id
-    ).where(or_(
-        Subscription.vpn_key.contains(clean),
-        Subscription.client_name.ilike(like),
-        AdaptSubscription.adapt_uuid.ilike(like),
-    ))
-    proxy_user_ids = select(ProxyAccount.user_id).where(or_(
-        ProxyAccount.sub_url.contains(clean),
-        ProxyAccount.marzban_username.ilike(like),
-    ))
+    sub_user_ids = _build_subscription_search_user_ids_subquery(clean)
+    proxy_user_ids = _build_proxy_search_user_ids_subquery(clean)
+
+    user_conditions = [
+        User.id.in_(sub_user_ids),
+        User.id.in_(proxy_user_ids),
+    ]
+    if parsed["kind"] == "plain":
+        username = clean.removeprefix("@")
+        numeric = int(clean) if clean.isdigit() else -1
+        like = f"%{clean}%"
+        username_like = f"%{username}%"
+        user_conditions.extend([
+            User.telegram_id == numeric,
+            User.username.ilike(username_like),
+            User.full_name.ilike(like),
+        ])
+
     async with async_session() as session:
         result = await session.execute(
-            select(User).where(or_(
-                User.telegram_id == numeric,
-                User.username.ilike(username_like),
-                User.full_name.ilike(like),
-                User.id.in_(sub_user_ids),
-                User.id.in_(proxy_user_ids),
-            )).order_by(User.created_at.desc()).limit(100)
+            select(User)
+            .where(or_(*user_conditions))
+            .order_by(User.created_at.desc())
+            .limit(100)
         )
         bot_users = result.scalars().all()
 
@@ -2991,27 +3242,59 @@ async def admin_user_by_username_process(message: Message, state: FSMContext) ->
 async def admin_user_by_link_process(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         return
-        
-    search_term = message.text.strip()
-    
-    async with async_session() as session:
-        # Join User -> Subscription
-        result = await session.execute(
-            select(User)
-            .join(Subscription, User.id == Subscription.user_id)
-            .options(selectinload(User.subscriptions))
-            .where(
-                (Subscription.vpn_key.contains(search_term))
-            )
-        )
-        user = result.scalar_one_or_none()
 
-    if not user:
+    search_term = message.text.strip()
+    parsed = _classify_admin_search_query(search_term)
+    if parsed["kind"] == "invalid_link":
         await message.answer("❌ Пользователь по данной ссылке/ключу не найден", reply_markup=admin_back_kb(), parse_mode="HTML")
         await state.clear()
         return
 
-    await _show_user_info(message, user)
+    sub_user_ids = _build_subscription_search_user_ids_subquery(search_term, link_only=True)
+    proxy_user_ids = _build_proxy_search_user_ids_subquery(search_term, link_only=True)
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(User)
+            .options(selectinload(User.subscriptions))
+            .where(or_(
+                User.id.in_(sub_user_ids),
+                User.id.in_(proxy_user_ids),
+            ))
+            .order_by(User.created_at.desc())
+            .limit(20)
+        )
+        users = result.scalars().all()
+
+    if not users:
+        await message.answer("❌ Пользователь по данной ссылке/ключу не найден", reply_markup=admin_back_kb(), parse_mode="HTML")
+        await state.clear()
+        return
+
+    if len(users) > 1:
+        ambiguous_results = [
+            {
+                "kind": "bot",
+                "telegram_id": int(u.telegram_id),
+                "username": u.username or "",
+                "name": u.full_name or u.username or str(u.telegram_id),
+                "blocked": bool(u.is_blocked),
+                "has_web": False,
+                "contact": "",
+            }
+            for u in users
+        ]
+        warning_text = "Найдено несколько клиентов по этой ссылке/ключу — выберите нужного:"
+        await state.update_data(
+            unified_results=ambiguous_results,
+            unified_query=search_term,
+            unified_warning=warning_text,
+        )
+        text_value, markup = _build_unified_search_page(ambiguous_results, search_term, 1, warning_text)
+        await message.answer(text_value, reply_markup=markup, parse_mode="HTML")
+        return
+
+    await _show_user_info(message, users[0])
     await state.clear()
 
 
