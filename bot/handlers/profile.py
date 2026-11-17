@@ -1059,66 +1059,29 @@ async def adapt_unfreeze(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("adapt_traffic:"))
 async def adapt_traffic(callback: CallbackQuery) -> None:
-    """Show traffic purchase options for an Adapt subscription."""
-    sub_id = int(callback.data.split(":")[1])
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-    gb_options = [10, 50, 100]
-    buttons = [
-        [InlineKeyboardButton(text=f"⚡️ +{gb} ГБ", callback_data=f"adapt_buy_traffic:{sub_id}:{gb}")]
-        for gb in gb_options
-    ]
-    buttons.append([InlineKeyboardButton(text="← Назад", callback_data="profile")])
-    await callback.message.edit_text(
-        "⚡️ <b>Докупить трафик</b>\n\nВыберите количество гигабайт:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="HTML",
-    )
-    await callback.answer()
+    """Legacy stale-message button: never offer unpaid supplier traffic add-ons."""
+    await callback.answer("Эта кнопка устарела", show_alert=True)
+    if callback.message:
+        await callback.message.answer(
+            "Докупка отдельного пакета трафика сейчас отключена. "
+            "Откройте «Купить» → «Улучшить подписку», чтобы выбрать и оплатить тариф с нужным объёмом трафика."
+        )
 
 
 @router.callback_query(F.data.startswith("adapt_buy_traffic:"))
 async def adapt_buy_traffic(callback: CallbackQuery) -> None:
-    """Purchase additional traffic for an Adapt subscription."""
-    await callback.answer("Обрабатываем…")
-    parts = callback.data.split(":")
-    sub_id = int(parts[1])
-    gb_amount = int(parts[2])
-
-    async with async_session() as session:
-        from bot.models import AdaptSubscription
-        from bot.services.adapt_api import AdaptAPI, AdaptAPIError
-        sub = await session.get(Subscription, sub_id)
-        if not sub:
-            await callback.message.answer("Подписка не найдена. Напишите в поддержку.")
-            return
-
-        user_result = await session.execute(
-            select(User).where(User.telegram_id == callback.from_user.id)
+    """Legacy stale-message button: never invoke AdaptAPI.purchase_traffic without verified payment."""
+    logger.warning(
+        "Blocked unpaid legacy adapt_buy_traffic callback from telegram_id=%s data=%s",
+        getattr(callback.from_user, "id", None),
+        callback.data,
+    )
+    await callback.answer("Эта кнопка устарела", show_alert=True)
+    if callback.message:
+        await callback.message.answer(
+            "Докупка трафика без подтверждённой оплаты недоступна. "
+            "Откройте «Купить» → «Улучшить подписку», чтобы оплатить переход на тариф с большим лимитом."
         )
-        user = user_result.scalar_one_or_none()
-        if not user or sub.user_id != user.id:
-            await callback.message.answer("Нет доступа к этой подписке.")
-            return
-
-        result = await session.execute(
-            select(AdaptSubscription).where(AdaptSubscription.subscription_id == sub_id)
-        )
-        adapt_record = result.scalar_one_or_none()
-        if not adapt_record:
-            await callback.message.answer("Служебные данные подписки не найдены. Напишите в поддержку.")
-            return
-
-        try:
-            resp = await AdaptAPI().purchase_traffic(adapt_record.adapt_uuid, gb_amount)
-        except AdaptAPIError as exc:
-            logger.warning("Traffic purchase failed subscription_id=%s: %s", sub_id, exc)
-            await callback.message.answer("Не удалось докупить трафик. Попробуйте позже или напишите в поддержку.")
-            return
-
-        total_price = resp.get("total_price", "?")
-
-    await callback.message.answer(f"✅ Куплено {gb_amount} ГБ (списано {total_price} USD)")
-    await show_profile(callback)
 
 
 @router.callback_query(F.data.startswith("adapt_upgrade:"))
