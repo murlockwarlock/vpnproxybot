@@ -43,3 +43,7 @@ jobs:
       - name: Run admin client search link regressions
         run: |
           pytest -v tests/test_admin_client_search_links.py
+
+      - name: Run VHQ renew safety & recovery regressions
+        run: |
+          pytest -q tests/test_vhq_renew_fulfillment.py tests/test_vhq_problem_payment_recovery.py

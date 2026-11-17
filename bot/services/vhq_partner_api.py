@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
@@ -13,6 +13,51 @@ _ALLOWED_DAYS = {
     "lite": {1, 7, 30, 90, 365},
     "basic": {30, 180, 365},
 }
+VHQ_RENEW_CONFIRMATION_TOLERANCE = timedelta(hours=36)
+
+
+def is_vhq_renewal_active_until_confirmed(
+    candidate_active_until: datetime | None,
+    *,
+    expected_active_until: datetime | None,
+    baseline_active_until: datetime | None = None,
+) -> bool:
+    """Verify VHQ active_until reflects a newly applied/scheduled renewal cycle.
+
+    VHQ anchors renewals to ``renews_at = active_until - 12h`` (or upstream
+    activation timestamp on expired orders), so a genuine 30-day renewal can
+    legitimately return ``expected - 12h`` .. ``expected - 20h`` while stale
+    responses stay at or near ``baseline_active_until``.
+    """
+    if candidate_active_until is None or expected_active_until is None:
+        return False
+    cand = (
+        candidate_active_until.replace(tzinfo=None)
+        if candidate_active_until.tzinfo is not None
+        else candidate_active_until
+    )
+    exp = (
+        expected_active_until.replace(tzinfo=None)
+        if expected_active_until.tzinfo is not None
+        else expected_active_until
+    )
+    span = timedelta(days=30)
+    if baseline_active_until is not None:
+        base = (
+            baseline_active_until.replace(tzinfo=None)
+            if baseline_active_until.tzinfo is not None
+            else baseline_active_until
+        )
+        if cand <= base + timedelta(days=1):
+            return False
+        if exp > base:
+            span = exp - base
+    tolerance = (
+        VHQ_RENEW_CONFIRMATION_TOLERANCE
+        if span >= timedelta(days=7)
+        else timedelta(hours=2)
+    )
+    return cand >= (exp - tolerance)
 
 
 class VHQPartnerAPIError(RuntimeError):

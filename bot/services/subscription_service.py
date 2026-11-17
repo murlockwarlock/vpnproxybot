@@ -11,7 +11,7 @@ from typing import Any
 
 import aiohttp
 from urllib.parse import urlparse
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, case, delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -53,7 +53,11 @@ from bot.services.subscription_semantics import (
     is_adapt_trial_subscription,
     paid_access_clause,
 )
-from bot.services.vhq_partner_api import VHQPartnerAPI, VHQPartnerAPIError
+from bot.services.vhq_partner_api import (
+    VHQPartnerAPI,
+    VHQPartnerAPIError,
+    is_vhq_renewal_active_until_confirmed,
+)
 from bot.services.vhq_routing import VHQ_CLIENT_PREFIX, get_vhq_spec_for_tariff
 from bot.services.vhq_subscription_proxy import build_vhq_subscription_ref_url
 
@@ -614,6 +618,18 @@ async def _claim_vhq_fulfillment_for_execution(
             .values(lease_expires_at=now + _VHQ_FULFILLMENT_LEASE_DURATION)
         )
     else:
+        preserved_error_code = case(
+            (
+                and_(
+                    VhqSubscriptionFulfillment.last_error_code.is_(None),
+                    VhqSubscriptionFulfillment.status.in_(
+                        ("uncertain", "renew_inflight")
+                    ),
+                ),
+                "ambiguous_renew",
+            ),
+            else_=VhqSubscriptionFulfillment.last_error_code,
+        )
         claim = (
             update(VhqSubscriptionFulfillment)
             .where(VhqSubscriptionFulfillment.id == fulfillment.id)
@@ -639,6 +655,7 @@ async def _claim_vhq_fulfillment_for_execution(
                 status="processing",
                 lease_token=token,
                 lease_expires_at=now + _VHQ_FULFILLMENT_LEASE_DURATION,
+                last_error_code=preserved_error_code,
             )
         )
 
@@ -706,6 +723,9 @@ async def execute_vhq_fulfillment(
             fulfillment.id,
         )
 
+    prior_status = fulfillment.status
+    prior_error_code = fulfillment.last_error_code
+
     if not await _claim_vhq_fulfillment_for_execution(
         session,
         fulfillment,
@@ -721,8 +741,19 @@ async def execute_vhq_fulfillment(
     sub = await session.get(Subscription, fulfillment.subscription_id)
     if not sub:
         fulfillment.status = "failed"
+        fulfillment.lease_token = None
+        fulfillment.lease_expires_at = None
         fulfillment.last_error_code = "subscription_not_found"
+        await session.commit()
         return
+
+    renew_days = int(sub.tariff_days or 0)
+    if renew_days <= 0 and sub.tariff_id:
+        linked_tariff = await session.get(Tariff, sub.tariff_id)
+        if linked_tariff and linked_tariff.days:
+            renew_days = int(linked_tariff.days)
+    if renew_days <= 0:
+        renew_days = 30
 
     orders_list = None
     order_id = fulfillment.vhq_order_id or sub.vhq_order_id
@@ -759,7 +790,7 @@ async def execute_vhq_fulfillment(
                         fulfillment.baseline_provider_active_until = sup_active
                         sub.vhq_active_until = sup_active
                         ref_time = sup_active if sup_active > now else now
-                        fulfillment.expected_provider_active_until = ref_time + timedelta(days=30)
+                        fulfillment.expected_provider_active_until = ref_time + timedelta(days=renew_days)
 
                 # Persist identity and baseline/expected targets durably before any POST renew!
                 try:
@@ -787,6 +818,8 @@ async def execute_vhq_fulfillment(
                 else None
             )
             fulfillment.status = "manual_review"
+            fulfillment.lease_token = None
+            fulfillment.lease_expires_at = None
             fulfillment.last_error_code = "unverified_legacy_order"
             fulfillment.last_error_message = (
                 f"Cannot prove current supplier order for legacy sub {sub.id}: "
@@ -821,7 +854,7 @@ async def execute_vhq_fulfillment(
                 fulfillment.baseline_provider_active_until = base_sup_active
                 sub.vhq_active_until = base_sup_active
                 ref_time = base_sup_active if base_sup_active > now else now
-                fulfillment.expected_provider_active_until = ref_time + timedelta(days=30)
+                fulfillment.expected_provider_active_until = ref_time + timedelta(days=renew_days)
                 try:
                     await session.commit()
                 except Exception as commit_exc:
@@ -839,7 +872,7 @@ async def execute_vhq_fulfillment(
 
     if fulfillment.expected_provider_active_until is None and fulfillment.baseline_provider_active_until:
         ref_time = fulfillment.baseline_provider_active_until if fulfillment.baseline_provider_active_until > now else now
-        fulfillment.expected_provider_active_until = ref_time + timedelta(days=30)
+        fulfillment.expected_provider_active_until = ref_time + timedelta(days=renew_days)
         try:
             await session.commit()
         except Exception as commit_exc:
@@ -851,21 +884,32 @@ async def execute_vhq_fulfillment(
             raise commit_exc
 
     # 1. Reconciliation: if status was uncertain, inflight, or leased retry, inspect orders first
+    effective_error_code = fulfillment.last_error_code or prior_error_code
     is_ambiguous_post_attempt = (
-        fulfillment.status == "renew_inflight"
-        or fulfillment.last_error_code in (
-            "renew_inflight", "network_timeout", "http_500", "http_502", "http_503", "http_504", "unexpected_error", "ambiguous_renew"
+        prior_status in ("renew_inflight", "uncertain")
+        or fulfillment.status in ("renew_inflight", "uncertain")
+        or effective_error_code in (
+            "renew_inflight",
+            "network_timeout",
+            "http_500",
+            "http_502",
+            "http_503",
+            "http_504",
+            "unexpected_error",
+            "ambiguous_renew",
+            "worker_exception",
         )
-        or bool(fulfillment.last_error_code and (
-            fulfillment.last_error_code.startswith("http_5")
-            or fulfillment.last_error_code.startswith("ambiguous_")
+        or bool(effective_error_code and (
+            effective_error_code.startswith("http_5")
+            or effective_error_code.startswith("ambiguous_")
         ))
     )
     should_reconcile = (
         is_ambiguous_post_attempt
+        or prior_status == "uncertain"
         or fulfillment.status == "uncertain"
         or fulfillment.attempts > 1
-        or fulfillment.last_error_code is not None
+        or effective_error_code is not None
     )
     if should_reconcile and order_id:
         try:
@@ -881,9 +925,15 @@ async def execute_vhq_fulfillment(
                 if sup_active:
                     is_ok = False
                     if fulfillment.expected_provider_active_until:
-                        is_ok = sup_active >= fulfillment.expected_provider_active_until
+                        is_ok = is_vhq_renewal_active_until_confirmed(
+                            sup_active,
+                            expected_active_until=fulfillment.expected_provider_active_until,
+                            baseline_active_until=fulfillment.baseline_provider_active_until,
+                        )
                     else:
                         fulfillment.status = "manual_review"
+                        fulfillment.lease_token = None
+                        fulfillment.lease_expires_at = None
                         fulfillment.last_error_code = "missing_baseline_unproven_renewal"
                         fulfillment.last_error_message = (
                             f"Order found in reconciliation but renewal cannot be proven without baseline: {matched}"
@@ -892,6 +942,10 @@ async def execute_vhq_fulfillment(
                         return
                     if is_ok:
                         fulfillment.status = "completed"
+                        fulfillment.lease_token = None
+                        fulfillment.lease_expires_at = None
+                        fulfillment.last_error_code = None
+                        fulfillment.last_error_message = None
                         fulfillment.confirmed_provider_active_until = sup_active
                         fulfillment.completed_at = now
                         sub.vhq_active_until = sup_active
@@ -909,6 +963,8 @@ async def execute_vhq_fulfillment(
                         # Repeating POST renew blindly is strictly prohibited without idempotency key!
                         if is_ambiguous_post_attempt:
                             backoff_seconds = min(30 * (2 ** max(fulfillment.attempts - 1, 0)), 3600)
+                            fulfillment.lease_token = None
+                            fulfillment.lease_expires_at = None
                             if fulfillment.attempts >= fulfillment.max_attempts:
                                 fulfillment.status = "manual_review"
                                 fulfillment.last_error_code = "ambiguous_renew_unconfirmed"
@@ -923,6 +979,8 @@ async def execute_vhq_fulfillment(
                                 )
                             else:
                                 fulfillment.status = "uncertain"
+                                if not fulfillment.last_error_code:
+                                    fulfillment.last_error_code = effective_error_code or "ambiguous_renew"
                                 fulfillment.next_attempt_at = now + timedelta(seconds=backoff_seconds)
                                 logger.warning(
                                     "Fulfillment %s: POST renew dispatched but active_until (%s) is still below expected (%s). "
@@ -935,12 +993,16 @@ async def execute_vhq_fulfillment(
                     # Matched, but active_until is unparseable or missing!
                     if is_ambiguous_post_attempt:
                         backoff_seconds = min(30 * (2 ** max(fulfillment.attempts - 1, 0)), 3600)
+                        fulfillment.lease_token = None
+                        fulfillment.lease_expires_at = None
                         if fulfillment.attempts >= fulfillment.max_attempts:
                             fulfillment.status = "manual_review"
                             fulfillment.last_error_code = "ambiguous_renew_invalid_date"
                             fulfillment.last_error_message = f"Order found in reconciliation but active_until is unparseable: {matched}"
                         else:
                             fulfillment.status = "uncertain"
+                            if not fulfillment.last_error_code:
+                                fulfillment.last_error_code = effective_error_code or "ambiguous_renew"
                             fulfillment.next_attempt_at = now + timedelta(seconds=backoff_seconds)
                         await session.commit()
                         return
@@ -948,17 +1010,23 @@ async def execute_vhq_fulfillment(
                 # matched is None: order not found in orders_list or orders_list is empty
                 if is_ambiguous_post_attempt:
                     backoff_seconds = min(30 * (2 ** max(fulfillment.attempts - 1, 0)), 3600)
+                    fulfillment.lease_token = None
+                    fulfillment.lease_expires_at = None
                     if fulfillment.attempts >= fulfillment.max_attempts:
                         fulfillment.status = "manual_review"
                         fulfillment.last_error_code = "ambiguous_renew_order_missing"
                         fulfillment.last_error_message = f"POST renew dispatched, but order {order_id} not found in get_orders after {fulfillment.attempts} attempts"
                     else:
                         fulfillment.status = "uncertain"
+                        if not fulfillment.last_error_code:
+                            fulfillment.last_error_code = effective_error_code or "ambiguous_renew"
                         fulfillment.next_attempt_at = now + timedelta(seconds=backoff_seconds)
                     await session.commit()
                     return
         except Exception as exc:
             logger.warning("Reconciliation get_orders failed for fulfillment %s: %s", fulfillment.id, exc)
+            fulfillment.lease_token = None
+            fulfillment.lease_expires_at = None
             if fulfillment.attempts >= fulfillment.max_attempts:
                 fulfillment.status = "manual_review"
                 fulfillment.last_error_code = "max_attempts_exceeded"
@@ -966,6 +1034,8 @@ async def execute_vhq_fulfillment(
                 await session.commit()
                 return
             fulfillment.status = "uncertain"
+            if not fulfillment.last_error_code and is_ambiguous_post_attempt:
+                fulfillment.last_error_code = effective_error_code or "ambiguous_renew"
             backoff_seconds = min(30 * (2 ** max(fulfillment.attempts - 1, 0)), 3600)
             fulfillment.next_attempt_at = now + timedelta(seconds=backoff_seconds)
             await session.commit()
@@ -975,14 +1045,18 @@ async def execute_vhq_fulfillment(
     if is_ambiguous_post_attempt:
         logger.critical(
             "CRITICAL: Blind re-POST renew prohibited for fulfillment %s (status=%s, err=%s)",
-            fulfillment.id, fulfillment.status, fulfillment.last_error_code,
+            fulfillment.id, fulfillment.status, effective_error_code,
         )
+        fulfillment.lease_token = None
+        fulfillment.lease_expires_at = None
         backoff_seconds = min(30 * (2 ** max(fulfillment.attempts - 1, 0)), 3600)
         if fulfillment.attempts >= fulfillment.max_attempts:
             fulfillment.status = "manual_review"
             fulfillment.last_error_code = "ambiguous_renew_unconfirmed"
         else:
             fulfillment.status = "uncertain"
+            if not fulfillment.last_error_code:
+                fulfillment.last_error_code = effective_error_code or "ambiguous_renew"
             fulfillment.next_attempt_at = now + timedelta(seconds=backoff_seconds)
         await session.commit()
         return
@@ -999,6 +1073,8 @@ async def execute_vhq_fulfillment(
                 # Basic 30d renew wholesale is 249 RUB
                 if c_bal < 249.0:
                     fulfillment.status = "retry_wait"
+                    fulfillment.lease_token = None
+                    fulfillment.lease_expires_at = None
                     fulfillment.next_attempt_at = now + timedelta(seconds=60)
                     await session.commit()
                     return
@@ -1037,11 +1113,13 @@ async def execute_vhq_fulfillment(
                 fulfillment.status = "manual_review"
                 fulfillment.last_error_code = "renew_409_wrong_product"
                 fulfillment.last_error_message = str(exc)
+                await session.commit()
                 return
             elif exc.status in (401, 403):
                 fulfillment.status = "manual_review"
                 fulfillment.last_error_code = f"http_{exc.status}"
                 fulfillment.last_error_message = str(exc)
+                await session.commit()
                 return
             elif exc.status == 402 or "insufficient balance" in exc_msg:
                 fulfillment.last_error_code = "insufficient_balance"
@@ -1061,6 +1139,7 @@ async def execute_vhq_fulfillment(
                 fulfillment.status = "manual_review"
                 fulfillment.last_error_code = f"http_{exc.status}"
                 fulfillment.last_error_message = str(exc)
+                await session.commit()
                 return
             elif exc.status in (500, 502, 503, 504) or (exc.status and 500 <= exc.status < 600):
                 if fulfillment.attempts >= fulfillment.max_attempts:
@@ -1084,7 +1163,7 @@ async def execute_vhq_fulfillment(
                     return
                 fulfillment.status = "uncertain"
                 fulfillment.next_attempt_at = now + timedelta(seconds=backoff_seconds)
-                fulfillment.last_error_code = f"http_{exc.status}"
+                fulfillment.last_error_code = f"http_{exc.status}" if exc.status else "ambiguous_renew"
                 fulfillment.last_error_message = str(exc)
                 await session.commit()
                 return
@@ -1096,11 +1175,13 @@ async def execute_vhq_fulfillment(
                 fulfillment.status = "manual_review"
                 fulfillment.last_error_code = "max_attempts_exceeded"
                 fulfillment.last_error_message = f"Max attempts reached on network error: {exc}"
+                await session.commit()
                 return
             fulfillment.status = "uncertain"
             fulfillment.next_attempt_at = now + timedelta(seconds=backoff_seconds)
             fulfillment.last_error_code = "network_timeout"
             fulfillment.last_error_message = str(exc)
+            await session.commit()
             return
         except Exception as exc:
             logger.exception("VHQ renew unexpected error fulfillment %s: %s", fulfillment.id, exc)
@@ -1110,11 +1191,13 @@ async def execute_vhq_fulfillment(
                 fulfillment.status = "manual_review"
                 fulfillment.last_error_code = "max_attempts_exceeded"
                 fulfillment.last_error_message = f"Max attempts reached on unexpected error: {exc}"
+                await session.commit()
                 return
             fulfillment.status = "uncertain"
             fulfillment.next_attempt_at = now + timedelta(seconds=backoff_seconds)
             fulfillment.last_error_code = "unexpected_error"
             fulfillment.last_error_message = str(exc)
+            await session.commit()
             return
         else:
             fulfillment.lease_token = None
@@ -1123,10 +1206,11 @@ async def execute_vhq_fulfillment(
             fulfillment.provider_response_json = json.dumps(response, default=str)
             is_success = False
             if fulfillment.expected_provider_active_until:
-                if resp_active_until and resp_active_until >= fulfillment.expected_provider_active_until:
-                    is_success = True
-                else:
-                    is_success = False
+                is_success = is_vhq_renewal_active_until_confirmed(
+                    resp_active_until,
+                    expected_active_until=fulfillment.expected_provider_active_until,
+                    baseline_active_until=fulfillment.baseline_provider_active_until,
+                )
             else:
                 if bool(response.get("already_requested")):
                     fulfillment.status = "manual_review"
@@ -1138,6 +1222,7 @@ async def execute_vhq_fulfillment(
                         "Fulfillment %s: already_requested=True with unknown baseline -> manual_review",
                         fulfillment.id,
                     )
+                    await session.commit()
                     return
                 if response.get("status") in ("scheduled", "renewed") and resp_active_until and resp_active_until > now:
                     is_success = True
@@ -1147,6 +1232,7 @@ async def execute_vhq_fulfillment(
                     fulfillment.last_error_message = (
                         f"Direct renew returned ambiguous result without baseline: status={response.get('status')} active_until={resp_active_until}"
                     )
+                    await session.commit()
                     return
 
             if is_success:
@@ -1158,16 +1244,23 @@ async def execute_vhq_fulfillment(
                 sub.vhq_active_until = fulfillment.confirmed_provider_active_until
                 sub.expires_at = fulfillment.target_local_expires_at
                 sub.status = SubStatus.ACTIVE
+                await session.commit()
                 return
             else:
                 if fulfillment.attempts >= fulfillment.max_attempts:
                     fulfillment.status = "manual_review"
                     fulfillment.last_error_code = "max_attempts_exceeded"
                     fulfillment.last_error_message = f"Expected active_until {fulfillment.expected_provider_active_until} not confirmed after {fulfillment.attempts} attempts"
+                    await session.commit()
                     return
                 fulfillment.status = "uncertain"
-                fulfillment.last_error_code = None
+                fulfillment.last_error_code = "ambiguous_renew"
+                fulfillment.last_error_message = (
+                    f"Unconfirmed VHQ renew response: status={response.get('status')} "
+                    f"active_until={resp_active_until} expected={fulfillment.expected_provider_active_until}"
+                )
                 fulfillment.next_attempt_at = now + timedelta(seconds=backoff_seconds)
+                await session.commit()
                 return
 
     # 3. Fallback buy branch
