@@ -3585,7 +3585,8 @@ async def handle_create_order(request: web.Request) -> web.Response:
                 session.add(order)
                 await session.commit()
         else:
-            await _get_or_create_web_balance_account(session, profile_token, contact)
+            if profile_token:
+                await _get_or_create_web_balance_account(session, profile_token, contact)
             order = WebOrder(
                 order_id=order_id,
                 contact=contact,
