@@ -198,6 +198,31 @@ class WebBalanceTransaction(Base):
             unique=True,
             sqlite_where=text("kind = 'balance_migration' AND source_id IS NOT NULL"),
         ),
+        Index(
+            "uq_web_balance_tx_order_payment",
+            "source_id",
+            unique=True,
+            sqlite_where=text("kind = 'order_payment' AND source_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_web_balance_tx_order_refund",
+            "source_id",
+            unique=True,
+            sqlite_where=text("kind = 'order_bonus_refund' AND source_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_web_balance_tx_referral_source",
+            "profile_token",
+            "source_id",
+            unique=True,
+            sqlite_where=text("kind = 'referral_bonus' AND source_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_web_balance_tx_topup_source",
+            "source_id",
+            unique=True,
+            sqlite_where=text("kind = 'topup' AND source_id IS NOT NULL"),
+        ),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)

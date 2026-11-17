@@ -14,6 +14,7 @@ from webstore.routes import (
     _acquire_profile_lock,
     _assert_profile_lock,
     _apply_order_bonus_spend,
+    _refund_order_reserved_bonus_if_needed,
     _finalize_order_cashback,
     _build_local_balance_status,
     _disable_web_balance_autodebit_after_tariff_purchase,
@@ -266,18 +267,34 @@ async def expire_pending_orders() -> None:
     cutoff = now - timedelta(hours=24)
     async with async_session() as session:
         result = await session.execute(
-            select(WebOrder)
+            select(WebOrder.order_id, WebOrder.profile_token)
             .where(WebOrder.status == "pending")
             .where(WebOrder.created_at <= cutoff)
             .where(WebOrder.yookassa_payment_id.is_(None))
         )
-        orders = result.scalars().all()
-        if orders:
-            for order in orders:
+        candidates = result.all()
+
+    expired_count = 0
+    for order_id, profile_token in candidates:
+        lock_key = profile_token or f"web-order:{order_id}"
+        async with _acquire_profile_lock(lock_key, timeout=10.0):
+            async with async_session() as session:
+                order = await session.scalar(
+                    select(WebOrder).where(WebOrder.order_id == order_id)
+                )
+                if not order or order.status != "pending" or order.yookassa_payment_id:
+                    continue
                 order.status = "canceled"
                 order.cancellation_confirmed = True
-            await session.commit()
-            logger.info("Expired %d stale pending orders without provider payment", len(orders))
+                await _refund_order_reserved_bonus_if_needed(
+                    session,
+                    order,
+                    reason="expired_pending_without_provider",
+                )
+                await session.commit()
+                expired_count += 1
+    if expired_count:
+        logger.info("Expired %d stale pending orders without provider payment", expired_count)
 
 
 async def retry_paid_web_orders() -> None:

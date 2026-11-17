@@ -49,6 +49,56 @@ def next_charge_datetime(now: datetime | None = None) -> datetime:
     return candidate.astimezone(timezone.utc).replace(tzinfo=None)
 
 
+class InsufficientBalanceError(RuntimeError):
+    """Raised when an atomic SQL balance debit cannot be satisfied."""
+
+
+async def async_debit_user_balance(
+    session,
+    user: User,
+    amount_rub: float,
+    kind: BalanceTransactionKind,
+    description: str,
+    source_type: str | None = None,
+    source_id: str | None = None,
+) -> float:
+    """Atomic conditional SQL-level balance debit preventing concurrent double-spend."""
+    amount = round(float(amount_rub), 2)
+    if amount <= 0:
+        return get_user_balance(user)
+
+    res = await session.execute(
+        update(User)
+        .where(User.id == user.id)
+        .where(func.round(func.coalesce(User.balance_rub, 0.0), 2) >= amount)
+        .values(
+            balance_rub=func.round(func.coalesce(User.balance_rub, 0.0) - amount, 2),
+        )
+        .returning(User.balance_rub)
+    )
+    row = res.scalar_one_or_none()
+    if row is None:
+        raise InsufficientBalanceError(
+            f"Insufficient balance for user_id={user.id}: needed {amount:.2f} RUB"
+        )
+    new_balance = float(row)
+    set_committed_value(user, "balance_rub", new_balance)
+
+    session.add(
+        BalanceTransaction(
+            user_id=user.id,
+            kind=kind,
+            direction=BalanceDirection.DEBIT,
+            amount_rub=amount,
+            balance_after_rub=new_balance,
+            description=description,
+            source_type=source_type,
+            source_id=source_id,
+        )
+    )
+    return new_balance
+
+
 async def async_credit_user_balance(
     session,
     user: User,

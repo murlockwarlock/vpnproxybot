@@ -510,6 +510,30 @@ async def init_db() -> None:
                 "ON web_balance_transactions(source_id) WHERE kind = 'balance_migration' AND source_id IS NOT NULL",
                 "SELECT source_id, count(*) as c FROM web_balance_transactions WHERE kind = 'balance_migration' AND source_id IS NOT NULL GROUP BY source_id HAVING c > 1",
             ),
+            (
+                "uq_web_balance_tx_order_payment",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_web_balance_tx_order_payment "
+                "ON web_balance_transactions(source_id) WHERE kind = 'order_payment' AND source_id IS NOT NULL",
+                "SELECT source_id, count(*) as c FROM web_balance_transactions WHERE kind = 'order_payment' AND source_id IS NOT NULL GROUP BY source_id HAVING c > 1",
+            ),
+            (
+                "uq_web_balance_tx_order_refund",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_web_balance_tx_order_refund "
+                "ON web_balance_transactions(source_id) WHERE kind = 'order_bonus_refund' AND source_id IS NOT NULL",
+                "SELECT source_id, count(*) as c FROM web_balance_transactions WHERE kind = 'order_bonus_refund' AND source_id IS NOT NULL GROUP BY source_id HAVING c > 1",
+            ),
+            (
+                "uq_web_balance_tx_referral_source",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_web_balance_tx_referral_source "
+                "ON web_balance_transactions(profile_token, source_id) WHERE kind = 'referral_bonus' AND source_id IS NOT NULL",
+                "SELECT profile_token, source_id, count(*) as c FROM web_balance_transactions WHERE kind = 'referral_bonus' AND source_id IS NOT NULL GROUP BY profile_token, source_id HAVING c > 1",
+            ),
+            (
+                "uq_web_balance_tx_topup_source",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_web_balance_tx_topup_source "
+                "ON web_balance_transactions(source_id) WHERE kind = 'topup' AND source_id IS NOT NULL",
+                "SELECT source_id, count(*) as c FROM web_balance_transactions WHERE kind = 'topup' AND source_id IS NOT NULL GROUP BY source_id HAVING c > 1",
+            ),
         ]
         for idx_name, create_sql, check_dup_sql in critical_indexes:
             try:

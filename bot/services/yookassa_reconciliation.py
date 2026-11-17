@@ -48,7 +48,14 @@ from bot.models import (
     TariffType,
     User,
 )
-from bot.services.balance_service import credit_user_balance, debit_user_balance, get_user_balance
+from bot.services.balance_service import (
+    InsufficientBalanceError,
+    async_credit_user_balance,
+    async_debit_user_balance,
+    credit_user_balance,
+    debit_user_balance,
+    get_user_balance,
+)
 from bot.services.cluster import LeaseHeartbeat, LeaseManager
 from bot.services.money import (
     kopecks_to_rub_float,
@@ -1287,12 +1294,13 @@ async def verify_and_fulfill_yookassa_payment(
                     payment_row.status = PaymentStatus.FAILED
                     payment_row.provisioning_failure_code = "payment_canceled_at_provider"
 
-                    # Refund debited discount if any was deducted
+                    # Refund debited/reserved discount if any was deducted
+                    cand_ids = [cid for cid in (provider_payment_id, f"local:{payment_row.id}") if cid]
                     discount_tx = await session.scalar(
                         select(BalanceTransaction).where(
                             BalanceTransaction.user_id == payment_row.user_id,
                             BalanceTransaction.source_type == "payment_discount",
-                            BalanceTransaction.source_id == provider_payment_id,
+                            BalanceTransaction.source_id.in_(cand_ids),
                         ).limit(1)
                     )
                     if discount_tx and discount_tx.amount_rub > 0:
@@ -1300,13 +1308,13 @@ async def verify_and_fulfill_yookassa_payment(
                             select(BalanceTransaction).where(
                                 BalanceTransaction.user_id == payment_row.user_id,
                                 BalanceTransaction.source_type == "payment_discount_refund",
-                                BalanceTransaction.source_id == provider_payment_id,
+                                BalanceTransaction.source_id.in_(cand_ids),
                             ).limit(1)
                         )
                         if not refund_exists:
                             u = await session.get(User, payment_row.user_id)
                             if u:
-                                credit_user_balance(
+                                await async_credit_user_balance(
                                     session,
                                     u,
                                     discount_tx.amount_rub,
@@ -2480,23 +2488,49 @@ async def verify_and_fulfill_yookassa_payment(
                     if discount_kopecks > 0:
                         user_rec = await session.get(User, delivered_user_id)
                         if user_rec:
+                            cand_ids = [cid for cid in (provider_payment_id, f"local:{payment.id}" if payment.id else None) if cid]
                             already_debited = await session.scalar(
                                 select(BalanceTransaction).where(
                                     BalanceTransaction.user_id == user_rec.id,
                                     BalanceTransaction.source_type == "payment_discount",
-                                    BalanceTransaction.source_id == provider_payment_id,
+                                    BalanceTransaction.source_id.in_(cand_ids),
                                 ).limit(1)
                             )
                             if not already_debited:
-                                debit_user_balance(
-                                    session,
-                                    user_rec,
-                                    kopecks_to_rub_float(discount_kopecks),
-                                    BalanceTransactionKind.TOPUP,
-                                    "Списание с баланса при оплате тарифа",
-                                    source_type="payment_discount",
-                                    source_id=provider_payment_id,
-                                )
+                                requested_discount_rub = kopecks_to_rub_float(discount_kopecks)
+                                try:
+                                    await async_debit_user_balance(
+                                        session,
+                                        user_rec,
+                                        requested_discount_rub,
+                                        BalanceTransactionKind.TOPUP,
+                                        "Списание с баланса при оплате тарифа",
+                                        source_type="payment_discount",
+                                        source_id=provider_payment_id,
+                                    )
+                                except InsufficientBalanceError:
+                                    await session.refresh(user_rec)
+                                    avail_rub = get_user_balance(user_rec)
+                                    if avail_rub > 0:
+                                        try:
+                                            await async_debit_user_balance(
+                                                session,
+                                                user_rec,
+                                                avail_rub,
+                                                BalanceTransactionKind.TOPUP,
+                                                "Списание остатка баланса при оплате тарифа",
+                                                source_type="payment_discount",
+                                                source_id=provider_payment_id,
+                                            )
+                                        except InsufficientBalanceError:
+                                            avail_rub = 0.0
+                                    logger.warning(
+                                        "Legacy YooKassa discount shortfall on finalization: payment=%s user_id=%s requested=%.2f debited=%.2f",
+                                        provider_payment_id,
+                                        user_rec.id,
+                                        requested_discount_rub,
+                                        avail_rub,
+                                    )
 
                     await session.flush()
                     plog(

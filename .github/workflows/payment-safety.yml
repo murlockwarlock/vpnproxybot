@@ -43,3 +43,8 @@ jobs:
       - name: Run admin client search link regressions
         run: |
           pytest -v tests/test_admin_client_search_links.py
+
+      - name: Run atomic balance and web referral regressions
+        run: |
+          pytest -v tests/test_atomic_balance_safety.py
+          pytest -q tests/test_yookassa_payment_safety.py tests/test_webstore_yookassa_reconciliation.py tests/test_webstore_email_auth.py
