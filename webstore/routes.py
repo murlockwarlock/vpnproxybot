@@ -7340,6 +7340,164 @@ async def handle_internal_admin_balance_lookup(request: web.Request) -> web.Resp
     })
 
 
+_WEB_SEARCH_GENERIC_URL_SEGMENTS = frozenset({
+    "",
+    "sub",
+    "vpnbot",
+    "adapt-sub",
+    "vhq-sub",
+    "proxy-subscription",
+    "subscribe",
+    "api",
+    "v1",
+    "v2",
+    "client",
+    "functions",
+    "partner-api",
+    "proxy",
+    "socks",
+})
+_WEB_SEARCH_VHQ_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$")
+_WEB_SEARCH_VPN_URI_SCHEMES = (
+    "vless://",
+    "vmess://",
+    "trojan://",
+    "ss://",
+    "ssr://",
+    "hy2://",
+    "hysteria2://",
+    "tuic://",
+    "tg://",
+)
+
+
+def _web_sql_exact_url_cs(col, target_url: str):
+    return func.rtrim(col, "/") == target_url.rstrip("/")
+
+
+def _web_sql_suffix_cs(col, suffix: str):
+    return func.substr(func.rtrim(col, "/"), -len(suffix)) == suffix
+
+
+def _web_sql_adapt_url_uuid_match(col, canon_uuid: str):
+    suffix = f"/{canon_uuid.lower()}"
+    lowered_trimmed = func.lower(func.rtrim(col, "/"))
+    lowered_raw = func.lower(col)
+    return or_(
+        func.substr(lowered_trimmed, -len(suffix)) == suffix,
+        lowered_raw.like(f"%{suffix}?%"),
+        lowered_raw.like(f"%{suffix}/?%"),
+        lowered_raw.like(f"%{suffix}#%"),
+        lowered_raw.like(f"%{suffix}/#%"),
+    )
+
+
+def _resolve_web_vhq_token(token_part: str) -> dict | None:
+    candidate_secrets: list[str] = []
+    for sec in (
+        getattr(settings, "vhq_subscription_proxy_secret", ""),
+        getattr(settings, "bridge_shared_secret", ""),
+    ):
+        sec_clean = str(sec or "").strip()
+        if sec_clean and sec_clean not in candidate_secrets:
+            candidate_secrets.append(sec_clean)
+    try:
+        from bot.services.vhq_subscription_proxy import resolve_vhq_mirror_token
+        for sec in candidate_secrets + [None]:
+            resolved = resolve_vhq_mirror_token(token_part, secret=sec)
+            if resolved:
+                return resolved
+    except Exception:
+        pass
+    return None
+
+
+def _classify_web_admin_search_query(raw_query: str) -> dict:
+    from urllib.parse import urlparse
+
+    raw = str(raw_query or "").strip()
+    if not raw:
+        return {"kind": "invalid_link"}
+
+    if "/vhq-sub/" in raw:
+        path_part = urlparse(raw).path if "://" in raw else raw.split("?", 1)[0].split("#", 1)[0]
+        token_part = path_part.rsplit("/vhq-sub/", 1)[-1].strip("/")
+        if not token_part or "/" in token_part or not _WEB_SEARCH_VHQ_TOKEN_RE.fullmatch(token_part):
+            return {"kind": "invalid_link"}
+        return {"kind": "vhq_mirror", "token": token_part, "resolved": _resolve_web_vhq_token(token_part)}
+
+    if " " not in raw and "://" not in raw and "/" not in raw and _WEB_SEARCH_VHQ_TOKEN_RE.fullmatch(raw):
+        return {"kind": "vhq_mirror", "token": raw, "resolved": _resolve_web_vhq_token(raw)}
+
+    if "/adapt-sub/" in raw.lower():
+        path_part = urlparse(raw).path if "://" in raw else raw.split("?", 1)[0].split("#", 1)[0]
+        idx = path_part.lower().rfind("/adapt-sub/")
+        seg = path_part[idx + len("/adapt-sub/"):].strip("/")
+        if "/" in seg or len(seg) != 36:
+            return {"kind": "invalid_link"}
+        try:
+            return {"kind": "adapt_uuid", "adapt_uuid": str(uuid.UUID(seg)).lower()}
+        except (ValueError, AttributeError):
+            return {"kind": "invalid_link"}
+
+    if raw.lower().startswith(("http://", "https://")):
+        parsed = urlparse(raw)
+        host = (parsed.netloc or "").strip().lower()
+        norm_path = (parsed.path or "").rstrip("/")
+        if not host:
+            return {"kind": "invalid_link"}
+
+        sub_idx = norm_path.lower().rfind("/sub/")
+        if sub_idx != -1:
+            seg = norm_path[sub_idx + len("/sub/"):]
+            if "/" not in seg and len(seg) == 36:
+                try:
+                    return {"kind": "adapt_uuid", "adapt_uuid": str(uuid.UUID(seg)).lower()}
+                except (ValueError, AttributeError):
+                    pass
+
+        if "adaptgroup." in host:
+            return {"kind": "invalid_link"}
+
+        last_seg = norm_path.rsplit("/", 1)[-1] if norm_path else ""
+        has_specific_token = bool(
+            last_seg and last_seg.lower() not in _WEB_SEARCH_GENERIC_URL_SEGMENTS and len(last_seg) >= 4
+        )
+        if not parsed.query and not has_specific_token:
+            return {"kind": "invalid_link"}
+
+        base_no_query = f"{parsed.scheme.lower()}://{host}{norm_path}"
+        full_no_frag = f"{base_no_query}?{parsed.query}" if parsed.query else base_no_query
+        allow_path_suffix = bool(has_specific_token and norm_path.count("/") >= 2)
+        return {
+            "kind": "http_url",
+            "raw": raw,
+            "full_no_frag": full_no_frag,
+            "has_query": bool(parsed.query),
+            "base_no_query": base_no_query if has_specific_token else None,
+            "path_suffix": norm_path if allow_path_suffix else None,
+        }
+
+    if raw.lower().startswith(_WEB_SEARCH_VPN_URI_SCHEMES):
+        after_scheme = raw.split("://", 1)[-1].strip()
+        if len(after_scheme) < 8:
+            return {"kind": "invalid_link"}
+        return {"kind": "uri_key", "uri": raw}
+
+    candidate = raw
+    for prefix in ("adapt_", "uuid:", "adapt:"):
+        if candidate.lower().startswith(prefix):
+            candidate = candidate[len(prefix):].strip()
+            break
+    if len(candidate) == 36:
+        try:
+            return {"kind": "adapt_uuid", "adapt_uuid": str(uuid.UUID(candidate)).lower()}
+        except (ValueError, AttributeError):
+            pass
+
+    return {"kind": "plain", "raw": raw}
+
+
 async def handle_internal_admin_client_lookup(request: web.Request) -> web.Response:
     if not _verify_internal_secret(request):
         return web.json_response({"error": "Forbidden"}, status=403)
@@ -7348,122 +7506,168 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
     query = _normalize_contact(raw_query)
     if not query:
         return web.json_response({"error": "Missing q"}, status=400)
+
+    parsed = _classify_web_admin_search_query(raw_query)
+    kind = parsed["kind"]
+    if kind == "invalid_link":
+        return web.json_response({"error": "Not found"}, status=404)
+
     username_query = query.removeprefix("@")
     numeric_query = int(query) if query.isdigit() else -1
     like_query = f"%{query}%"
     username_like = f"%{username_query}%"
 
-    extracted_adapt_uuid = _extract_adapt_uuid(raw_query)
-    url_path = None
-    if raw_query.lower().startswith(("http://", "https://")):
-        from urllib.parse import urlparse
-        parsed_path = (urlparse(raw_query).path or "").rstrip("/")
-        if len(parsed_path) > 5:
-            url_path = parsed_path
+    order_conditions = []
+    item_conditions = []
 
-    resolved_vhq = None
-    if "/vhq-sub/" in raw_query:
-        try:
-            from bot.services.vhq_subscription_proxy import resolve_vhq_mirror_url
-            resolved_vhq = resolve_vhq_mirror_url(raw_query)
-        except Exception:
-            resolved_vhq = None
-
-    order_conditions = [
-        WebOrder.order_id == query,
-        WebOrder.order_id == raw_query,
-        WebOrder.contact.ilike(like_query),
-        WebOrder.email.ilike(like_query),
-        WebOrder.profile_token == query,
-        WebOrder.profile_token.like(f"{query}%"),
-        WebOrder.subscription_url.contains(raw_query),
-        WebOrder.subscription_url.contains(query),
-        WebOrder.marzban_username.ilike(like_query),
-        WebOrder.yookassa_payment_id == query,
-        WebOrder.yookassa_payment_id == raw_query,
-    ]
-    item_conditions = [
-        WebTelegramItem.telegram_id == numeric_query,
-        WebTelegramItem.external_id.ilike(like_query),
-        WebTelegramItem.key_value.contains(raw_query),
-        WebTelegramItem.key_value.contains(query),
-        WebTelegramItem.title.ilike(like_query),
-    ]
-    if extracted_adapt_uuid:
-        uuid_like = f"%{extracted_adapt_uuid}%"
+    if kind == "adapt_uuid":
+        canon_uuid = parsed["adapt_uuid"]
         order_conditions.extend([
-            WebOrder.subscription_url.ilike(uuid_like),
-            WebOrder.marzban_username.ilike(uuid_like),
-            WebOrder.target_order_id.ilike(uuid_like),
+            func.lower(WebOrder.marzban_username) == f"adapt_{canon_uuid}",
+            func.lower(WebOrder.target_order_id) == canon_uuid,
+            _web_sql_adapt_url_uuid_match(WebOrder.subscription_url, canon_uuid),
         ])
         item_conditions.extend([
-            WebTelegramItem.key_value.ilike(uuid_like),
-            WebTelegramItem.external_id.ilike(uuid_like),
+            _web_sql_adapt_url_uuid_match(WebTelegramItem.key_value, canon_uuid),
+            func.lower(WebTelegramItem.external_id).in_([
+                canon_uuid,
+                f"uuid:{canon_uuid}",
+                f"adapt:{canon_uuid}",
+                f"adapt_{canon_uuid}",
+            ]),
         ])
-    if url_path:
-        order_conditions.append(WebOrder.subscription_url.contains(url_path))
-        item_conditions.append(WebTelegramItem.key_value.contains(url_path))
-    if resolved_vhq:
-        if resolved_vhq.get("web_order_id"):
-            order_conditions.append(WebOrder.order_id == str(resolved_vhq["web_order_id"]))
-        if resolved_vhq.get("upstream_url"):
-            up_url = str(resolved_vhq["upstream_url"])
-            order_conditions.append(WebOrder.subscription_url.contains(up_url))
-            item_conditions.append(WebTelegramItem.key_value.contains(up_url))
-        if resolved_vhq.get("order_id"):
-            order_conditions.append(WebOrder.vhq_order_id == str(resolved_vhq["order_id"]))
-        if resolved_vhq.get("subscription_id"):
-            item_conditions.append(WebTelegramItem.external_id == f"sub_{int(resolved_vhq['subscription_id'])}")
+    elif kind == "vhq_mirror":
+        token = parsed["token"]
+        resolved = parsed["resolved"]
+        order_conditions.append(_web_sql_suffix_cs(WebOrder.subscription_url, f"/vhq-sub/{token}"))
+        item_conditions.append(_web_sql_suffix_cs(WebTelegramItem.key_value, f"/vhq-sub/{token}"))
+        if resolved:
+            if resolved.get("web_order_id"):
+                order_conditions.append(WebOrder.order_id == str(resolved["web_order_id"]))
+            if resolved.get("upstream_url"):
+                up_url = str(resolved["upstream_url"])
+                order_conditions.append(_web_sql_exact_url_cs(WebOrder.vhq_upstream_url, up_url))
+                order_conditions.append(_web_sql_exact_url_cs(WebOrder.subscription_url, up_url))
+                item_conditions.append(_web_sql_exact_url_cs(WebTelegramItem.key_value, up_url))
+            if resolved.get("order_id"):
+                ord_id = str(resolved["order_id"])
+                order_conditions.append(WebOrder.vhq_order_id == ord_id)
+                order_conditions.append(WebOrder.order_id == ord_id)
+            if resolved.get("subscription_id"):
+                item_conditions.append(WebTelegramItem.external_id == f"sub_{int(resolved['subscription_id'])}")
+    elif kind == "http_url":
+        if parsed["has_query"]:
+            order_conditions.extend([
+                WebOrder.subscription_url == parsed["raw"],
+                WebOrder.subscription_url == parsed["full_no_frag"],
+                WebOrder.vhq_upstream_url == parsed["raw"],
+                WebOrder.vhq_upstream_url == parsed["full_no_frag"],
+            ])
+            item_conditions.extend([
+                WebTelegramItem.key_value == parsed["raw"],
+                WebTelegramItem.key_value == parsed["full_no_frag"],
+            ])
+        if parsed["base_no_query"]:
+            order_conditions.extend([
+                _web_sql_exact_url_cs(WebOrder.subscription_url, parsed["base_no_query"]),
+                _web_sql_exact_url_cs(WebOrder.vhq_upstream_url, parsed["base_no_query"]),
+            ])
+            item_conditions.append(_web_sql_exact_url_cs(WebTelegramItem.key_value, parsed["base_no_query"]))
+        if parsed["path_suffix"]:
+            order_conditions.extend([
+                _web_sql_suffix_cs(WebOrder.subscription_url, parsed["path_suffix"]),
+                _web_sql_suffix_cs(WebOrder.vhq_upstream_url, parsed["path_suffix"]),
+            ])
+            item_conditions.append(_web_sql_suffix_cs(WebTelegramItem.key_value, parsed["path_suffix"]))
+    elif kind == "uri_key":
+        order_conditions.append(WebOrder.subscription_url == parsed["uri"])
+        item_conditions.append(WebTelegramItem.key_value == parsed["uri"])
+    else:
+        order_conditions.extend([
+            WebOrder.order_id == query,
+            WebOrder.order_id == raw_query,
+            WebOrder.vhq_order_id == raw_query,
+            WebOrder.contact.ilike(like_query),
+            WebOrder.email.ilike(like_query),
+            WebOrder.profile_token == query,
+            WebOrder.profile_token.like(f"{query}%"),
+            WebOrder.yookassa_payment_id == query,
+            WebOrder.yookassa_payment_id == raw_query,
+        ])
+        if raw_query.lower().startswith("vhq_"):
+            ord_id = raw_query[4:].strip()
+            if ord_id:
+                order_conditions.append(WebOrder.vhq_order_id == ord_id)
+            order_conditions.append(func.lower(WebOrder.marzban_username) == query)
+        elif raw_query.lower().startswith("adapt_"):
+            order_conditions.append(func.lower(WebOrder.marzban_username) == query)
+        else:
+            order_conditions.append(WebOrder.marzban_username.ilike(like_query))
+
+        item_conditions.extend([
+            WebTelegramItem.telegram_id == numeric_query,
+            WebTelegramItem.external_id.ilike(like_query),
+            WebTelegramItem.title.ilike(like_query),
+        ])
+        if len(raw_query) >= 8 and " " not in raw_query and "/" not in raw_query:
+            order_conditions.extend([
+                _web_sql_suffix_cs(WebOrder.subscription_url, f"/{raw_query}"),
+                _web_sql_suffix_cs(WebOrder.vhq_upstream_url, f"/{raw_query}"),
+            ])
+            item_conditions.append(_web_sql_suffix_cs(WebTelegramItem.key_value, f"/{raw_query}"))
 
     async with async_session() as session:
         tokens: set[str] = set()
-        orders_result = await session.execute(
-            select(WebOrder).where(or_(*order_conditions))
-        )
-        matched_orders = orders_result.scalars().all()
-        tokens.update(o.profile_token for o in matched_orders if o.profile_token)
+        if order_conditions:
+            orders_result = await session.execute(
+                select(WebOrder).where(or_(*order_conditions))
+            )
+            matched_orders = orders_result.scalars().all()
+            tokens.update(o.profile_token for o in matched_orders if o.profile_token)
 
-        accounts_result = await session.execute(
-            select(WebAccount).where(
-                or_(
-                    WebAccount.contact.ilike(like_query),
-                    WebAccount.profile_token == query,
-                    WebAccount.profile_token.like(f"{query}%"),
+        if kind == "plain":
+            accounts_result = await session.execute(
+                select(WebAccount).where(
+                    or_(
+                        WebAccount.contact.ilike(like_query),
+                        WebAccount.profile_token == query,
+                        WebAccount.profile_token.like(f"{query}%"),
+                    )
                 )
             )
-        )
-        accounts = accounts_result.scalars().all()
-        tokens.update(a.profile_token for a in accounts)
+            accounts = accounts_result.scalars().all()
+            tokens.update(a.profile_token for a in accounts)
 
-        balances_result = await session.execute(
-            select(WebBalanceAccount).where(
-                or_(
-                    WebBalanceAccount.contact.ilike(like_query),
-                    WebBalanceAccount.profile_token == query,
-                    WebBalanceAccount.profile_token.like(f"{query}%"),
+            balances_result = await session.execute(
+                select(WebBalanceAccount).where(
+                    or_(
+                        WebBalanceAccount.contact.ilike(like_query),
+                        WebBalanceAccount.profile_token == query,
+                        WebBalanceAccount.profile_token.like(f"{query}%"),
+                    )
                 )
             )
-        )
-        balances = balances_result.scalars().all()
-        tokens.update(a.profile_token for a in balances)
+            balances = balances_result.scalars().all()
+            tokens.update(a.profile_token for a in balances)
 
-        links_result = await session.execute(
-            select(WebProfileLink).where(
-                or_(
-                    WebProfileLink.telegram_id == numeric_query,
-                    WebProfileLink.telegram_username.ilike(username_like),
-                    WebProfileLink.telegram_full_name.ilike(like_query),
-                    WebProfileLink.contact.ilike(like_query),
-                    WebProfileLink.profile_token.like(f"{query}%"),
+            links_result = await session.execute(
+                select(WebProfileLink).where(
+                    or_(
+                        WebProfileLink.telegram_id == numeric_query,
+                        WebProfileLink.telegram_username.ilike(username_like),
+                        WebProfileLink.telegram_full_name.ilike(like_query),
+                        WebProfileLink.contact.ilike(like_query),
+                        WebProfileLink.profile_token.like(f"{query}%"),
+                    )
                 )
             )
-        )
-        tokens.update(link.profile_token for link in links_result.scalars().all())
+            tokens.update(link.profile_token for link in links_result.scalars().all())
 
-        items_result = await session.execute(
-            select(WebTelegramItem).where(or_(*item_conditions))
-        )
-        tokens.update(item.profile_token for item in items_result.scalars().all())
+        if item_conditions:
+            items_result = await session.execute(
+                select(WebTelegramItem).where(or_(*item_conditions))
+            )
+            tokens.update(item.profile_token for item in items_result.scalars().all())
 
         if not tokens:
             return web.json_response({"error": "Not found"}, status=404)

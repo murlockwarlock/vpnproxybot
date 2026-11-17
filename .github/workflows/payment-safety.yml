@@ -39,3 +39,7 @@ jobs:
         run: |
           pytest -q tests/test_admin_adapt_demo_and_keys.py -k manual_adapt_failure
           pytest -q tests/test_adapt_subscription_service.py -k adapt_upgrade_failure_preserves_safe_operation_classification
+
+      - name: Run admin client search link regressions
+        run: |
+          pytest -v tests/test_admin_client_search_links.py
