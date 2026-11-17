@@ -157,9 +157,10 @@ class AdaptAPI:
     async def upgrade_subscription(
         self, subscription_uuid: str, new_plan_uuid: str
     ) -> dict[str, Any]:
-        """Upgrade subscription to a more expensive plan (prorated cost).
+        """Change active subscription plan and start the new plan's full period from now.
 
-        Returns UpgradeSubscriptionResponse with upgrade_price and new devices count.
+        Formula: upgrade_price = new_plan_price - (old_plan_price / old_plan_days) * remaining_days.
+        Returns UpgradeSubscriptionResponse with end_date, upgrade_price, and new devices count.
         """
         return await self._post(
             "/subs/upgrade",

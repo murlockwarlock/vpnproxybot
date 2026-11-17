@@ -7344,7 +7344,8 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
     if not _verify_internal_secret(request):
         return web.json_response({"error": "Forbidden"}, status=403)
 
-    query = _normalize_contact(request.query.get("q") or "")
+    raw_query = (request.query.get("q") or "").strip()
+    query = _normalize_contact(raw_query)
     if not query:
         return web.json_response({"error": "Missing q"}, status=400)
     username_query = query.removeprefix("@")
@@ -7352,21 +7353,72 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
     like_query = f"%{query}%"
     username_like = f"%{username_query}%"
 
+    extracted_adapt_uuid = _extract_adapt_uuid(raw_query)
+    url_path = None
+    if raw_query.lower().startswith(("http://", "https://")):
+        from urllib.parse import urlparse
+        parsed_path = (urlparse(raw_query).path or "").rstrip("/")
+        if len(parsed_path) > 5:
+            url_path = parsed_path
+
+    resolved_vhq = None
+    if "/vhq-sub/" in raw_query:
+        try:
+            from bot.services.vhq_subscription_proxy import resolve_vhq_mirror_url
+            resolved_vhq = resolve_vhq_mirror_url(raw_query)
+        except Exception:
+            resolved_vhq = None
+
+    order_conditions = [
+        WebOrder.order_id == query,
+        WebOrder.order_id == raw_query,
+        WebOrder.contact.ilike(like_query),
+        WebOrder.email.ilike(like_query),
+        WebOrder.profile_token == query,
+        WebOrder.profile_token.like(f"{query}%"),
+        WebOrder.subscription_url.contains(raw_query),
+        WebOrder.subscription_url.contains(query),
+        WebOrder.marzban_username.ilike(like_query),
+        WebOrder.yookassa_payment_id == query,
+        WebOrder.yookassa_payment_id == raw_query,
+    ]
+    item_conditions = [
+        WebTelegramItem.telegram_id == numeric_query,
+        WebTelegramItem.external_id.ilike(like_query),
+        WebTelegramItem.key_value.contains(raw_query),
+        WebTelegramItem.key_value.contains(query),
+        WebTelegramItem.title.ilike(like_query),
+    ]
+    if extracted_adapt_uuid:
+        uuid_like = f"%{extracted_adapt_uuid}%"
+        order_conditions.extend([
+            WebOrder.subscription_url.ilike(uuid_like),
+            WebOrder.marzban_username.ilike(uuid_like),
+            WebOrder.target_order_id.ilike(uuid_like),
+        ])
+        item_conditions.extend([
+            WebTelegramItem.key_value.ilike(uuid_like),
+            WebTelegramItem.external_id.ilike(uuid_like),
+        ])
+    if url_path:
+        order_conditions.append(WebOrder.subscription_url.contains(url_path))
+        item_conditions.append(WebTelegramItem.key_value.contains(url_path))
+    if resolved_vhq:
+        if resolved_vhq.get("web_order_id"):
+            order_conditions.append(WebOrder.order_id == str(resolved_vhq["web_order_id"]))
+        if resolved_vhq.get("upstream_url"):
+            up_url = str(resolved_vhq["upstream_url"])
+            order_conditions.append(WebOrder.subscription_url.contains(up_url))
+            item_conditions.append(WebTelegramItem.key_value.contains(up_url))
+        if resolved_vhq.get("order_id"):
+            order_conditions.append(WebOrder.vhq_order_id == str(resolved_vhq["order_id"]))
+        if resolved_vhq.get("subscription_id"):
+            item_conditions.append(WebTelegramItem.external_id == f"sub_{int(resolved_vhq['subscription_id'])}")
+
     async with async_session() as session:
         tokens: set[str] = set()
         orders_result = await session.execute(
-            select(WebOrder).where(
-                or_(
-                    WebOrder.order_id == query,
-                    WebOrder.contact.ilike(like_query),
-                    WebOrder.email.ilike(like_query),
-                    WebOrder.profile_token == query,
-                    WebOrder.profile_token.like(f"{query}%"),
-                    WebOrder.subscription_url.contains(query),
-                    WebOrder.marzban_username.ilike(like_query),
-                    WebOrder.yookassa_payment_id == query,
-                )
-            )
+            select(WebOrder).where(or_(*order_conditions))
         )
         matched_orders = orders_result.scalars().all()
         tokens.update(o.profile_token for o in matched_orders if o.profile_token)
@@ -7409,14 +7461,7 @@ async def handle_internal_admin_client_lookup(request: web.Request) -> web.Respo
         tokens.update(link.profile_token for link in links_result.scalars().all())
 
         items_result = await session.execute(
-            select(WebTelegramItem).where(
-                or_(
-                    WebTelegramItem.telegram_id == numeric_query,
-                    WebTelegramItem.external_id.ilike(like_query),
-                    WebTelegramItem.key_value.contains(query),
-                    WebTelegramItem.title.ilike(like_query),
-                )
-            )
+            select(WebTelegramItem).where(or_(*item_conditions))
         )
         tokens.update(item.profile_token for item in items_result.scalars().all())
 

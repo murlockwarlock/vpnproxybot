@@ -27,6 +27,10 @@
     {
       "name": "Subscriptions",
       "description": "Create and manage VPN subscriptions"
+    },
+    {
+      "name": "Balance",
+      "description": "Check the current integration balance"
     }
   ],
   "paths": {
@@ -347,6 +351,119 @@
         }
       }
     },
+    "/subs/renew/custom": {
+      "post": {
+        "tags": ["Subscriptions"],
+        "summary": "Renew subscription for a custom period",
+        "description": "Renews an existing subscription for a specified number of days. The price and traffic are calculated proportionally from the current plan.\n\n**Price formula:**\n```\ntotal_price = (plan_price_usd / plan_days) × custom_days\nadditional_bytes = (plan_traffic_limit_bytes / plan_days) × custom_days\n```\n\nIf the subscription has already expired, the new period starts from now. If it's still active, the new period is added to the current end date.",
+        "operationId": "renewSubscriptionCustom",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RenewSubscriptionCustomRequest" },
+              "example": {
+                "api_key_id": 1,
+                "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                "custom_days": 7
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Subscription renewed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RenewSubscriptionCustomResponse" },
+                "example": {
+                  "success": true,
+                  "subscription_uuid": "770fa622-a4bd-63f6-c938-668877662222",
+                  "subscription_url": "https://network-api.adaptgroup.app/sub/770fa622-a4bd-63f6-c938-668877662222",
+                  "end_date": "2026-07-08T12:00:00",
+                  "days": 7,
+                  "traffic_limit_bytes": 25165824000,
+                  "total_price": "0.8167",
+                  "balance": "92.18"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Subscription is frozen",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Subscription is frozen" }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+                  "invalid_key": {
+                    "summary": "Invalid api_key or api_key_id",
+                    "value": { "detail": "Invalid api_key or api_key_id" }
+                  },
+                  "missing_header": {
+                    "summary": "Missing X-Api-Key header",
+                    "value": { "detail": "Missing X-Api-Key header" }
+                  }
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient balance",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Insufficient balance" }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Subscription not found" }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request parameters",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "custom_days must be between 3 and 1095" }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          },
+          "503": {
+            "description": "Service temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Service temporarily unavailable" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/subs/freeze": {
       "post": {
         "tags": ["Subscriptions"],
@@ -539,8 +656,8 @@
     "/subs/upgrade": {
       "post": {
         "tags": ["Subscriptions"],
-        "summary": "Upgrade subscription",
-        "description": "Upgrades an active subscription to a more expensive plan. The cost is calculated proportionally based on the remaining days.\n\n**Upgrade price formula:**\n```\nupgrade_price = (new_price_per_day - old_price_per_day) × remaining_days\n```\n\nIf both plans include a traffic limit, additional traffic is also added proportionally.",
+        "summary": "Change subscription plan",
+        "description": "Changes the plan of an active subscription. The cost is calculated as the difference between the new plan price and the remaining value of the current plan.\n\n**Price formula:**\n```\nremaining_value = (old_plan_price / old_plan_days) × remaining_days\nupgrade_price = new_plan_price - remaining_value\n```\n\nAfter the plan change, the subscription gets a new period starting from now. If `upgrade_price <= 0` — the plan change is not allowed.",
         "operationId": "upgradeSubscription",
         "requestBody": {
           "required": true,
@@ -557,7 +674,7 @@
         },
         "responses": {
           "200": {
-            "description": "Subscription upgraded",
+            "description": "Plan changed",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/UpgradeSubscriptionResponse" },
@@ -568,6 +685,7 @@
                   "new_plan_uuid": "661f9511-f3ac-52e5-b827-557766551111",
                   "devices": 5,
                   "additional_bytes": 53687091200,
+                  "end_date": "2026-07-08T12:00:00",
                   "upgrade_price": "1.2500",
                   "balance": "95.25"
                 }
@@ -593,7 +711,7 @@
                     "value": { "detail": "Subscription is expired" }
                   },
                   "cheaper_plan": {
-                    "summary": "New plan must be more expensive",
+                    "summary": "New plan must have a higher price per day",
                     "value": { "detail": "New plan must be more expensive than current plan" }
                   },
                   "no_days": {
@@ -610,15 +728,15 @@
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/ErrorResponse" },
                 "examples": {
-  "invalid_key": {
-    "summary": "Invalid api_key or api_key_id",
-    "value": { "detail": "Invalid api_key or api_key_id" }
-  },
-  "missing_header": {
-    "summary": "Missing X-Api-Key header",
-    "value": { "detail": "Missing X-Api-Key header" }
-  }
-}
+                  "invalid_key": {
+                    "summary": "Invalid api_key or api_key_id",
+                    "value": { "detail": "Invalid api_key or api_key_id" }
+                  },
+                  "missing_header": {
+                    "summary": "Missing X-Api-Key header",
+                    "value": { "detail": "Missing X-Api-Key header" }
+                  }
+                }
               }
             }
           },
@@ -1124,6 +1242,95 @@
           }
         }
       }
+    },
+    "/balance/check": {
+      "post": {
+        "tags": ["Balance"],
+        "summary": "Check balance",
+        "description": "Returns the current integration balance in USD. The value is read directly from the database at request time and reflects the balance at that moment.",
+        "operationId": "checkBalance",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BaseRequest" },
+              "example": { "api_key_id": 1 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Current integration balance",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BalanceCheckResponse" },
+                "example": {
+                  "success": true,
+                  "api_key_id": 1,
+                  "balance": "10.2500",
+                  "currency": "USD",
+                  "balance_updated_at": "2026-07-19T12:00:00"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+                  "invalid_key": {
+                    "summary": "Invalid api_key or api_key_id",
+                    "value": { "detail": "Invalid api_key or api_key_id" }
+                  },
+                  "missing_header": {
+                    "summary": "Missing X-Api-Key header",
+                    "value": { "detail": "Missing X-Api-Key header" }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request validation failed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ValidationErrorResponse" },
+                "example": {
+                  "detail": [
+                    {
+                      "type": "greater_than",
+                      "loc": ["body", "api_key_id"],
+                      "msg": "Input should be greater than 0",
+                      "input": 0,
+                      "ctx": { "gt": 0 }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Too many requests" }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": { "detail": "Внутренняя ошибка сервера" }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1142,6 +1349,7 @@
         "properties": {
           "api_key_id": {
             "type": "integer",
+            "minimum": 1,
             "description": "Integration ID",
             "example": 1
           }
@@ -1283,11 +1491,11 @@
         "properties": {
           "uuid": { "type": "string", "format": "uuid" },
           "name": { "type": "string", "example": "Standard" },
-          "devices": { "type": "integer", "example": 3 },
-          "days": { "type": "integer", "example": 30 },
-          "price_usd": { "type": "string", "example": "3.50" },
-          "retail_price_usd": { "type": "string", "nullable": true, "example": "5.00" },
-          "traffic_limit_bytes": { "type": "integer", "nullable": true, "example": 107374182400 },
+          "devices": { "type": "integer", "description": "Maximum number of devices", "example": 3 },
+          "days": { "type": "integer", "description": "Subscription duration in days", "example": 30 },
+          "price_usd": { "type": "string", "description": "Your wholesale price in USD", "example": "3.50" },
+          "retail_price_usd": { "type": "string", "description": "Recommended retail price in USD", "nullable": true, "example": "5.00" },
+          "traffic_limit_bytes": { "type": "integer", "description": "Traffic limit in bytes for ⚡️ servers. 0 — ⚡️ servers are not available", "example": 107374182400 },
           "is_trial": { "type": "boolean", "example": false },
           "is_active": { "type": "boolean", "example": true },
           "created_at": { "type": "string", "format": "date-time" }
@@ -1358,6 +1566,43 @@
           "balance": { "type": "string" }
         }
       },
+      "RenewSubscriptionCustomRequest": {
+        "type": "object",
+        "required": ["api_key_id", "subscription_uuid", "custom_days"],
+        "properties": {
+          "api_key_id": {
+            "type": "integer",
+            "example": 1
+          },
+          "subscription_uuid": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Subscription UUID",
+            "example": "770fa622-a4bd-63f6-c938-668877662222"
+          },
+          "custom_days": {
+            "type": "integer",
+            "description": "Number of days to renew for. Min: 3, max: 1095",
+            "minimum": 3,
+            "maximum": 1095,
+            "example": 7
+          }
+        }
+      },
+      "RenewSubscriptionCustomResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "message": { "type": "string", "nullable": true },
+          "subscription_uuid": { "type": "string", "format": "uuid" },
+          "subscription_url": { "type": "string" },
+          "end_date": { "type": "string", "format": "date-time" },
+          "days": { "type": "integer" },
+          "traffic_limit_bytes": { "type": "integer", "nullable": true },
+          "total_price": { "type": "string", "description": "Total renewal cost in USD" },
+          "balance": { "type": "string", "description": "Remaining integration balance in USD" }
+        }
+      },
       "FreezeSubscriptionResponse": {
         "type": "object",
         "properties": {
@@ -1388,8 +1633,9 @@
           "new_plan_uuid": { "type": "string", "format": "uuid" },
           "devices": { "type": "integer" },
           "additional_bytes": { "type": "integer", "nullable": true },
-          "upgrade_price": { "type": "string" },
-          "balance": { "type": "string" }
+          "end_date": { "type": "string", "format": "date-time" },
+          "upgrade_price": { "type": "string", "description": "Total cost of the plan change in USD" },
+          "balance": { "type": "string", "description": "Remaining integration balance in USD" }
         }
       },
       "PurchaseTrafficResponse": {
@@ -1444,6 +1690,30 @@
           "total": { "type": "integer" },
           "offset": { "type": "integer" },
           "limit": { "type": "integer" }
+        }
+      },
+      "BalanceCheckResponse": {
+        "type": "object",
+        "required": ["success", "api_key_id", "balance", "currency", "balance_updated_at"],
+        "properties": {
+          "success": { "type": "boolean", "example": true },
+          "api_key_id": { "type": "integer", "minimum": 1, "description": "Integration ID", "example": 1 },
+          "balance": { "type": "string", "description": "Current integration balance with four decimal places", "example": "10.2500" },
+          "currency": { "type": "string", "enum": ["USD"], "example": "USD" },
+          "balance_updated_at": { "type": "string", "format": "date-time", "nullable": true, "description": "UTC timestamp of the latest balance update", "example": "2026-07-19T12:00:00" }
+        }
+      },
+      "ValidationErrorResponse": {
+        "type": "object",
+        "required": ["detail"],
+        "properties": {
+          "detail": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
         }
       },
       "SuccessResponse": {

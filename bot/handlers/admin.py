@@ -2687,6 +2687,75 @@ async def _fetch_webstore_search_profiles(query: str) -> list[dict]:
             return list(data.get("profiles") or [])
 
 
+def _extract_search_url_path(query: str) -> str | None:
+    raw = str(query or "").strip()
+    if not raw.lower().startswith(("http://", "https://")):
+        return None
+    from urllib.parse import urlparse
+    path = (urlparse(raw).path or "").rstrip("/")
+    return path if len(path) > 5 else None
+
+
+def _build_subscription_search_user_ids_subquery(clean: str):
+    from bot.services.adapt_routing import _ADAPT_URL_UUID_RE, _UUID_RE, ADAPT_CLIENT_PREFIX
+
+    like = f"%{clean}%"
+    conditions = [
+        Subscription.vpn_key.contains(clean),
+        Subscription.client_name.ilike(like),
+        Subscription.vhq_order_id.ilike(like),
+        AdaptSubscription.adapt_uuid.ilike(like),
+    ]
+
+    adapt_match = _ADAPT_URL_UUID_RE.search(clean)
+    extracted_adapt_uuid = adapt_match.group(1) if adapt_match else None
+    if not extracted_adapt_uuid and clean.lower().startswith(ADAPT_CLIENT_PREFIX):
+        candidate_uuid = clean[len(ADAPT_CLIENT_PREFIX):].strip()
+        if _UUID_RE.match(candidate_uuid):
+            extracted_adapt_uuid = candidate_uuid
+
+    if extracted_adapt_uuid:
+        uuid_like = f"%{extracted_adapt_uuid}%"
+        conditions.extend([
+            AdaptSubscription.adapt_uuid.ilike(uuid_like),
+            Subscription.client_name.ilike(uuid_like),
+            Subscription.vpn_key.ilike(uuid_like),
+        ])
+
+    resolved_vhq = resolve_vhq_mirror_url(clean)
+    if resolved_vhq:
+        if resolved_vhq.get("subscription_id"):
+            conditions.append(Subscription.id == int(resolved_vhq["subscription_id"]))
+        if resolved_vhq.get("upstream_url"):
+            conditions.append(Subscription.vpn_key.contains(str(resolved_vhq["upstream_url"])))
+        if resolved_vhq.get("order_id"):
+            ord_id = str(resolved_vhq["order_id"])
+            conditions.append(Subscription.vhq_order_id == ord_id)
+            conditions.append(Subscription.client_name.ilike(f"%{ord_id}%"))
+
+    url_path = _extract_search_url_path(clean)
+    if url_path:
+        conditions.append(Subscription.vpn_key.contains(url_path))
+
+    return (
+        select(Subscription.user_id)
+        .outerjoin(AdaptSubscription, AdaptSubscription.subscription_id == Subscription.id)
+        .where(or_(*conditions))
+    )
+
+
+def _build_proxy_search_user_ids_subquery(clean: str):
+    like = f"%{clean}%"
+    conditions = [
+        ProxyAccount.sub_url.contains(clean),
+        ProxyAccount.marzban_username.ilike(like),
+    ]
+    url_path = _extract_search_url_path(clean)
+    if url_path:
+        conditions.append(ProxyAccount.sub_url.contains(url_path))
+    return select(ProxyAccount.user_id).where(or_(*conditions))
+
+
 async def _run_unified_user_search(query: str) -> tuple[list[dict], str | None]:
     clean = query.strip()
     username = clean.removeprefix("@")
@@ -2694,17 +2763,8 @@ async def _run_unified_user_search(query: str) -> tuple[list[dict], str | None]:
     like = f"%{clean}%"
     username_like = f"%{username}%"
 
-    sub_user_ids = select(Subscription.user_id).outerjoin(
-        AdaptSubscription, AdaptSubscription.subscription_id == Subscription.id
-    ).where(or_(
-        Subscription.vpn_key.contains(clean),
-        Subscription.client_name.ilike(like),
-        AdaptSubscription.adapt_uuid.ilike(like),
-    ))
-    proxy_user_ids = select(ProxyAccount.user_id).where(or_(
-        ProxyAccount.sub_url.contains(clean),
-        ProxyAccount.marzban_username.ilike(like),
-    ))
+    sub_user_ids = _build_subscription_search_user_ids_subquery(clean)
+    proxy_user_ids = _build_proxy_search_user_ids_subquery(clean)
     async with async_session() as session:
         result = await session.execute(
             select(User).where(or_(
@@ -2993,16 +3053,19 @@ async def admin_user_by_link_process(message: Message, state: FSMContext) -> Non
         return
         
     search_term = message.text.strip()
+    sub_user_ids = _build_subscription_search_user_ids_subquery(search_term)
+    proxy_user_ids = _build_proxy_search_user_ids_subquery(search_term)
     
     async with async_session() as session:
-        # Join User -> Subscription
         result = await session.execute(
             select(User)
-            .join(Subscription, User.id == Subscription.user_id)
             .options(selectinload(User.subscriptions))
-            .where(
-                (Subscription.vpn_key.contains(search_term))
-            )
+            .where(or_(
+                User.id.in_(sub_user_ids),
+                User.id.in_(proxy_user_ids),
+            ))
+            .order_by(User.created_at.desc())
+            .limit(1)
         )
         user = result.scalar_one_or_none()
 
