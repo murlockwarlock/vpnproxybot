@@ -3352,8 +3352,12 @@ async def handle_create_order(request: web.Request) -> web.Response:
                     },
                     status=400,
                 )
-        balance_account = await _get_or_create_web_balance_account(session, profile_token, contact)
-        if use_balance and balance_account.balance_rub > 0:
+        balance_account = (
+            await _get_or_create_web_balance_account(session, profile_token, contact)
+            if profile_token
+            else None
+        )
+        if use_balance and balance_account and balance_account.balance_rub > 0:
             bonus_applied_rub = min(int(balance_account.balance_rub), original_amount_rub)
         order = WebOrder(
             order_id=order_id,

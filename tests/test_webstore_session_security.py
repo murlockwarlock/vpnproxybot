@@ -330,5 +330,87 @@ async def test_legitimate_first_time_guest_checkout_and_order_lookup_mint_real_s
     ).status == 200
 
 
+async def test_unauthenticated_quick_renew_with_protected_contact_succeeds_without_exposing_profile(
+    patched_webstore, monkeypatch
+):
+    """Unauthenticated Quick Renew entering a registered WebAccount email must not crash or leak the account profile."""
+    monkeypatch.setitem(sys.modules, "yookassa", _FakeYooKassa())
+    monkeypatch.setattr(routes.settings, "yookassa_shop_id", "shop")
+    monkeypatch.setattr(routes.settings, "yookassa_secret_key", "secret")
+    tariff_1m = {
+        "key": "1m",
+        "label": "1 месяц",
+        "adapt_plan_uuid": "plan-1m",
+        "price_rub": 300,
+        "days": 30,
+        "devices": 1,
+        "adapt_cost_price_usd": 1.0,
+        "is_active": True,
+    }
+    monkeypatch.setattr(routes, "get_store_tariffs", lambda: [tariff_1m])
+    monkeypatch.setattr(routes, "get_store_tariffs_by_key", lambda: {"1m": tariff_1m})
+
+    class _MockAdapt:
+        async def get_status(self, adapt_uuid):
+            return {
+                "uuid": adapt_uuid,
+                "plan_uuid": "plan-1m",
+                "is_active": True,
+                "end_date": (datetime.utcnow() + timedelta(days=5)).isoformat(),
+            }
+
+    monkeypatch.setattr(routes, "AdaptAPI", _MockAdapt)
+
+    victim_email = "registered-owner@example.com"
+    victim_profile = routes._make_profile_token(victim_email)
+    async with patched_webstore() as session:
+        session.add(
+            WebAccount(
+                contact=victim_email,
+                profile_token=victim_profile,
+                password_hash=routes._hash_password("strong-pass"),
+            )
+        )
+        session.add(
+            WebBalanceAccount(
+                profile_token=victim_profile,
+                contact=victim_email,
+                balance_rub=500,
+                ref_code="ref-reg-owner",
+            )
+        )
+        await session.commit()
+
+    resp = await routes.handle_create_order(
+        _Request(
+            _json_body={
+                "tariff_key": "1m",
+                "purchase_action": "renew",
+                "target_order_id": "uuid:05a19dc5-a84f-4568-9994-ad9d8fb61354",
+                "contact": victim_email,
+            }
+        )
+    )
+    assert resp.status == 200
+    qr_order_id = json.loads(resp.text)["order_id"]
+
+    async with patched_webstore() as session:
+        qr_order = await session.scalar(select(WebOrder).where(WebOrder.order_id == qr_order_id))
+        assert qr_order is not None
+        assert qr_order.profile_token is None
+        assert (await session.get(WebBalanceAccount, victim_profile)).balance_rub == 500
+        qr_order.status = "delivered"
+        qr_order.subscription_url = "https://secret.test/renewed-key"
+        qr_order.delivered_at = datetime.utcnow()
+        await session.commit()
+
+    status_resp = await routes.handle_order_status(_Request(query={"order_id": qr_order_id}))
+    assert status_resp.status == 200
+    status_data = json.loads(status_resp.text)
+    assert "05a19dc5-a84f-4568-9994-ad9d8fb61354" in (status_data["subscription_url"] or "")
+    assert status_data["profile_token"] is None
+    assert routes._AUTH_COOKIE not in status_resp.cookies
+
+
 async def _async_val(val):
     return val
