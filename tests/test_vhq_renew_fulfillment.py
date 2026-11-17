@@ -86,10 +86,10 @@ async def bot_db(monkeypatch):
     monkeypatch.setattr("bot.services.yookassa_reconciliation.async_session", factory)
     monkeypatch.setattr("bot.webhooks.async_session", factory)
     monkeypatch.setattr("bot.services.guide_service.async_session", factory)
-    if not settings.vhq_subscription_proxy_base_url:
-        monkeypatch.setattr(settings, "vhq_subscription_proxy_base_url", "https://darimiru.test")
-    if not settings.vhq_subscription_proxy_secret and not settings.webstore_bridge_secret:
-        monkeypatch.setattr(settings, "vhq_subscription_proxy_secret", "ci-vhq-proxy-secret")
+    if not settings.base_webhook_url and not settings.subscription_base_url:
+        monkeypatch.setattr(settings, "base_webhook_url", "https://darimiru.test")
+    if not settings.webstore_bridge_secret and not settings.bot_token:
+        monkeypatch.setattr(settings, "webstore_bridge_secret", "ci-vhq-proxy-secret")
     yield factory
     await engine.dispose()
 
