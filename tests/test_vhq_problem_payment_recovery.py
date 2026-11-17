@@ -23,6 +23,7 @@ import pytest_asyncio
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from bot.config import settings
 from bot.models import (
     AppLease,
     Base,
@@ -79,8 +80,20 @@ async def db_engine():
 
 
 @pytest_asyncio.fixture
-async def db_session_factory(db_engine):
-    return async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+async def db_session_factory(db_engine, monkeypatch):
+    factory = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr("bot.database.async_session", factory)
+    monkeypatch.setattr("bot.services.cluster.async_session", factory)
+    monkeypatch.setattr("bot.services.scheduler.async_session", factory)
+    monkeypatch.setattr("bot.services.yookassa_reconciliation.async_session", factory)
+    monkeypatch.setattr("bot.services.problem_payments.async_session", factory)
+    monkeypatch.setattr("bot.webhooks.async_session", factory)
+    monkeypatch.setattr("bot.services.guide_service.async_session", factory)
+    if not settings.vhq_subscription_proxy_base_url:
+        monkeypatch.setattr(settings, "vhq_subscription_proxy_base_url", "https://darimiru.test")
+    if not settings.vhq_subscription_proxy_secret and not settings.webstore_bridge_secret:
+        monkeypatch.setattr(settings, "vhq_subscription_proxy_secret", "ci-vhq-proxy-secret")
+    return factory
 
 
 # ── Test 1: VHQ Insufficient Balance Recorded as vhq_balance ─────────────────

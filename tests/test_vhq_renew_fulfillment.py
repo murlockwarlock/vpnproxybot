@@ -80,9 +80,16 @@ async def bot_db(monkeypatch):
             )
         )
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr("bot.database.async_session", factory)
+    monkeypatch.setattr("bot.services.cluster.async_session", factory)
     monkeypatch.setattr("bot.services.scheduler.async_session", factory)
     monkeypatch.setattr("bot.services.yookassa_reconciliation.async_session", factory)
     monkeypatch.setattr("bot.webhooks.async_session", factory)
+    monkeypatch.setattr("bot.services.guide_service.async_session", factory)
+    if not settings.vhq_subscription_proxy_base_url:
+        monkeypatch.setattr(settings, "vhq_subscription_proxy_base_url", "https://darimiru.test")
+    if not settings.vhq_subscription_proxy_secret and not settings.webstore_bridge_secret:
+        monkeypatch.setattr(settings, "vhq_subscription_proxy_secret", "ci-vhq-proxy-secret")
     yield factory
     await engine.dispose()
 
