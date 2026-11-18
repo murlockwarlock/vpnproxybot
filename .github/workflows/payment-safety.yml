@@ -48,3 +48,7 @@ jobs:
         run: |
           pytest -v tests/test_adapt_traffic_callback_guard.py
           pytest -v tests/test_adapt_api.py -k "not test_disabled_raises_on_post"
+
+      - name: Run VHQ renew safety & recovery regressions
+        run: |
+          pytest -q tests/test_vhq_renew_fulfillment.py tests/test_vhq_problem_payment_recovery.py

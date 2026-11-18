@@ -35,7 +35,12 @@ from bot.services.provisioning_issues import (
     build_internal_access_error,
     build_vhq_access_error,
 )
-from bot.services.vhq_partner_api import VHQPartnerAPI, VHQPartnerAPIError, _ALLOWED_DAYS
+from bot.services.vhq_partner_api import (
+    VHQPartnerAPI,
+    VHQPartnerAPIError,
+    _ALLOWED_DAYS,
+    is_vhq_renewal_active_until_confirmed,
+)
 from bot.services.vhq_routing import get_vhq_spec_for_store_tariff
 from bot.services.adapt_api import (
     ADAPT_MIN_CUSTOM_RENEW_DAYS,
@@ -268,6 +273,14 @@ def _is_adapt_mutation_attempted(order: WebOrder, action: str) -> bool:
     return _adapt_mutation_state(order, action) in _ADAPT_MUTATION_POST_STATES
 
 
+_VHQ_AMBIGUOUS_RENEW_FAILURE_CODES = {
+    "vhq_renew_inflight",
+    "supplier_renew_processing",
+    "vhq_renew_uncertain",
+    "network_timeout",
+    "reconciliation_uncertain",
+}
+
 _VHQ_NON_RETRYABLE_BUY_FAILURE_CODES = {
     "buy_inflight",
     "buy_fallback_inflight",
@@ -280,6 +293,7 @@ _VHQ_NON_RETRYABLE_BUY_FAILURE_CODES = {
     "buy_fallback_failed",
     "vhq_response_runtime",
     "missing_baseline_already_requested",
+    "ambiguous_renew_unconfirmed",
 }
 
 
@@ -593,8 +607,13 @@ async def _notify_admins_webstore(
             f"{client_line}"
             f"{target_str}".strip()
         )
-    elif event in {"failed", "retrying"} and issue is not None:
-        heading = "Ошибка выдачи" if event == "failed" else "Выдача задержана — будет повтор"
+    elif event in {"failed", "retrying", "conflict"} and issue is not None:
+        if event == "failed":
+            heading = "Ошибка выдачи"
+        elif event == "conflict":
+            heading = "Конфликт параллельного продления — ожидание"
+        else:
+            heading = "Выдача задержана — будет повтор"
         text = (
             f"🚨 <b>{heading} (веб-магазин)</b>\n\n"
             f"Тариф: {html.escape(order.tariff_label)}\n"
@@ -4059,12 +4078,13 @@ async def attempt_fulfill_order(session, order: WebOrder) -> None:
                 )
                 return
 
-        if order.failure_code in ("buy_fallback_inflight", "buy_inflight"):
+        if order.failure_code in ("buy_fallback_inflight", "buy_inflight", "vhq_renew_inflight"):
             now = datetime.utcnow()
             if order.next_fulfillment_retry_at and order.next_fulfillment_retry_at > now:
                 logger.info(
-                    "Order %s has live buy_inflight until %s. Leaving untouched.",
+                    "Order %s has live %s until %s. Leaving untouched.",
                     order.order_id,
+                    order.failure_code,
                     order.next_fulfillment_retry_at,
                 )
                 return
@@ -4078,7 +4098,7 @@ async def attempt_fulfill_order(session, order: WebOrder) -> None:
 
         order.fulfillment_attempts = int(order.fulfillment_attempts or 0) + 1
         order.last_fulfillment_attempt_at = datetime.utcnow()
-        if order.failure_code not in ("buy_fallback_inflight", "buy_inflight"):
+        if order.failure_code not in ("buy_fallback_inflight", "buy_inflight", "vhq_renew_inflight"):
             order.next_fulfillment_retry_at = None
         try:
             await _fulfill_order(session, order)
@@ -4244,9 +4264,28 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
             )
         ).all()
 
+        if order.failure_code == "vhq_renew_inflight":
+            if order.next_fulfillment_retry_at and order.next_fulfillment_retry_at > now:
+                logger.info(
+                    "Order %s has live vhq_renew_inflight until %s. Leaving untouched.",
+                    order.order_id,
+                    order.next_fulfillment_retry_at,
+                )
+                return
+
         open_concurrent = [
             o for o in concurrent_candidates
-            if o.failure_code in ("supplier_renew_processing", "network_timeout", "concurrent_renewal_conflict")
+            if o.failure_code in (
+                "vhq_renew_inflight",
+                "supplier_renew_processing",
+                "vhq_renew_uncertain",
+                "network_timeout",
+                "concurrent_renewal_conflict",
+            )
+            or (
+                o.failure_code is not None
+                and o.failure_code.startswith("vhq_renew_http_5")
+            )
             or o.id < order.id
         ]
 
@@ -4274,8 +4313,9 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
 
         renew_days = int(order.days or 30)
 
-        # Blocker 3: Baseline snapshot from root_order or GET orders if root_order.vhq_active_until is NULL
-        provider_baseline = root_order.vhq_active_until
+        # Blocker 3: Durable baseline snapshot from order.target_snapshot_expires_at, root_order, or GET orders
+        provider_baseline = order.target_snapshot_expires_at or root_order.vhq_active_until
+        orders_list = None
         if provider_baseline is None and supplier_order_id:
             try:
                 orders_resp = await api.get_orders()
@@ -4293,20 +4333,31 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
             except Exception as exc:
                 logger.warning("Failed to establish baseline for web order %s: %s", order.order_id, exc)
 
+        if provider_baseline and order.target_snapshot_expires_at is None:
+            order.target_snapshot_expires_at = provider_baseline
+            await session.commit()
+
         expected_provider_active_until = None
         if provider_baseline:
-            ref_time = provider_baseline if provider_baseline > now else now
+            anchor_now = order.paid_at or order.created_at or now
+            ref_time = provider_baseline if provider_baseline > anchor_now else anchor_now
             expected_provider_active_until = ref_time + timedelta(days=renew_days)
 
-        # 1. Reconciliation: only if retrying after a previous attempt
+        is_ambiguous_renew_post = (
+            order.failure_code in _VHQ_AMBIGUOUS_RENEW_FAILURE_CODES
+            or bool(order.failure_code and order.failure_code.startswith("vhq_renew_http_5"))
+        )
+
+        # 1. Reconciliation: inspect supplier orders first whenever retrying or after an ambiguous POST
         should_reconcile = (
-            order.failure_code in ("supplier_renew_processing", "network_timeout", "reconciliation_uncertain", "vhq_renew_uncertain")
+            is_ambiguous_renew_post
             or (order.fulfillment_attempts and order.fulfillment_attempts > 1 and order.failure_code is not None)
         )
         if should_reconcile and supplier_order_id:
             try:
-                orders_resp = await api.get_orders()
-                orders_list = orders_resp if isinstance(orders_resp, list) else (orders_resp.get("orders", []) if isinstance(orders_resp, dict) else [])
+                if orders_list is None:
+                    orders_resp = await api.get_orders()
+                    orders_list = orders_resp if isinstance(orders_resp, list) else (orders_resp.get("orders", []) if isinstance(orders_resp, dict) else [])
                 matched = next(
                     (o for o in orders_list if str(o.get("order_id") or o.get("id") or "").strip() == str(supplier_order_id).strip()),
                     None,
@@ -4316,7 +4367,11 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
                     if sup_active:
                         is_ok = False
                         if expected_provider_active_until:
-                            is_ok = sup_active >= expected_provider_active_until
+                            is_ok = is_vhq_renewal_active_until_confirmed(
+                                sup_active,
+                                expected_active_until=expected_provider_active_until,
+                                baseline_active_until=provider_baseline,
+                            )
                         else:
                             is_ok = False
 
@@ -4332,12 +4387,55 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
                             order.failure_message = None
                             order.failure_reason = None
                             order.failure_code = None
+                            order.next_fulfillment_retry_at = None
                             order.delivered_at = datetime.utcnow()
                             _web_plog("WEB_ПРОДЛЕНИЕ", order_id=order.order_id, tariff=order.tariff_label, provider="vhq", note="reconciliation")
                             logger.info("Order %s renewed via VHQ reconciliation (root order %s)", order.order_id, root_order.order_id)
                             return
             except Exception as rec_exc:
                 logger.warning("Reconciliation get_orders failed for web order %s: %s", order.order_id, rec_exc)
+
+        # Invariant: If a non-idempotent POST renew was already dispatched and not yet confirmed by GET orders,
+        # NEVER send a second paid POST renew!
+        if is_ambiguous_renew_post:
+            attempts = int(order.fulfillment_attempts or 1)
+            if attempts >= _FULFILLMENT_MAX_ATTEMPTS:
+                reason = (
+                    f"VHQ POST renew was already dispatched for order {order.order_id}, "
+                    f"but expected active_until ({expected_provider_active_until}) was not confirmed "
+                    f"after {attempts} attempts. Duplicate POST prohibited."
+                )
+                order.status = "failed"
+                order.next_fulfillment_retry_at = None
+                order.failure_code = "ambiguous_renew_unconfirmed"
+                order.failure_reason = reason
+                order.failure_message = "Заказ требует проверки администратором. Оплата сохранена."
+                issue = build_internal_access_error(
+                    provider="vhq",
+                    code="ambiguous_renew_unconfirmed",
+                    admin_message=reason,
+                    client_message=order.failure_message,
+                )
+                await session.commit()
+                await _notify_admins_webstore(order, "failed", issue=issue)
+                await _notify_linked_webstore_user(order, "failed")
+                return
+
+            delay_index = min(max(attempts - 1, 0), len(_FULFILLMENT_RETRY_DELAYS_MINUTES) - 1)
+            retry_minutes = _FULFILLMENT_RETRY_DELAYS_MINUTES[delay_index]
+            order.status = "paid"
+            if order.failure_code == "vhq_renew_inflight":
+                order.failure_code = "vhq_renew_uncertain"
+            order.failure_message = "Продление обрабатывается поставщиком. Проверяем статус..."
+            order.next_fulfillment_retry_at = datetime.utcnow() + timedelta(minutes=retry_minutes)
+            await session.commit()
+            return
+
+        # PoNR: Commit durable in-flight marker BEFORE non-idempotent supplier POST!
+        order.failure_code = "vhq_renew_inflight"
+        order.failure_reason = "VHQ renew POST initiated"
+        order.next_fulfillment_retry_at = datetime.utcnow() + timedelta(minutes=2)
+        await session.commit()
 
         try:
             response = await api.renew(order_id=supplier_order_id)
@@ -4349,10 +4447,11 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
             if resp_status == "processing":
                 is_confirmed = False
             elif expected_provider_active_until:
-                if new_active_until and new_active_until >= expected_provider_active_until:
-                    is_confirmed = True
-                else:
-                    is_confirmed = False
+                is_confirmed = is_vhq_renewal_active_until_confirmed(
+                    new_active_until,
+                    expected_active_until=expected_provider_active_until,
+                    baseline_active_until=provider_baseline,
+                )
             else:
                 if bool(response.get("already_requested")):
                     is_confirmed = False
@@ -4370,7 +4469,7 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
                     await session.commit()
                     await _notify_admins_webstore(order, "failed", issue=issue)
                     return
-                elif resp_status in ("renewed", "completed", "success") and new_active_until and new_active_until > now:
+                elif resp_status in ("renewed", "completed", "success", "scheduled") and new_active_until and new_active_until > now:
                     is_confirmed = True
                 else:
                     is_confirmed = False
@@ -4384,6 +4483,7 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
                 order.next_fulfillment_retry_at = datetime.utcnow() + timedelta(minutes=1)
                 order.failure_code = "supplier_renew_processing"
                 order.failure_message = "Продление обрабатывается поставщиком. Проверяем статус..."
+                await session.commit()
                 return
 
             root_order.vhq_active_until = new_active_until
@@ -4402,6 +4502,8 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
             order.status = "delivered"
             order.failure_message = None
             order.failure_reason = None
+            order.failure_code = None
+            order.next_fulfillment_retry_at = None
             order.delivered_at = now
             _web_plog(
                 "WEB_ПРОДЛЕНИЕ",
@@ -4477,6 +4579,8 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
                     order.status = "delivered"
                     order.failure_message = None
                     order.failure_reason = None
+                    order.failure_code = None
+                    order.next_fulfillment_retry_at = None
                     order.delivered_at = now
                     _web_plog(
                         "WEB_ВЫДАЧА",
@@ -4532,6 +4636,18 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
                 order.failure_message = issue.client_message
                 await _notify_admins_webstore(order, "failed", issue=issue)
                 return
+            elif exc.status and 500 <= exc.status < 600:
+                logger.warning(
+                    "Ambiguous HTTP %s during VHQ renew for order %s: %s",
+                    exc.status, order.order_id, exc,
+                )
+                order.status = "paid"
+                order.failure_code = f"vhq_renew_http_{exc.status}"
+                order.failure_reason = f"Ambiguous HTTP {exc.status} during VHQ renew: {exc}"
+                order.failure_message = "Продление обрабатывается поставщиком. Проверяем статус..."
+                order.next_fulfillment_retry_at = datetime.utcnow() + timedelta(minutes=1)
+                await session.commit()
+                return
             else:
                 issue = build_vhq_access_error(
                     status=exc.status,
@@ -4542,14 +4658,16 @@ async def _fulfill_vhq_order(session, order: WebOrder, vhq_spec: dict[str, int |
                 await _mark_order_failed(order, issue)
                 return
         except Exception as exc:
-            issue = build_internal_access_error(
-                provider="vhq",
-                code="vhq_renew_runtime",
-                admin_message=f"Unexpected VHQ renew error order_id={order.order_id}: {exc}",
-                raw_message=str(exc),
+            logger.warning(
+                "Unexpected post-dispatch VHQ renew error for order %s: %s",
+                order.order_id, exc,
             )
-            logger.error(issue.admin_message)
-            await _mark_order_failed(order, issue)
+            order.status = "paid"
+            order.failure_code = "vhq_renew_uncertain"
+            order.failure_reason = f"Unexpected VHQ renew error after dispatch: {exc}"
+            order.failure_message = "Продление обрабатывается поставщиком. Проверяем статус..."
+            order.next_fulfillment_retry_at = datetime.utcnow() + timedelta(minutes=1)
+            await session.commit()
             return
 
     # NEW purchase

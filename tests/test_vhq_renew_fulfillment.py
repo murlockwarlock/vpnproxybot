@@ -80,9 +80,16 @@ async def bot_db(monkeypatch):
             )
         )
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr("bot.database.async_session", factory)
+    monkeypatch.setattr("bot.services.cluster.async_session", factory)
     monkeypatch.setattr("bot.services.scheduler.async_session", factory)
     monkeypatch.setattr("bot.services.yookassa_reconciliation.async_session", factory)
     monkeypatch.setattr("bot.webhooks.async_session", factory)
+    monkeypatch.setattr("bot.services.guide_service.async_session", factory)
+    if not settings.base_webhook_url and not settings.subscription_base_url:
+        monkeypatch.setattr(settings, "base_webhook_url", "https://darimiru.test")
+    if not settings.webstore_bridge_secret and not settings.bot_token:
+        monkeypatch.setattr(settings, "webstore_bridge_secret", "ci-vhq-proxy-secret")
     yield factory
     await engine.dispose()
 
@@ -2263,22 +2270,24 @@ async def test_legacy_bot_existing_future_active_until_is_not_mistaken_for_new_r
         expected_target = existing_future + timedelta(days=30)
         assert abs((ff_obj.expected_provider_active_until.replace(tzinfo=None) - expected_target).total_seconds()) < 5
 
-        # Fulfillment was NOT completed because existing_future < expected_target
-        assert ff_obj.status != "completed"
-        assert ff_obj.status in ("uncertain", "retry_wait", "manual_review")
+        # Fulfillment was NOT completed because existing_future < expected_target,
+        # and ambiguous_renew marker is preserved so retry will reconcile via GET orders
+        # instead of firing a duplicate paid POST renew!
+        assert ff_obj.status == "uncertain"
+        assert ff_obj.last_error_code == "ambiguous_renew"
+        assert mock_api.renew.call_count == 1
 
-        # Now simulate a true renewal: supplier extends to expected_target (+30 days)
-        mock_api.renew = AsyncMock(return_value={
-            "status": "renewed",
-            "active_until": expected_target.isoformat() + "Z",
-            "order_id": "leg_ord_921",
-        })
+        # Now simulate supplier state converging to expected_target (+30 days) on GET orders
+        mock_api.get_orders = AsyncMock(return_value=[
+            {"order_id": "leg_ord_921", "active_until": expected_target.isoformat() + "Z"}
+        ])
         with patch("bot.services.subscription_service.VHQPartnerAPI", return_value=mock_api):
             await execute_vhq_fulfillment(session, ff_obj)
         await session.commit()
 
         assert ff_obj.status == "completed"
         assert ff_obj.confirmed_provider_active_until is not None
+        assert mock_api.renew.call_count == 1
 
 
 # ── Test 22: Blocker 3: Webstore legacy baseline snapshot & POST renew ────────────
@@ -3695,6 +3704,384 @@ async def test_webstore_fallback_buy_missing_order_id_fails_to_manual_review(web
         # Order MUST NOT be delivered!
         assert order_check.status == "failed"
         assert order_check.failure_code == "fallback_buy_missing_data"
+
+
+# ── Test 37: P0-1 VHQ renews_at-anchored horizon (+29d12h / +29d18h) accepted once ──
+
+
+async def test_vhq_renew_accepts_renews_at_anchored_horizon_without_duplicate_post(bot_db, web_db):
+    """VHQ returns baseline + 29d12h (scheduled on active) or now + 29d18h (expired).
+
+    Both Bot and Webstore must confirm completion on attempt 1 without marking
+    uncertain or issuing a duplicate paid POST renew.
+    """
+    now = datetime.utcnow()
+    active_baseline = now + timedelta(days=3)
+    # VHQ schedules 30d from renews_at = active_until - 12h -> baseline + 29d 12h
+    vhq_scheduled_horizon = active_baseline + timedelta(days=29, hours=12)
+
+    async with bot_db() as session:
+        user = User(id=1, telegram_id=937001, username="horizon_user")
+        tariff = Tariff(
+            id=937,
+            label="Baza Pro",
+            price_rub=399,
+            price_stars=0,
+            days=30,
+            is_active=True,
+            tariff_type=TariffType.VPN,
+            vhq_tier="basic",
+        )
+        server = _make_db_server(937, "Server 937")
+        sub = _make_db_sub(
+            937,
+            user_id=1,
+            tariff_id=937,
+            server_id=937,
+            client_name="vhq_ord_937",
+            vpn_key="https://sub.vhq-connect.xyz/key_937",
+            vhq_order_id="ord_937",
+            status=SubStatus.ACTIVE,
+            expires_at=active_baseline,
+            vhq_active_until=active_baseline,
+        )
+        payment = Payment(
+            id=937,
+            user_id=1,
+            tariff_id=937,
+            amount=39900,
+            currency="RUB",
+            method=PaymentMethod.YOOKASSA,
+            status=PaymentStatus.COMPLETED,
+            provider_payment_id="yk_937",
+        )
+        session.add_all([user, tariff, server, sub, payment])
+        await session.commit()
+
+    mock_bot_api = AsyncMock()
+    mock_bot_api.renew = AsyncMock(return_value={
+        "status": "scheduled",
+        "order_id": "ord_937",
+        "active_until": vhq_scheduled_horizon.isoformat() + "Z",
+    })
+
+    async with bot_db() as session:
+        u = await session.get(User, 1)
+        t = await session.get(Tariff, 937)
+        p = await session.get(Payment, 937)
+        with patch("bot.services.subscription_service.VHQPartnerAPI", return_value=mock_bot_api):
+            renewed_sub, _ = await create_or_extend_paid_access(
+                session,
+                user=u,
+                tariff=t,
+                platform=Platform.ANDROID,
+                purchase_action="renew",
+                target_subscription_id=937,
+                provisioning_payment=p,
+            )
+            await session.commit()
+
+        assert renewed_sub is not None
+        assert mock_bot_api.renew.call_count == 1
+        ff = await session.scalar(
+            select(VhqSubscriptionFulfillment).where(VhqSubscriptionFulfillment.subscription_id == 937)
+        )
+        assert ff.status == "completed"
+        assert ff.attempts == 1
+        assert ff.confirmed_provider_active_until == vhq_scheduled_horizon
+        assert renewed_sub.expires_at == active_baseline + timedelta(days=30)
+
+    # Webstore expired order returning paid_at + 29d 18h (exact production #288/#318/#319 shape)
+    expired_baseline = now - timedelta(days=2)
+    paid_at = now - timedelta(seconds=10)
+    vhq_expired_horizon = paid_at + timedelta(days=29, hours=18, minutes=20)
+    async with web_db() as session:
+        root_order = WebOrder(
+            id=9371,
+            order_id="WEB_HORIZON_ROOT",
+            tariff_key="baza_pro_30",
+            tariff_label="Baza Pro 30",
+            days=30,
+            amount_rub=399,
+            status="delivered",
+            vhq_order_id="sup_horizon_937",
+            subscription_url="/vhq/sub/WEB_HORIZON_ROOT",
+            vhq_upstream_url="https://sub.vhq-connect.xyz/web_937",
+            vhq_active_until=expired_baseline,
+            access_expires_at=expired_baseline,
+        )
+        renew_order = WebOrder(
+            id=9372,
+            order_id="WEB_HORIZON_RENEW",
+            tariff_key="baza_pro_30",
+            tariff_label="Baza Pro 30",
+            days=30,
+            amount_rub=399,
+            status="paid",
+            paid_at=paid_at,
+            purchase_action="renew",
+            target_order_id="order:WEB_HORIZON_ROOT",
+        )
+        session.add_all([root_order, renew_order])
+        await session.commit()
+
+    mock_web_api = AsyncMock()
+    mock_web_api.renew = AsyncMock(return_value={
+        "status": "renewed",
+        "order_id": "sup_horizon_937",
+        "active_until": vhq_expired_horizon.isoformat() + "Z",
+    })
+    mock_web_cls = MagicMock(return_value=mock_web_api)
+    mock_web_cls.extract_active_until = VHQPartnerAPI.extract_active_until
+    mock_web_cls.extract_subscription_url = VHQPartnerAPI.extract_subscription_url
+    mock_web_cls.extract_order_id = VHQPartnerAPI.extract_order_id
+
+    async with web_db() as session:
+        order = await session.get(WebOrder, 9372)
+        with (
+            patch("webstore.routes.get_store_tariffs_by_key", return_value={"baza_pro_30": {"provider": "vhq", "vhq_tier": "basic", "days": 30}}),
+            patch("webstore.routes.VHQPartnerAPI", mock_web_cls),
+            patch("webstore.routes._notify_admins_webstore", new=AsyncMock()),
+            patch("webstore.routes._notify_linked_webstore_user", new=AsyncMock()),
+        ):
+            await attempt_fulfill_order(session, order)
+            await session.commit()
+
+    assert mock_web_api.renew.call_count == 1
+    async with web_db() as session:
+        chk = await session.get(WebOrder, 9372)
+        assert chk.status == "delivered"
+        assert chk.failure_code is None
+        assert chk.vhq_active_until == vhq_expired_horizon
+
+
+# ── Test 38: P0-1 Bot HTTP 200 unconfirmed response never clears POST marker ──
+
+
+async def test_vhq_renew_unconfirmed_200_preserves_ambiguous_marker_across_worker_claim_and_restart(bot_db):
+    """When api.renew returns HTTP 200 without advancing active_until, worker claim + restart
+    must NEVER clear the ambiguous POST marker or send a second POST renew.
+    """
+    now = datetime.utcnow()
+    baseline = now + timedelta(days=5)
+    expected = baseline + timedelta(days=30)
+
+    async with bot_db() as session:
+        user = User(id=1, telegram_id=938001, username="marker_user")
+        tariff = Tariff(
+            id=938,
+            label="Baza Pro",
+            price_rub=399,
+            price_stars=0,
+            days=30,
+            is_active=True,
+            tariff_type=TariffType.VPN,
+            vhq_tier="basic",
+        )
+        server = _make_db_server(938, "Server 938")
+        sub = _make_db_sub(
+            938,
+            user_id=1,
+            tariff_id=938,
+            server_id=938,
+            client_name="vhq_ord_938",
+            vpn_key="https://sub.vhq-connect.xyz/key_938",
+            vhq_order_id="ord_938",
+            status=SubStatus.ACTIVE,
+            expires_at=baseline,
+            vhq_active_until=baseline,
+        )
+        ff = VhqSubscriptionFulfillment(
+            id=938,
+            subscription_id=938,
+            user_id=1,
+            source_type="payment",
+            source_id="payment:938",
+            action="renew",
+            status="pending",
+            vhq_order_id="ord_938",
+            baseline_provider_active_until=baseline,
+            expected_provider_active_until=expected,
+            baseline_local_expires_at=baseline,
+            target_local_expires_at=expected,
+            attempts=0,
+            max_attempts=3,
+            next_attempt_at=now - timedelta(seconds=1),
+        )
+        session.add_all([user, tariff, server, sub, ff])
+        await session.commit()
+
+    mock_api = AsyncMock()
+    # Attempt 1: HTTP 200 but active_until is still at old baseline!
+    mock_api.renew = AsyncMock(return_value={
+        "status": "processing",
+        "order_id": "ord_938",
+        "active_until": baseline.isoformat() + "Z",
+    })
+    mock_api.get_orders = AsyncMock(return_value=[
+        {"order_id": "ord_938", "active_until": baseline.isoformat() + "Z"}
+    ])
+
+    with (
+        patch("bot.services.scheduler.async_session", bot_db),
+        patch("bot.services.subscription_service.VHQPartnerAPI", return_value=mock_api),
+        patch("bot.services.scheduler.notify_admins_issue", new=AsyncMock()),
+    ):
+        # Tick 1: dispatches single POST renew, moves to uncertain + ambiguous_renew
+        await process_vhq_subscription_fulfillments(AsyncMock())
+
+    assert mock_api.renew.call_count == 1
+    async with bot_db() as session:
+        ff1 = await session.get(VhqSubscriptionFulfillment, 938)
+        assert ff1.status == "uncertain"
+        assert ff1.last_error_code == "ambiguous_renew"
+        # Fast-forward next_attempt_at AND simulate legacy row with last_error_code=None to test claim preservation too
+        ff1.next_attempt_at = now - timedelta(seconds=1)
+        ff1.last_error_code = None
+        await session.commit()
+
+    mock_notify = AsyncMock()
+    with (
+        patch("bot.services.scheduler.async_session", bot_db),
+        patch("bot.services.subscription_service.VHQPartnerAPI", return_value=mock_api),
+        patch("bot.services.scheduler.notify_admins_issue", new=mock_notify),
+    ):
+        # Tick 2: scheduler claims uncertain -> processing; must preserve ambiguous_renew and NOT call renew()!
+        await process_vhq_subscription_fulfillments(AsyncMock())
+
+    assert mock_api.renew.call_count == 1
+    async with bot_db() as session:
+        ff2 = await session.get(VhqSubscriptionFulfillment, 938)
+        assert ff2.status == "uncertain"
+        assert ff2.last_error_code == "ambiguous_renew"
+        ff2.next_attempt_at = now - timedelta(seconds=1)
+        await session.commit()
+
+    with (
+        patch("bot.services.scheduler.async_session", bot_db),
+        patch("bot.services.subscription_service.VHQPartnerAPI", return_value=mock_api),
+        patch("bot.services.scheduler.notify_admins_issue", new=mock_notify),
+    ):
+        # Tick 3 (reaches max_attempts=3): transitions to manual_review + alerts admin, still 1 POST total!
+        await process_vhq_subscription_fulfillments(AsyncMock())
+
+    assert mock_api.renew.call_count == 1
+    assert mock_notify.call_count == 1
+    async with bot_db() as session:
+        ff3 = await session.get(VhqSubscriptionFulfillment, 938)
+        assert ff3.status == "manual_review"
+        assert ff3.last_error_code == "ambiguous_renew_unconfirmed"
+
+
+# ── Test 39: P0-1 Webstore ambiguous renew never re-POSTs, never drifts, fails closed ──
+
+
+async def test_webstore_renew_ambiguous_response_and_timeout_never_repost_and_do_not_drift(web_db):
+    """Webstore VHQ renew commits PoNR before POST, never sends a second POST on unconfirmed/timeout,
+    anchors expected horizon to paid_at (not drifting utcnow), and fails closed with admin alert at max_attempts.
+    """
+    now = datetime.utcnow()
+    paid_at = now - timedelta(hours=3)
+    expired_baseline = now - timedelta(days=4)
+
+    async with web_db() as session:
+        root_order = WebOrder(
+            id=9391,
+            order_id="WEB_NOREPOST_ROOT",
+            tariff_key="baza_pro_30",
+            tariff_label="Baza Pro 30",
+            days=30,
+            amount_rub=399,
+            status="delivered",
+            vhq_order_id="sup_norepost_939",
+            subscription_url="/vhq/sub/WEB_NOREPOST_ROOT",
+            vhq_upstream_url="https://sub.vhq-connect.xyz/web_939",
+            vhq_active_until=expired_baseline,
+            access_expires_at=expired_baseline,
+        )
+        renew_order = WebOrder(
+            id=9392,
+            order_id="WEB_NOREPOST_RENEW",
+            tariff_key="baza_pro_30",
+            tariff_label="Baza Pro 30",
+            days=30,
+            amount_rub=399,
+            status="paid",
+            paid_at=paid_at,
+            created_at=paid_at,
+            purchase_action="renew",
+            target_order_id="order:WEB_NOREPOST_ROOT",
+            fulfillment_attempts=0,
+        )
+        session.add_all([root_order, renew_order])
+        await session.commit()
+
+    ponr_committed_before_post = False
+
+    async def timeout_after_checking_ponr(*, order_id: str):
+        nonlocal ponr_committed_before_post
+        async with web_db() as check_sess:
+            persisted = await check_sess.get(WebOrder, 9392)
+            if (
+                persisted is not None
+                and persisted.failure_code == "vhq_renew_inflight"
+                and persisted.target_snapshot_expires_at == expired_baseline
+            ):
+                ponr_committed_before_post = True
+        raise asyncio.TimeoutError("Read timeout after VHQ received POST")
+
+    mock_api = AsyncMock()
+    mock_api.renew = AsyncMock(side_effect=timeout_after_checking_ponr)
+    # GET orders still shows unadvanced expired_baseline on retries 2..5
+    mock_api.get_orders = AsyncMock(return_value=[
+        {"order_id": "sup_norepost_939", "active_until": expired_baseline.isoformat() + "Z"}
+    ])
+    mock_cls = MagicMock(return_value=mock_api)
+    mock_cls.extract_active_until = VHQPartnerAPI.extract_active_until
+    mock_cls.extract_subscription_url = VHQPartnerAPI.extract_subscription_url
+    mock_cls.extract_order_id = VHQPartnerAPI.extract_order_id
+
+    mock_notify_admin = AsyncMock()
+    mock_notify_user = AsyncMock()
+
+    with (
+        patch("webstore.routes.get_store_tariffs_by_key", return_value={"baza_pro_30": {"provider": "vhq", "vhq_tier": "basic", "days": 30}}),
+        patch("webstore.routes.VHQPartnerAPI", mock_cls),
+        patch("webstore.routes._notify_admins_webstore", mock_notify_admin),
+        patch("webstore.routes._notify_linked_webstore_user", mock_notify_user),
+    ):
+        # Attempt 1: dispatches POST, times out -> vhq_renew_uncertain
+        async with web_db() as session:
+            o = await session.get(WebOrder, 9392)
+            await attempt_fulfill_order(session, o)
+
+        assert ponr_committed_before_post is True
+        assert mock_api.renew.call_count == 1
+
+        # Attempts 2, 3, 4: GET orders has not advanced yet; ZERO extra renew() calls!
+        for expected_attempt in (2, 3, 4):
+            async with web_db() as session:
+                o = await session.get(WebOrder, 9392)
+                o.next_fulfillment_retry_at = now - timedelta(seconds=1)
+                await session.commit()
+                await attempt_fulfill_order(session, o)
+                assert o.status == "paid"
+                assert o.fulfillment_attempts == expected_attempt
+            assert mock_api.renew.call_count == 1
+
+        # Attempt 5 (_FULFILLMENT_MAX_ATTEMPTS): still unconfirmed -> fails closed + alerts admin!
+        async with web_db() as session:
+            o = await session.get(WebOrder, 9392)
+            o.next_fulfillment_retry_at = now - timedelta(seconds=1)
+            await session.commit()
+            await attempt_fulfill_order(session, o)
+            assert o.status == "failed"
+            assert o.failure_code == "ambiguous_renew_unconfirmed"
+            assert o.next_fulfillment_retry_at is None
+
+        assert mock_api.renew.call_count == 1
+        assert mock_notify_admin.call_count == 1
+
 
 
 
