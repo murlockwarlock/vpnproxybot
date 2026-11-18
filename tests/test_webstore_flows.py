@@ -28,7 +28,7 @@ async def test_store_upgrade_price_uses_server_quotes():
     assert "{{MIN_PURCHASE_PRICE_RUB}}" not in html
 
 
-from webstore.models import Base, WebBalanceAccount, WebBalanceTopUp, WebBalanceTransaction, WebOrder, WebProfileLink, WebTelegramItem
+from webstore.models import Base, WebBalanceAccount, WebBalanceTopUp, WebBalanceTransaction, WebOrder, WebProfileLink, WebSession, WebTelegramItem
 
 pytestmark = pytest.mark.asyncio
 
@@ -110,13 +110,33 @@ async def patched_webstore(monkeypatch, db_session_factory):
 
 
 async def test_create_profile_returns_ref_link_and_demo_url(monkeypatch, patched_webstore):
+    import hashlib
     maybe_demo = AsyncMock(return_value="https://loonapie.xyz/s/demo-token")
     monkeypatch.setattr(webstore_routes, "_maybe_issue_web_demo_key", maybe_demo)
     monkeypatch.setattr(webstore_routes.settings, "demo_key_days", 3)
 
+    unauth_resp = await webstore_routes.handle_create_profile(
+        _Request(_json_body={"contact": "@user"}, cookies={}, headers={}, remote="127.0.0.1")
+    )
+    assert unauth_resp.status == 401
+
+    profile_token = webstore_routes._make_profile_token("@user")
+    session_secret = "valid-session-secret-for-demo"
+    async with patched_webstore() as session:
+        session.add(WebProfileLink(profile_token=profile_token, contact="@user", telegram_id=777001))
+        session.add(
+            WebSession(
+                token_hash=hashlib.sha256(session_secret.encode()).hexdigest(),
+                profile_token=profile_token,
+                method="telegram",
+                expires_at=datetime.utcnow() + timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
     request = _Request(
-        _json_body={"contact": "@user"},
-        cookies={},
+        _json_body={"token": profile_token},
+        cookies={webstore_routes._AUTH_COOKIE: session_secret},
         headers={},
         remote="127.0.0.1",
     )
@@ -1225,6 +1245,15 @@ async def test_demo_upgrade_order_allows_missing_wholesale_metadata(
                 target_snapshot_plan_uuid=demo_plan_uuid,
             )
         )
+        import hashlib
+        session.add(
+            WebSession(
+                token_hash=hashlib.sha256(b"demo-session-secret").hexdigest(),
+                profile_token="demo-profile",
+                method="telegram",
+                expires_at=datetime.utcnow() + timedelta(hours=1),
+            )
+        )
         await session.commit()
 
     request = _Request(
@@ -1234,7 +1263,7 @@ async def test_demo_upgrade_order_allows_missing_wholesale_metadata(
             "target_order_id": "order:demo-order",
             "contact": "customer@example.com",
         },
-        cookies={"webstore_profile_token": "demo-profile"},
+        cookies={webstore_routes._AUTH_COOKIE: "demo-session-secret"},
         headers={"X-Real-IP": "127.0.0.1"},
         remote="127.0.0.1",
     )

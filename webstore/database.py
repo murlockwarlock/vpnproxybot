@@ -537,6 +537,7 @@ async def init_db() -> None:
                 (WebOrder.contact.is_(None) & WebOrder.email.is_not(None))
                 | (
                     WebOrder.profile_token.is_(None)
+                    & (WebOrder.purchase_action == "new")
                     & (WebOrder.contact.is_not(None) | WebOrder.email.is_not(None))
                 ),
             )

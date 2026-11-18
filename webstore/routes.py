@@ -912,18 +912,26 @@ def _clear_profile_cookie(response: web.StreamResponse) -> None:
     response.del_cookie("webstore_profile_token", path="/")
 
 
+def _has_raw_auth_cookie(request: web.Request) -> bool:
+    cookies = getattr(request, "cookies", None)
+    if not hasattr(cookies, "get"):
+        return False
+    raw = cookies.get(_AUTH_COOKIE, "")
+    return isinstance(raw, str) and bool(raw.strip())
+
+
 async def _authenticated_profile(request: web.Request) -> str:
-    cookies = getattr(request, "cookies", {})
-    token = cookies.get(_AUTH_COOKIE, "")
+    cookies = getattr(request, "cookies", None)
+    if not hasattr(cookies, "get"):
+        return ""
+    raw_token = cookies.get(_AUTH_COOKIE, "")
+    token = raw_token.strip() if isinstance(raw_token, str) else ""
+    if not token:
+        return ""
     async with async_session() as session:
-        if token:
-            record = await session.get(WebSession, hashlib.sha256(token.encode()).hexdigest())
-            if record and record.expires_at > datetime.utcnow():
-                return record.profile_token
-        legacy = cookies.get("webstore_profile_token", "")
-        if legacy and not await session.scalar(select(WebAccount.id).where(WebAccount.profile_token == legacy)):
-            if await session.get(WebProfileLink, legacy) or await session.scalar(select(WebOrder.id).where(WebOrder.profile_token == legacy).limit(1)):
-                return legacy
+        record = await session.get(WebSession, hashlib.sha256(token.encode()).hexdigest())
+        if record and record.expires_at > datetime.utcnow():
+            return record.profile_token
     return ""
 
 
@@ -2981,11 +2989,40 @@ async def handle_create_order(request: web.Request) -> web.Response:
             status=400,
         )
 
+    isolate_unauthenticated_guest_token = False
+    detach_quick_renew_profile = False
     if saved_profile_token != profile_token:
-        async with async_session() as session:
-            protected = await session.scalar(select(WebAccount.id).where(WebAccount.profile_token == profile_token))
-        if protected and (use_balance or not is_quick_renew):
+        if use_balance:
             return web.json_response({"error": "Войдите в профиль", "auth_required": True}, status=401)
+        async with async_session() as session:
+            protected = bool(
+                await session.scalar(select(WebAccount.id).where(WebAccount.profile_token == profile_token).limit(1))
+                or await session.get(WebProfileLink, profile_token)
+            )
+            existing_guest_history = False
+            if not protected:
+                existing_order = await session.scalar(
+                    select(WebOrder.id)
+                    .where(
+                        WebOrder.profile_token == profile_token,
+                        WebOrder.status.in_(("delivered", "paid", "demo")),
+                    )
+                    .limit(1)
+                )
+                existing_balance = await session.get(WebBalanceAccount, profile_token)
+                existing_guest_history = bool(
+                    existing_order is not None
+                    or (existing_balance is not None and int(existing_balance.balance_rub or 0) > 0)
+                )
+        if protected:
+            if not is_quick_renew:
+                return web.json_response({"error": "Войдите в профиль", "auth_required": True}, status=401)
+            detach_quick_renew_profile = True
+        elif existing_guest_history:
+            if is_quick_renew:
+                detach_quick_renew_profile = True
+            else:
+                isolate_unauthenticated_guest_token = True
 
     if _is_intro_basic_store_tariff(tariff_key) and not linked_profile:
         return web.json_response(
@@ -3006,7 +3043,12 @@ async def handle_create_order(request: web.Request) -> web.Response:
 
     order_id = uuid.uuid4().hex[:16]
     client_ip = _get_client_ip(request)
-    profile_token = profile_token or (_make_profile_token(contact) if contact else saved_profile_token)
+    if detach_quick_renew_profile:
+        profile_token = None
+    elif isolate_unauthenticated_guest_token:
+        profile_token = f"guest_{order_id}"
+    else:
+        profile_token = profile_token or (_make_profile_token(contact) if contact else saved_profile_token)
     original_amount_rub = int(tariff["price_rub"])
     bonus_applied_rub = 0
 
@@ -3329,8 +3371,12 @@ async def handle_create_order(request: web.Request) -> web.Response:
                     },
                     status=400,
                 )
-        balance_account = await _get_or_create_web_balance_account(session, profile_token, contact)
-        if use_balance and balance_account.balance_rub > 0:
+        balance_account = (
+            await _get_or_create_web_balance_account(session, profile_token, contact)
+            if profile_token
+            else None
+        )
+        if use_balance and balance_account and balance_account.balance_rub > 0:
             bonus_applied_rub = min(int(balance_account.balance_rub), original_amount_rub)
         order = WebOrder(
             order_id=order_id,
@@ -3607,21 +3653,23 @@ async def handle_create_balance_topup(request: web.Request) -> web.Response:
     if amount_rub < 10 or amount_rub > 50000:
         return web.json_response({"error": "Введите сумму от 10 до 50 000 ₽"}, status=400)
 
-    profile_token = (body.get("token") or (await _authenticated_profile(request)) or "").strip()
-    if not profile_token:
+    authenticated = (await _authenticated_profile(request)).strip()
+    requested_token = str(body.get("token") or "").strip()
+    if not authenticated:
         return web.json_response(
             {"error": "Сначала зарегистрируйтесь или войдите, чтобы пополнение сохранилось в личном кабинете.", "auth_required": True},
-            status=401,
+            status=403 if _has_raw_auth_cookie(request) else 401,
         )
+    if requested_token and requested_token != authenticated:
+        return web.json_response({"error": "Войдите в профиль", "auth_required": True}, status=403)
+    profile_token = authenticated
 
     async with async_session() as session:
         link = await session.get(WebProfileLink, profile_token)
         account = await session.scalar(select(WebAccount).where(WebAccount.profile_token == profile_token))
-        if account and await _authenticated_profile(request) != profile_token:
-            return web.json_response({"error": "Войдите в профиль", "auth_required": True}, status=403 if request.cookies.get(_AUTH_COOKIE) else 401)
         has_order = await session.scalar(select(WebOrder.id).where(WebOrder.profile_token == profile_token).limit(1))
         if not account and not link and not has_order:
-            return web.json_response({"error": "Профиль не найден", "auth_required": True}, status=401)
+            return web.json_response({"error": "Профиль не найден", "auth_required": True}, status=404)
         topup_id = uuid.uuid4().hex[:16]
         topup = WebBalanceTopUp(
             topup_id=topup_id,
@@ -3682,7 +3730,9 @@ async def handle_order_status(request: web.Request) -> web.Response:
     if not order_id:
         return web.json_response({"error": "Missing order_id"}, status=400)
 
+    authenticated = await _authenticated_profile(request)
     should_retry_referral = False
+    mint_guest_checkout_session = False
     async with async_session() as session:
         result = await session.execute(
             select(WebOrder).where(WebOrder.order_id == order_id)
@@ -3711,17 +3761,45 @@ async def handle_order_status(request: web.Request) -> web.Response:
             and order.referral_status in {None, "ready", "failed"}
         )
 
+        is_delivered = order.status == "delivered"
+        exposed_profile_token = None
+        if is_delivered and order.profile_token:
+            if authenticated == order.profile_token:
+                exposed_profile_token = order.profile_token
+            elif not authenticated and hasattr(session, "scalar") and hasattr(session, "get"):
+                has_protected = bool(
+                    await session.scalar(
+                        select(WebAccount.id).where(WebAccount.profile_token == order.profile_token).limit(1)
+                    )
+                    or await session.get(WebProfileLink, order.profile_token)
+                )
+                has_other_orders = await session.scalar(
+                    select(WebOrder.id)
+                    .where(
+                        WebOrder.profile_token == order.profile_token,
+                        WebOrder.id != order.id,
+                        WebOrder.status.in_(("delivered", "paid", "demo")),
+                    )
+                    .limit(1)
+                )
+                if not has_protected and has_other_orders is None:
+                    exposed_profile_token = order.profile_token
+                    mint_guest_checkout_session = True
+
         response_data = {
             "status": order.status,
-            "subscription_url": _display_order_subscription_url(order) or order.subscription_url,
+            "subscription_url": (_display_order_subscription_url(order) or order.subscription_url) if is_delivered else None,
             "tariff_label": order.tariff_label,
             "days": order.days,
-            "profile_token": order.profile_token,
+            "profile_token": exposed_profile_token,
             "failure_message": order.failure_message,
         }
 
     if should_retry_referral:
         await _sync_referral_credit_for_order(order_id)
+
+    if mint_guest_checkout_session and response_data["profile_token"]:
+        return await _auth_response(response_data, response_data["profile_token"], method="checkout")
 
     return web.json_response(response_data)
 
@@ -6403,34 +6481,24 @@ async def handle_create_profile(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
-    contact_in = _normalize_contact(body.get("contact", ""))
-    profile_token = (
-        body.get("token")
-        or (_make_profile_token(contact_in) if contact_in else "")
-        or (await _authenticated_profile(request))
-        or ""
-    ).strip()
-    if not profile_token:
+    authenticated = (await _authenticated_profile(request)).strip()
+    requested_token = str(body.get("token") or "").strip()
+    if not authenticated:
         return web.json_response(
             {"error": "Сначала зарегистрируйтесь или войдите, чтобы демо сохранилось в личном кабинете.", "auth_required": True},
-            status=401,
+            status=403 if _has_raw_auth_cookie(request) else 401,
         )
+    if requested_token and requested_token != authenticated:
+        return web.json_response({"error": "Войдите в профиль", "auth_required": True}, status=403)
+    profile_token = authenticated
 
     async with async_session() as session:
         web_account = await session.scalar(select(WebAccount).where(WebAccount.profile_token == profile_token).limit(1))
-        if web_account and await _authenticated_profile(request) != profile_token:
-            return web.json_response({"error": "Войдите в профиль", "auth_required": True}, status=403 if request.cookies.get(_AUTH_COOKIE) else 401)
         linked_profile = await session.get(WebProfileLink, profile_token)
-        if not web_account and not linked_profile and not contact_in:
-            return web.json_response(
-                {"error": "Сначала зарегистрируйтесь или войдите, чтобы демо сохранилось в личном кабинете.", "auth_required": True},
-                status=401,
-            )
-        contact = _normalize_contact(web_account.contact) if web_account and web_account.contact else None
+        confirmed_email = await session.scalar(select(WebEmail.email).where(WebEmail.profile_token == profile_token)) if web_account else None
+        contact = confirmed_email or (_normalize_contact(web_account.contact) if web_account and web_account.contact else None)
         if not contact and linked_profile and linked_profile.contact:
             contact = _normalize_contact(linked_profile.contact)
-        if not contact and contact_in:
-            contact = contact_in
         account = await _get_or_create_web_balance_account(session, profile_token, contact)
         demo_url = await _maybe_issue_web_demo_key(session, account)
         if not demo_url:
@@ -6460,7 +6528,7 @@ async def handle_create_profile(request: web.Request) -> web.Response:
 
 
 async def handle_profile_lookup(request: web.Request) -> web.Response:
-    """Look up profile token by email and order ID."""
+    """Look up guest profile token by verified contact and paid/delivered order ID."""
     try:
         body = await request.json()
     except Exception:
@@ -6471,13 +6539,29 @@ async def handle_profile_lookup(request: web.Request) -> web.Response:
     if not contact or not order_id:
         return web.json_response({"error": "Введите контакт и номер заказа"}, status=400)
 
+    if (
+        not await _allow_auth_attempt("lookup-ip", _get_client_ip(request), 20, 15)
+        or not await _allow_auth_attempt("lookup-contact", contact, 8, 15)
+    ):
+        return web.json_response({"error": "Слишком много попыток. Попробуйте позже."}, status=429)
+
     token = _make_profile_token(contact)
 
     async with async_session() as session:
+        protected = bool(
+            await session.scalar(select(WebAccount.id).where(WebAccount.profile_token == token).limit(1))
+            or await session.get(WebProfileLink, token)
+        )
+        if protected:
+            return web.json_response(
+                {"error": "Для этого профиля включена защита входа. Войдите по паролю, коду с почты или через Telegram.", "auth_required": True},
+                status=401,
+            )
         result = await session.execute(
             select(WebOrder).where(
                 WebOrder.profile_token == token,
                 WebOrder.order_id == order_id,
+                WebOrder.status.in_(("paid", "delivered")),
             ).limit(1)
         )
         order = result.scalar_one_or_none()
@@ -6487,7 +6571,7 @@ async def handle_profile_lookup(request: web.Request) -> web.Response:
                 status=404,
             )
 
-    return web.json_response({"token": token})
+    return await _auth_response({"token": token}, token, method="order_lookup")
 
 
 async def handle_store_asset(request: web.Request) -> web.Response:
@@ -6746,15 +6830,22 @@ async def handle_profile_link_init(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
-    token = body.get("token", "").strip()
-    if not token:
+    authenticated = (await _authenticated_profile(request)).strip()
+    requested_token = str(body.get("token") or "").strip()
+    if not authenticated and not requested_token:
         return web.json_response({"error": "Missing token"}, status=400)
+    if not authenticated:
+        return web.json_response(
+            {"error": "Войдите в профиль"},
+            status=403 if _has_raw_auth_cookie(request) else 401,
+        )
+    if requested_token and requested_token != authenticated:
+        return web.json_response({"error": "Войдите в профиль"}, status=403)
+    token = authenticated
 
     async with async_session() as session:
         orders, _, _ = await _get_profile_bundle(session, token)
         account = await session.scalar(select(WebAccount).where(WebAccount.profile_token == token))
-        if account and await _authenticated_profile(request) != token:
-            return web.json_response({"error": "Войдите в профиль"}, status=403 if request.cookies.get(_AUTH_COOKIE) else 401)
         link = await session.get(WebProfileLink, token)
         if not orders and not account and not link:
             return web.json_response({"error": "Профиль не найден"}, status=404)
@@ -6819,15 +6910,17 @@ async def handle_telegram_auth_status(request: web.Request) -> web.Response:
 
 
 async def handle_profile_orders(request: web.Request) -> web.Response:
-    """Get all orders for a profile token."""
-    authenticated = await _authenticated_profile(request)
-    token = request.query.get("token", "").strip() or authenticated
-    if authenticated:
-        async with async_session() as session:
-            if await session.scalar(select(WebAccount.id).where(WebAccount.profile_token == authenticated)):
-                token = authenticated
-    if not token:
-        return web.json_response({"error": "Missing token"}, status=400)
+    """Get all orders for the authenticated profile session."""
+    authenticated = (await _authenticated_profile(request)).strip()
+    if not authenticated:
+        requested = request.query.get("token", "").strip()
+        if not requested and not _has_raw_auth_cookie(request):
+            return web.json_response({"error": "Missing token", "auth_required": True}, status=401)
+        return web.json_response(
+            {"error": "Войдите в профиль", "auth_required": True},
+            status=403 if _has_raw_auth_cookie(request) else 401,
+        )
+    token = authenticated
 
     balance_profile = None
     balance_history = None
@@ -6836,8 +6929,6 @@ async def handle_profile_orders(request: web.Request) -> web.Response:
     async with async_session() as session:
         orders, link, telegram_items = await _get_profile_bundle(session, token)
         account = await session.scalar(select(WebAccount).where(WebAccount.profile_token == token))
-        if account and authenticated != token:
-            return web.json_response({"error": "Войдите в профиль"}, status=403 if request.cookies.get(_AUTH_COOKIE) else 401)
         confirmed_email = await session.scalar(select(WebEmail.email).where(WebEmail.profile_token == token)) if account else None
         if not orders and not link and not telegram_items and not account:
             return web.json_response({"error": "Заказы не найдены"}, status=404)
@@ -6918,18 +7009,25 @@ async def handle_balance_toggle(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
-    token = (body.get("token") or (await _authenticated_profile(request)) or "").strip()
     enabled = bool(body.get("enabled"))
-    if not token:
-        return web.json_response({"error": "Сначала откройте профиль"}, status=400)
-
     if enabled:
         return web.json_response({"error": "Самостоятельное включение ежедневных списаний недоступно"}, status=403)
 
+    authenticated = (await _authenticated_profile(request)).strip()
+    requested_token = str(body.get("token") or "").strip()
+    if not authenticated and not requested_token:
+        return web.json_response({"error": "Сначала откройте профиль"}, status=400)
+    if not authenticated:
+        return web.json_response(
+            {"error": "Войдите в профиль"},
+            status=403 if _has_raw_auth_cookie(request) else 401,
+        )
+    if requested_token and requested_token != authenticated:
+        return web.json_response({"error": "Войдите в профиль"}, status=403)
+    token = authenticated
+
     async with async_session() as session:
         account_exists = await session.scalar(select(WebAccount.id).where(WebAccount.profile_token == token))
-        if account_exists and await _authenticated_profile(request) != token:
-            return web.json_response({"error": "Войдите в профиль"}, status=403 if request.cookies.get(_AUTH_COOKIE) else 401)
         orders, link, items = await _get_profile_bundle(session, token)
         if not account_exists and not orders and not link and not items:
             return web.json_response({"error": "Профиль не найден"}, status=404)
@@ -6976,8 +7074,11 @@ async def handle_cancel_order(request: web.Request) -> web.Response:
             return web.json_response({"error": "Заказ не найден"}, status=404)
         if order.profile_token != token:
             return web.json_response({"error": "Нет доступа"}, status=403)
-        account = await session.scalar(select(WebAccount.id).where(WebAccount.profile_token == token))
-        if account and await _authenticated_profile(request) != token:
+        protected = bool(
+            await session.scalar(select(WebAccount.id).where(WebAccount.profile_token == token).limit(1))
+            or await session.get(WebProfileLink, token)
+        )
+        if protected and await _authenticated_profile(request) != token:
             return web.json_response({"error": "Войдите в профиль"}, status=403)
         profile_lock_key = order.profile_token or f"web-order:{order.order_id}"
         async with _acquire_profile_lock(profile_lock_key, timeout=10.0):

@@ -25,6 +25,7 @@ from webstore.models import (
     WebBalanceAccount,
     WebOrder,
     WebProfileLink,
+    WebSession,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -582,12 +583,18 @@ async def test_client_ticket_auto_contact_from_profile(patched, db_session_facto
             telegram_id=123123123,
             telegram_username="autouser",
         ))
+        session.add(WebSession(
+            token_hash=hashlib.sha256(b"support-auto-session").hexdigest(),
+            profile_token="prof_auto_contact",
+            method="telegram",
+            expires_at=datetime.utcnow() + timedelta(hours=1),
+        ))
         await session.commit()
 
     create_data = json.loads((await webstore_routes.handle_support_new_ticket(
         _make_request(
             {"message": "Привет"},
-            cookies={"webstore_profile_token": "prof_auto_contact"}
+            cookies={webstore_routes._AUTH_COOKIE: "support-auto-session"}
         )
     )).text)
     ticket_id = create_data["ticket_id"]
