@@ -14,7 +14,7 @@ from aiogram.types import LabeledPrice
 from sqlalchemy.exc import IntegrityError
 
 from bot.config import settings
-from bot.services.balance_service import credit_user_balance
+from bot.services.balance_service import async_credit_user_balance, credit_user_balance
 from bot.services.money import (
     kopecks_to_rub_string,
     rub_to_kopecks,
@@ -252,7 +252,7 @@ async def credit_referral(
                     amount_rub=earning,
                 )
             )
-            credit_user_balance(
+            await async_credit_user_balance(
                 session,
                 referrer,
                 earning,
@@ -482,7 +482,7 @@ async def credit_cashback(
 
     try:
         async with session.begin_nested():
-            credit_user_balance(
+            await async_credit_user_balance(
                 session,
                 user,
                 cashback_amount,

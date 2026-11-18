@@ -53,7 +53,15 @@ from bot.services.adapt_subscription_proxy import fetch_adapt_mirror_payload
 from bot.services.client_names import build_client_name
 from bot.services.cluster import LeaseManager
 from bot.services.device_slots import get_included_device_slots, get_max_device_slots
-from bot.services.balance_service import async_credit_user_balance, credit_user_balance, debit_user_balance, get_daily_charge_rub, get_user_balance
+from bot.services.balance_service import (
+    InsufficientBalanceError,
+    async_credit_user_balance,
+    async_debit_user_balance,
+    credit_user_balance,
+    debit_user_balance,
+    get_daily_charge_rub,
+    get_user_balance,
+)
 from bot.services.balance_mode_service import disable_balance_mode, enable_balance_mode
 from bot.services.money import kopecks_to_rub_float, rub_to_kopecks
 from bot.services.notifications import notify_admins_issue, notify_admins_payment, notify_expiring
@@ -1175,17 +1183,41 @@ async def handle_robokassa_result(request: web.Request) -> web.Response:
                 if discount > 0:
                     user_rec = await session.get(User, user_db_id_for_payment)
                     if user_rec:
-                        actual_discount = min(discount, max(0.0, get_user_balance(user_rec)))
-                        if actual_discount > 0:
-                            debit_user_balance(
-                                session,
-                                user_rec,
-                                actual_discount,
-                                BalanceTransactionKind.TOPUP,
-                                "Списание с баланса при оплате тарифа",
-                                source_type="payment_discount",
-                                source_id=str(inv_id),
-                            )
+                        already_debited_tx = await session.scalar(
+                            select(BalanceTransaction).where(
+                                BalanceTransaction.user_id == user_rec.id,
+                                BalanceTransaction.source_type == "payment_discount",
+                                BalanceTransaction.source_id == str(inv_id),
+                            ).limit(1)
+                        )
+                        if not already_debited_tx:
+                            requested_discount = round(float(discount), 2)
+                            try:
+                                await async_debit_user_balance(
+                                    session,
+                                    user_rec,
+                                    requested_discount,
+                                    BalanceTransactionKind.TOPUP,
+                                    "Списание с баланса при оплате тарифа",
+                                    source_type="payment_discount",
+                                    source_id=str(inv_id),
+                                )
+                            except InsufficientBalanceError:
+                                await session.refresh(user_rec)
+                                avail_balance = get_user_balance(user_rec)
+                                if avail_balance > 0:
+                                    try:
+                                        await async_debit_user_balance(
+                                            session,
+                                            user_rec,
+                                            avail_balance,
+                                            BalanceTransactionKind.TOPUP,
+                                            "Списание остатка баланса при оплате тарифа",
+                                            source_type="payment_discount",
+                                            source_id=str(inv_id),
+                                        )
+                                    except InsufficientBalanceError:
+                                        pass
 
                 await session.flush()
                 await credit_referral(session, user_db_id_for_payment, payment.id, float(out_sum))
@@ -1374,7 +1406,7 @@ async def handle_internal_web_referral_credit(request: web.Request) -> web.Respo
                     earning_amount_rub=earning,
                 )
             )
-            credit_user_balance(
+            await async_credit_user_balance(
                 session,
                 referrer,
                 earning,

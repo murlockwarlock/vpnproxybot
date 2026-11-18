@@ -21,6 +21,7 @@ from bot.config import settings
 from bot.database import async_session
 from bot.keyboards.client import back_to_menu_kb, balance_menu_kb, balance_payment_kb
 from bot.models import (
+    BalanceTransaction,
     BalanceTransactionKind,
     BalanceTopUp,
     Payment,
@@ -36,7 +37,15 @@ from bot.models import (
     User,
     ProxyAccount,
 )
-from bot.services.balance_service import credit_user_balance, debit_user_balance, get_daily_charge_rub, get_user_balance
+from bot.services.balance_service import (
+    InsufficientBalanceError,
+    async_credit_user_balance,
+    async_debit_user_balance,
+    credit_user_balance,
+    debit_user_balance,
+    get_daily_charge_rub,
+    get_user_balance,
+)
 from bot.services import vpn_manager
 from bot.services.client_names import build_client_name
 from bot.services.device_slots import get_included_device_slots, get_max_device_slots
@@ -1004,19 +1013,7 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
             await callback.answer("Недостаточно средств на балансе", show_alert=True)
             return
 
-        await callback.answer("Обрабатываем оплату…")
-
         purchase_kopecks = rub_to_kopecks(purchase_price)
-        debit_user_balance(
-            session,
-            user,
-            kopecks_to_rub_float(purchase_kopecks),
-            BalanceTransactionKind.TOPUP,
-            f"Оплата тарифа «{tariff.label}» с баланса",
-            source_type="tariff",
-            source_id=str(tariff.id),
-        )
-
         payment = Payment(
             user_id=user.id,
             subscription_id=None,
@@ -1031,7 +1028,27 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
             platform=platform_str,
         )
         session.add(payment)
+        await session.flush()
+
+        try:
+            await async_debit_user_balance(
+                session,
+                user,
+                kopecks_to_rub_float(purchase_kopecks),
+                BalanceTransactionKind.TOPUP,
+                f"Оплата тарифа «{tariff.label}» с баланса",
+                source_type="balance_payment",
+                source_id=str(payment.id),
+            )
+        except (InsufficientBalanceError, Exception) as debit_exc:
+            await session.rollback()
+            if isinstance(debit_exc, InsufficientBalanceError):
+                await callback.answer("Недостаточно средств на балансе", show_alert=True)
+                return
+            raise
+
         await session.commit()
+        await callback.answer("Обрабатываем оплату…")
 
         saved_platform = user.platform if _is_deferred_platform(platform_str) and user.platform and not is_tg_proxy_only else None
         needs_platform_choice = _is_deferred_platform(platform_str) and not is_tg_proxy_only
@@ -1068,17 +1085,25 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                     "adapt_upgrade_failed",
                 }
                 vhq_pending = issue.provider == "vhq" and issue.code == "supplier_fulfillment_pending"
-                if not ambiguous_adapt and not vhq_pending:
-                    credit_user_balance(
+                ambiguous_vhq = (
+                    issue.provider == "vhq"
+                    and not issue.confirmed_rejection
+                    and issue.code not in {"missing_server", "invalid_renewal_target"}
+                )
+                hold_balance_for_recovery = bool(ambiguous_adapt or vhq_pending or ambiguous_vhq)
+                if not hold_balance_for_recovery:
+                    await async_credit_user_balance(
                         session,
                         user,
-                        float(purchase_price),
+                        kopecks_to_rub_float(purchase_kopecks),
                         BalanceTransactionKind.REFUND,
                         "Возврат на баланс после ошибки выдачи ключа",
-                        source_type="tariff",
-                        source_id=str(tariff.id),
+                        source_type="payment_refund",
+                        source_id=str(payment.id),
                     )
                     payment.status = PaymentStatus.REFUNDED
+                elif not payment.provisioning_failure_code:
+                    payment.provisioning_failure_code = issue.code
                 plog(
                     "ОШИБКА_ВЫДАЧИ",
                     provider=issue.provider.upper(),
@@ -1108,7 +1133,7 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                 await notify_expiring(
                     callback.bot,
                     callback.from_user.id,
-                    f"⚠️ {_build_delivery_issue_text(issue, refunded_balance=not ambiguous_adapt and not vhq_pending)}",
+                    f"⚠️ {_build_delivery_issue_text(issue, refunded_balance=not hold_balance_for_recovery)}",
                 )
                 return
             if not subscription or not vpn_key:
@@ -1126,14 +1151,14 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                     "❌ Ошибка генерации ключа. Средства не списаны.\nОбратитесь в поддержку.",
                     parse_mode="HTML",
                 )
-                credit_user_balance(
+                await async_credit_user_balance(
                     session,
                     user,
-                    float(purchase_price),
+                    kopecks_to_rub_float(purchase_kopecks),
                     BalanceTransactionKind.REFUND,
                     "Возврат на баланс после ошибки выдачи ключа",
-                    source_type="tariff",
-                    source_id=str(tariff.id),
+                    source_type="payment_refund",
+                    source_id=str(payment.id),
                 )
                 payment.status = PaymentStatus.REFUNDED
                 await session.commit()
@@ -1146,14 +1171,14 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                 from bot.services.subscription_service import get_primary_active_server
                 server = await get_primary_active_server(session)
                 if not server:
-                    credit_user_balance(
+                    await async_credit_user_balance(
                         session,
                         user,
-                        float(purchase_price),
+                        kopecks_to_rub_float(purchase_kopecks),
                         BalanceTransactionKind.REFUND,
                         "Возврат на баланс после ошибки сервера",
-                        source_type="tariff",
-                        source_id=str(tariff.id),
+                        source_type="payment_refund",
+                        source_id=str(payment.id),
                     )
                     payment.status = PaymentStatus.REFUNDED
                     await session.commit()
@@ -1184,14 +1209,14 @@ async def initiate_balance_payment(callback: CallbackQuery) -> None:
                 subscription=subscription,
             )
             if not mtproto_account and is_tg_proxy_only:
-                credit_user_balance(
+                await async_credit_user_balance(
                     session,
                     user,
-                    float(purchase_price),
+                    kopecks_to_rub_float(purchase_kopecks),
                     BalanceTransactionKind.REFUND,
                     "Возврат на баланс после ошибки создания Telegram-ускорителя",
-                    source_type="tariff",
-                    source_id=str(tariff.id),
+                    source_type="payment_refund",
+                    source_id=str(payment.id),
                 )
                 payment.status = PaymentStatus.REFUNDED
                 await session.commit()
@@ -1316,23 +1341,6 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
             await callback.answer(str(exc), show_alert=True)
             return
 
-        purchase_kopecks, discount_kopecks, payable_kopecks = canonical_discount_and_payable(
-            purchase_price,
-            get_user_balance(user) if use_bal == 1 else 0,
-            minimum_external_kopecks=MIN_YOOKASSA_KOPECKS,
-        )
-
-        if discount_kopecks >= purchase_kopecks and purchase_kopecks > 0:
-            await callback.answer("Баланса достаточно для полной оплаты. Используйте 'Оплатить с баланса'", show_alert=True)
-            return
-
-        if 0 < payable_kopecks < MIN_YOOKASSA_KOPECKS:
-            await callback.answer(
-                f"Сумма к оплате ({kopecks_to_rub_string(payable_kopecks)} ₽) меньше минимальной (10 ₽).",
-                show_alert=True,
-            )
-            return
-
         # Reuse an ambiguous local operation for up to YooKassa's idempotence
         # window. A fresh callback must not create a second financial intent.
         payment = await session.scalar(
@@ -1348,7 +1356,78 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
             .order_by(Payment.id.desc())
             .limit(1)
         )
+        if payment and payment.created_at and datetime.utcnow() - payment.created_at >= timedelta(hours=24):
+            if payment.provider_status == "canceled" and payment.provider_paid is False:
+                # A terminal, authenticated cancellation closes the abandoned
+                # intent. Refund any reserved balance discount idempotently.
+                payment.status = PaymentStatus.FAILED
+                payment.provisioning_failure_code = "payment_canceled_at_provider"
+                cand_ids = [cid for cid in (payment.provider_payment_id, f"local:{payment.id}") if cid]
+                discount_tx = await session.scalar(
+                    select(BalanceTransaction).where(
+                        BalanceTransaction.user_id == user.id,
+                        BalanceTransaction.source_type == "payment_discount",
+                        BalanceTransaction.source_id.in_(cand_ids),
+                    ).limit(1)
+                )
+                if discount_tx and discount_tx.amount_rub > 0:
+                    refund_exists = await session.scalar(
+                        select(BalanceTransaction).where(
+                            BalanceTransaction.user_id == user.id,
+                            BalanceTransaction.source_type == "payment_discount_refund",
+                            BalanceTransaction.source_id.in_(cand_ids),
+                        ).limit(1)
+                    )
+                    if not refund_exists:
+                        await async_credit_user_balance(
+                            session,
+                            user,
+                            discount_tx.amount_rub,
+                            BalanceTransactionKind.REFUND,
+                            f"Возврат списания по отмененному платежу {payment.provider_payment_id or payment.id}",
+                            source_type="payment_discount_refund",
+                            source_id=payment.provider_payment_id or f"local:{payment.id}",
+                        )
+                await session.flush()
+                payment = None
+            else:
+                payment.provisioning_failure_code = "yookassa_create_ambiguous_manual_review"
+                await session.commit()
+                await callback.answer("Предыдущая попытка платежа требует проверки поддержки.", show_alert=True)
+                return
+        elif payment:
+            if not payment.provider_idempotence_key:
+                payment.provisioning_failure_code = "yookassa_create_ambiguous_manual_review"
+                await session.commit()
+                await callback.answer("Предыдущая попытка платежа требует проверки поддержки.", show_alert=True)
+                return
+            if payment.provider_status == "succeeded" and payment.provider_paid is True:
+                await callback.answer("Этот платёж уже принят и ожидает завершения выдачи.", show_alert=True)
+                return
+            payable_kopecks = payment.amount
+            discount_kopecks = payment.discount_kopecks
+            if discount_kopecks is None:
+                discount_kopecks = rub_to_kopecks(payment.discount_applied or 0)
+            purchase_kopecks = payment.purchase_kopecks or (payable_kopecks + discount_kopecks)
+
         if not payment:
+            purchase_kopecks, discount_kopecks, payable_kopecks = canonical_discount_and_payable(
+                purchase_price,
+                get_user_balance(user) if use_bal == 1 else 0,
+                minimum_external_kopecks=MIN_YOOKASSA_KOPECKS,
+            )
+
+            if discount_kopecks >= purchase_kopecks and purchase_kopecks > 0:
+                await callback.answer("Баланса достаточно для полной оплаты. Используйте 'Оплатить с баланса'", show_alert=True)
+                return
+
+            if 0 < payable_kopecks < MIN_YOOKASSA_KOPECKS:
+                await callback.answer(
+                    f"Сумма к оплате ({kopecks_to_rub_string(payable_kopecks)} ₽) меньше минимальной (10 ₽).",
+                    show_alert=True,
+                )
+                return
+
             payment = Payment(
                 user_id=user.id,
                 amount=payable_kopecks,
@@ -1365,50 +1444,26 @@ async def initiate_yookassa_payment(callback: CallbackQuery) -> None:
             )
             session.add(payment)
             await session.flush()
-        elif payment.created_at and datetime.utcnow() - payment.created_at >= timedelta(hours=24):
-            if payment.provider_status == "canceled" and payment.provider_paid is False:
-                # A terminal, authenticated cancellation closes the abandoned
-                # intent.  Unknown outcomes remain fail-closed above.
-                payment.status = PaymentStatus.FAILED
-                payment.provisioning_failure_code = "payment_canceled_at_provider"
-                await session.flush()
-                payment = Payment(
-                    user_id=user.id,
-                    amount=payable_kopecks,
-                    currency="RUB",
-                    method=PaymentMethod.YOOKASSA,
-                    status=PaymentStatus.PENDING,
-                    telegram_chat_id=callback.message.chat.id,
-                    discount_applied=kopecks_to_rub_float(discount_kopecks),
-                    purchase_kopecks=purchase_kopecks,
-                    discount_kopecks=discount_kopecks,
-                    tariff_id=tariff_id,
-                    platform=platform_str,
-                    provider_idempotence_key=None,
-                )
-                session.add(payment)
-                await session.flush()
-            else:
-                payment.provisioning_failure_code = "yookassa_create_ambiguous_manual_review"
-                await session.commit()
-                await callback.answer("Предыдущая попытка платежа требует проверки поддержки.", show_alert=True)
-                return
-        elif not payment.provider_idempotence_key:
-            payment.provisioning_failure_code = "yookassa_create_ambiguous_manual_review"
-            await session.commit()
-            await callback.answer("Предыдущая попытка платежа требует проверки поддержки.", show_alert=True)
-            return
-        elif payment.provider_status == "succeeded" and payment.provider_paid is True:
-            await callback.answer("Этот платёж уже принят и ожидает завершения выдачи.", show_alert=True)
-            return
-        if not payment.provider_idempotence_key:
             payment.provider_idempotence_key = f"bot-payment-{payment.id}"
-        else:
-            payable_kopecks = payment.amount
-            discount_kopecks = payment.discount_kopecks
-            if discount_kopecks is None:
-                discount_kopecks = rub_to_kopecks(payment.discount_applied or 0)
-            purchase_kopecks = payment.purchase_kopecks or (payable_kopecks + discount_kopecks)
+            if discount_kopecks > 0:
+                try:
+                    await async_debit_user_balance(
+                        session,
+                        user,
+                        kopecks_to_rub_float(discount_kopecks),
+                        BalanceTransactionKind.TOPUP,
+                        "Резерв списания с баланса при оплате тарифа",
+                        source_type="payment_discount",
+                        source_id=f"local:{payment.id}",
+                    )
+                except InsufficientBalanceError:
+                    await session.rollback()
+                    await callback.answer(
+                        "Баланс изменился. Пожалуйста, выберите способ оплаты заново.",
+                        show_alert=True,
+                    )
+                    return
+
         payment_id = payment.id
         operation_idempotence_key = payment.provider_idempotence_key
         user_telegram_id = user.telegram_id
@@ -1621,6 +1676,35 @@ async def process_pre_checkout(pre_checkout: PreCheckoutQuery) -> None:
         await pre_checkout.answer(ok=False, error_message="Тариф больше недоступен")
         return
 
+    discount = 0.0
+    parts = payload_str.split("_")
+    if len(parts) > 2:
+        try:
+            parsed_discount = float(parts[-1])
+            if math.isfinite(parsed_discount) and parsed_discount > 0:
+                discount = round(parsed_discount, 2)
+        except ValueError:
+            discount = 0.0
+
+    if discount > 0:
+        async with async_session() as session:
+            user = await session.scalar(
+                select(User).where(User.telegram_id == pre_checkout.from_user.id)
+            )
+            if not user or get_user_balance(user) + 1e-6 < discount:
+                logger.warning(
+                    "Pre-checkout rejected (insufficient balance for discount): user_id=%s payload=%s required=%.2f available=%.2f",
+                    pre_checkout.from_user.id,
+                    payload_str,
+                    discount,
+                    get_user_balance(user) if user else 0.0,
+                )
+                await pre_checkout.answer(
+                    ok=False,
+                    error_message="Баланс изменился. Пожалуйста, создайте новый счёт.",
+                )
+                return
+
     logger.info(
         "Pre-checkout approved: user_id=%s payload=%s currency=%s total_amount=%s",
         pre_checkout.from_user.id,
@@ -1712,7 +1796,7 @@ async def process_successful_payment(message: Message) -> None:
                         completed_at=datetime.utcnow(),
                     )
                 )
-            credit_user_balance(
+            await async_credit_user_balance(
                 session,
                 user,
                 float(amount_rub),
@@ -1988,26 +2072,76 @@ async def process_successful_payment(message: Message) -> None:
 
         pay_method = _payment_method_from_currency(payment_info.currency)
         payment.subscription_id = subscription.id if subscription else None
-        payment.discount_applied = discount
+        actual_discount = 0.0
 
         if discount > 0:
-            actual_discount = min(float(discount), max(0.0, get_user_balance(user)))
-            if actual_discount > 0:
-                debit_user_balance(
+            already_debited_tx = await session.scalar(
+                select(BalanceTransaction).where(
+                    BalanceTransaction.user_id == user.id,
+                    BalanceTransaction.source_type == "payment_discount",
+                    BalanceTransaction.source_id == payment_info.telegram_payment_charge_id,
+                ).limit(1)
+            )
+            if already_debited_tx:
+                actual_discount = float(already_debited_tx.amount_rub or 0.0)
+            else:
+                requested_discount = round(float(discount), 2)
+                try:
+                    await async_debit_user_balance(
+                        session,
+                        user,
+                        requested_discount,
+                        BalanceTransactionKind.TOPUP,
+                        "Списание с баланса при частичной оплате тарифа",
+                        source_type="payment_discount",
+                        source_id=payment_info.telegram_payment_charge_id,
+                    )
+                    actual_discount = requested_discount
+                except InsufficientBalanceError:
+                    await session.refresh(user)
+                    avail_balance = get_user_balance(user)
+                    if avail_balance > 0:
+                        try:
+                            await async_debit_user_balance(
+                                session,
+                                user,
+                                avail_balance,
+                                BalanceTransactionKind.TOPUP,
+                                "Списание остатка баланса при частичной оплате тарифа",
+                                source_type="payment_discount",
+                                source_id=payment_info.telegram_payment_charge_id,
+                            )
+                            actual_discount = avail_balance
+                        except InsufficientBalanceError:
+                            actual_discount = 0.0
+                    logger.warning(
+                        "Discount shortfall on external Telegram charge: user_id=%s charge_id=%s requested=%.2f debited=%.2f",
+                        user.id,
+                        payment_info.telegram_payment_charge_id,
+                        requested_discount,
+                        actual_discount,
+                    )
+
+        payment.discount_applied = actual_discount
+
+        try:
+            purchase_price_rub = float(
+                await get_purchase_price_rub(
                     session,
-                    user,
-                    actual_discount,
-                    BalanceTransactionKind.TOPUP,
-                    "Списание с баланса при частичной оплате тарифа",
-                    source_type="payment_discount",
-                    source_id=payment_info.telegram_payment_charge_id,
+                    user=user,
+                    tariff=tariff,
+                    action=decode_intent(platform_str)[1],
+                    target_subscription_id=decode_intent(platform_str)[2],
                 )
+            )
+        except ValueError:
+            purchase_price_rub = float(tariff.price_rub)
 
         await session.flush()
 
-        # Referral commission + log
+        # Referral commission + log (strictly on externally paid portion)
         amount_rub = (
-            float(tariff.price_rub)
+            max(0.0, round(purchase_price_rub - actual_discount, 2))
             if payment_info.currency == "XTR"
             else kopecks_to_rub_float(payment_info.total_amount)
         )

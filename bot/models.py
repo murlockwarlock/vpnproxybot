@@ -347,6 +347,26 @@ class BalanceTransaction(Base):
             unique=True,
             sqlite_where=text("kind = 'CASHBACK' AND source_type = 'payment' AND source_id IS NOT NULL"),
         ),
+        Index(
+            "uq_balance_tx_payment_discount",
+            "user_id",
+            "source_type",
+            "source_id",
+            unique=True,
+            sqlite_where=text(
+                "direction = 'DEBIT' AND source_type IN ('payment_discount', 'balance_payment') AND source_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_balance_tx_payment_refund",
+            "user_id",
+            "source_type",
+            "source_id",
+            unique=True,
+            sqlite_where=text(
+                "direction = 'CREDIT' AND source_type IN ('payment_refund', 'payment_discount_refund') AND source_id IS NOT NULL"
+            ),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

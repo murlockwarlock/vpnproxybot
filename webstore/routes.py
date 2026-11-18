@@ -28,6 +28,7 @@ from aiohttp import WSCloseCode, web
 from sqlalchemy import delete, func, insert, literal, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm.attributes import set_committed_value
 
 from bot.services.payment_logger import plog
 from bot.services.provisioning_issues import (
@@ -1928,6 +1929,185 @@ def _add_web_balance_transaction(
     )
 
 
+_CONFIRMED_PRE_MUTATION_WEB_FAILURE_CODES = {
+    "adapt_target_missing",
+    "adapt_target_not_found",
+    "adapt_renew_plan_mismatch",
+    "adapt_baseline_missing",
+    "adapt_upgrade_same_plan",
+    "adapt_upgrade_reactivation_required",
+    "device_requires_plan_upgrade",
+    "vhq_request_invalid",
+    "renew_409_wrong_product",
+    "marzban_disabled",
+    "marzban_create_failed",
+    "marzban_update_failed",
+    "marzban_url_missing",
+}
+
+
+async def _atomic_debit_web_balance(
+    session,
+    profile_token: str,
+    *,
+    amount_rub: int,
+    kind: str,
+    description: str,
+    source_id: str | None,
+    contact: str | None = None,
+) -> int | None:
+    """Atomically debit integer RUB from WebBalanceAccount via conditional SQL UPDATE.
+
+    Returns new balance_rub on success, or None if available balance < amount_rub.
+    """
+    amount = int(amount_rub)
+    account = await _get_or_create_web_balance_account(session, profile_token, contact)
+    if amount <= 0:
+        return int(account.balance_rub or 0)
+    await session.flush()
+    now = datetime.utcnow()
+    res = await session.execute(
+        update(WebBalanceAccount)
+        .where(WebBalanceAccount.profile_token == profile_token)
+        .where(func.coalesce(WebBalanceAccount.balance_rub, 0) >= amount)
+        .values(
+            balance_rub=func.coalesce(WebBalanceAccount.balance_rub, 0) - amount,
+            total_spent_rub=func.coalesce(WebBalanceAccount.total_spent_rub, 0) + amount,
+            updated_at=now,
+        )
+        .returning(WebBalanceAccount.balance_rub)
+    )
+    row = res.scalar_one_or_none()
+    if row is None:
+        return None
+    new_balance_int = int(row)
+    set_committed_value(account, "balance_rub", new_balance_int)
+    session.add(
+        WebBalanceTransaction(
+            profile_token=profile_token,
+            amount_rub=amount,
+            direction="debit",
+            kind=kind,
+            balance_after_rub=new_balance_int,
+            description=description,
+            source_id=source_id,
+        )
+    )
+    return new_balance_int
+
+
+async def _atomic_credit_web_balance(
+    session,
+    profile_token: str,
+    *,
+    amount_rub: int,
+    kind: str,
+    description: str,
+    source_id: str | None,
+    contact: str | None = None,
+    counts_as_earned: bool = True,
+) -> int:
+    """Atomically credit integer RUB to WebBalanceAccount via SQL UPDATE."""
+    amount = int(amount_rub)
+    account = await _get_or_create_web_balance_account(session, profile_token, contact)
+    if amount <= 0:
+        return int(account.balance_rub or 0)
+    await session.flush()
+    now = datetime.utcnow()
+    values: dict[str, object] = {
+        "balance_rub": func.coalesce(WebBalanceAccount.balance_rub, 0) + amount,
+        "balance_warning_for_charge_at": None,
+        "updated_at": now,
+    }
+    if counts_as_earned:
+        values["total_earned_rub"] = func.coalesce(WebBalanceAccount.total_earned_rub, 0) + amount
+    else:
+        values["total_spent_rub"] = func.max(0, func.coalesce(WebBalanceAccount.total_spent_rub, 0) - amount)
+    res = await session.execute(
+        update(WebBalanceAccount)
+        .where(WebBalanceAccount.profile_token == profile_token)
+        .values(**values)
+        .returning(WebBalanceAccount.balance_rub)
+    )
+    new_balance_int = int(res.scalar_one())
+    set_committed_value(account, "balance_rub", new_balance_int)
+    set_committed_value(account, "balance_warning_for_charge_at", None)
+    session.add(
+        WebBalanceTransaction(
+            profile_token=profile_token,
+            amount_rub=amount,
+            direction="credit",
+            kind=kind,
+            balance_after_rub=new_balance_int,
+            description=description,
+            source_id=source_id,
+        )
+    )
+    return new_balance_int
+
+
+def _can_auto_refund_failed_bonus_order(order: WebOrder) -> bool:
+    """Return True only when a 100% balance-paid order failed deterministically before supplier mutation."""
+    if int(order.amount_rub or 0) != 0 or int(order.bonus_applied_rub or 0) <= 0:
+        return False
+    if order.status != "failed" or order.next_fulfillment_retry_at is not None:
+        return False
+    code = str(order.failure_code or "").strip()
+    if not code or code not in _CONFIRMED_PRE_MUTATION_WEB_FAILURE_CODES:
+        return False
+    if _is_adapt_mutation_attempted(order, str(order.purchase_action or "new")):
+        return False
+    return True
+
+
+async def _refund_order_reserved_bonus_if_needed(
+    session,
+    order: WebOrder,
+    *,
+    reason: str,
+) -> bool:
+    """Idempotently refund reserved order_payment bonus when an order is confirmed canceled/pre-mutation failed."""
+    if not order or not order.profile_token or order.status == "delivered":
+        return False
+    if int(order.bonus_applied_rub or 0) <= 0:
+        return False
+    debit_tx = await session.scalar(
+        select(WebBalanceTransaction).where(
+            WebBalanceTransaction.profile_token == order.profile_token,
+            WebBalanceTransaction.kind == "order_payment",
+            WebBalanceTransaction.source_id == order.order_id,
+        ).limit(1)
+    )
+    if not debit_tx or int(debit_tx.amount_rub or 0) <= 0:
+        return False
+    refund_tx = await session.scalar(
+        select(WebBalanceTransaction).where(
+            WebBalanceTransaction.kind == "order_bonus_refund",
+            WebBalanceTransaction.source_id == order.order_id,
+        ).limit(1)
+    )
+    if refund_tx:
+        return False
+    await _atomic_credit_web_balance(
+        session,
+        order.profile_token,
+        amount_rub=int(debit_tx.amount_rub),
+        kind="order_bonus_refund",
+        description=f"Возврат резерва баланса по заказу {order.order_id}",
+        source_id=order.order_id,
+        contact=order.contact or order.email,
+        counts_as_earned=False,
+    )
+    logger.info(
+        "Refunded reserved web balance for order %s: profile=%s amount=%s reason=%s",
+        order.order_id,
+        order.profile_token[:8],
+        debit_tx.amount_rub,
+        reason,
+    )
+    return True
+
+
 async def _fetch_web_balance_history(session, profile_token: str, limit: int = 20) -> list[WebBalanceTransaction]:
     result = await session.execute(
         select(WebBalanceTransaction)
@@ -2104,11 +2284,14 @@ async def _disable_web_balance_autodebit_after_tariff_purchase(session, order: W
 async def _credit_web_referral(order: WebOrder) -> dict[str, str | int | float | None]:
     if not order.ref_source or not settings.bridge_shared_secret or not settings.referral_bridge_url:
         return {"status": "skipped"}
+    paid_amount_rub = int(order.amount_rub or 0)
+    if paid_amount_rub <= 0:
+        return {"status": "not_eligible", "earning_rub": 0}
 
     payload = {
         "order_id": order.order_id,
         "ref_code": order.ref_source,
-        "amount_rub": order.amount_rub,
+        "amount_rub": paid_amount_rub,
         "buyer_contact": order.contact or order.email,
         "tariff_label": order.tariff_label,
     }
@@ -2174,17 +2357,23 @@ async def _credit_local_web_referral_locked(order_id: str) -> dict[str, str | in
         if existing.scalar_one_or_none():
             return {"status": "already_credited"}
 
+        paid_amount_rub = int(order.amount_rub or 0)
+        if paid_amount_rub <= 0:
+            return {"status": "not_eligible", "earning_rub": 0}
+
         config = await _fetch_public_balance_config()
         commission_percent = float((config or {}).get("referral_commission_percent", settings.referral_commission_percent))
-        earning_rub = max(1, int(round((order.original_amount_rub or order.amount_rub) * commission_percent / 100)))
-        _add_web_balance_transaction(
+        if commission_percent <= 0:
+            return {"status": "disabled", "earning_rub": 0}
+        earning_rub = max(1, int(round(paid_amount_rub * commission_percent / 100)))
+        await _atomic_credit_web_balance(
             session,
-            account,
+            account.profile_token,
             amount_rub=earning_rub,
-            direction="credit",
             kind="referral_bonus",
             description="Бонус за оплату друга через сайт",
             source_id=order.order_id,
+            counts_as_earned=True,
         )
         await session.commit()
         return {
@@ -2211,23 +2400,37 @@ async def _apply_order_bonus_spend(session, order: WebOrder) -> None:
         order.bonus_spent_at = datetime.utcnow()
         return
 
-    if account.balance_rub < bonus_amount:
-        bonus_amount = max(0, account.balance_rub)
-    if bonus_amount <= 0:
-        order.bonus_applied_rub = 0
-        order.bonus_spent_at = datetime.utcnow()
-        return
-
-    _add_web_balance_transaction(
+    debited_after = await _atomic_debit_web_balance(
         session,
-        account,
+        account.profile_token,
         amount_rub=bonus_amount,
-        direction="debit",
         kind="order_payment",
         description=f"Списано на оплату заказа {order.order_id}",
         source_id=order.order_id,
+        contact=order.contact or order.email,
     )
-    order.bonus_applied_rub = bonus_amount
+    if debited_after is None:
+        await session.refresh(account)
+        avail = max(0, int(account.balance_rub or 0))
+        if avail > 0:
+            await _atomic_debit_web_balance(
+                session,
+                account.profile_token,
+                amount_rub=avail,
+                kind="order_payment",
+                description=f"Списано на оплату заказа {order.order_id}",
+                source_id=order.order_id,
+                contact=order.contact or order.email,
+            )
+            order.bonus_applied_rub = avail
+        else:
+            order.bonus_applied_rub = 0
+        logger.warning(
+            "Legacy web order bonus shortfall on delivery: order=%s requested=%s available=%s",
+            order.order_id,
+            bonus_amount,
+            avail,
+        )
     order.bonus_spent_at = datetime.utcnow()
 
 
@@ -2263,16 +2466,16 @@ async def _apply_order_cashback(session, order: WebOrder) -> int:
     if cashback_rub <= 0:
         return 0
 
-    account = await _get_or_create_web_balance_account(session, order.profile_token, order.contact or order.email)
     pct_fmt = int(pct) if pct.is_integer() else pct
-    _add_web_balance_transaction(
+    await _atomic_credit_web_balance(
         session,
-        account,
+        order.profile_token,
         amount_rub=cashback_rub,
-        direction="credit",
         kind="cashback",
         description=f"Кешбэк {pct_fmt}% за оплату заказа {order.order_id}",
         source_id=order.order_id,
+        contact=order.contact or order.email,
+        counts_as_earned=True,
     )
     logger.info(
         "Cashback credited for web order %s: profile=%s amount=%s руб (%s%%)",
@@ -2398,7 +2601,11 @@ async def _sync_referral_credit_for_order(order_id: str) -> None:
         order = result.scalar_one_or_none()
         if not order or order.status != "delivered" or not order.ref_source:
             return
-        if order.referral_status in {"credited", "invalid"}:
+        if order.referral_status in {"credited", "invalid", "not_eligible"}:
+            return
+        if int(order.amount_rub or 0) <= 0:
+            order.referral_status = "not_eligible"
+            await session.commit()
             return
 
     credit_result = await _credit_local_web_referral(order_id)
@@ -2425,6 +2632,8 @@ async def _sync_referral_credit_for_order(order_id: str) -> None:
             order.referral_status = "credited"
             if not order.referral_credited_at:
                 order.referral_credited_at = datetime.utcnow()
+        elif status == "not_eligible":
+            order.referral_status = "not_eligible"
         elif status in {"invalid", "disabled"}:
             order.referral_status = "invalid"
         elif status != "skipped":
@@ -2575,20 +2784,31 @@ async def _credit_local_balance_topup_locked(topup_id: str) -> dict[str, str | i
         if topup.status == "completed":
             return {"status": "already_credited"}
 
-        account = await _get_or_create_web_balance_account(session, topup.profile_token)
-        _add_web_balance_transaction(
+        existing_tx = await session.scalar(
+            select(WebBalanceTransaction).where(
+                WebBalanceTransaction.kind == "topup",
+                WebBalanceTransaction.source_id == topup.topup_id,
+            ).limit(1)
+        )
+        if existing_tx:
+            topup.status = "completed"
+            topup.completed_at = topup.completed_at or datetime.utcnow()
+            await session.commit()
+            return {"status": "already_credited"}
+
+        new_balance_rub = await _atomic_credit_web_balance(
             session,
-            account,
+            topup.profile_token,
             amount_rub=int(topup.amount_rub),
-            direction="credit",
             kind="topup",
             description="Пополнение баланса через сайт",
             source_id=topup.topup_id,
+            counts_as_earned=True,
         )
         topup.status = "completed"
         topup.completed_at = datetime.utcnow()
         await session.commit()
-        return {"status": "credited", "balance_rub": account.balance_rub}
+        return {"status": "credited", "balance_rub": new_balance_rub}
 
 
 async def _get_profile_bundle(
@@ -3371,38 +3591,86 @@ async def handle_create_order(request: web.Request) -> web.Response:
                     },
                     status=400,
                 )
-        balance_account = (
-            await _get_or_create_web_balance_account(session, profile_token, contact)
-            if profile_token
-            else None
-        )
-        if use_balance and balance_account and balance_account.balance_rub > 0:
-            bonus_applied_rub = min(int(balance_account.balance_rub), original_amount_rub)
-        order = WebOrder(
-            order_id=order_id,
-            contact=contact,
-            email=email,
-            tariff_key=tariff_key,
-            tariff_label=tariff["label"],
-            days=tariff["days"],
-            amount_rub=max(0, original_amount_rub - bonus_applied_rub),
-            original_amount_rub=original_amount_rub,
-            bonus_applied_rub=bonus_applied_rub,
-            status="pending",
-            ip_address=client_ip,
-            ref_source=ref_source,
-            referral_status="ready" if ref_source else None,
-            profile_token=profile_token,
-            purchase_action=purchase_action,
-            target_order_id=target_order_id,
-            target_snapshot_plan_uuid=target_snapshot_plan_uuid,
-            target_snapshot_expires_at=target_snapshot_expires_at,
-            target_snapshot_is_frozen=target_snapshot_is_frozen if purchase_action != "new" else None,
-            entry_referrer=entry_referrer,
-            entry_url=entry_url,
-        )
-        session.add(order)
-        await session.commit()
+        bonus_spent_at = None
+        if use_balance:
+            async with _acquire_profile_lock(profile_token, timeout=10.0):
+                balance_account = await _get_or_create_web_balance_account(session, profile_token, contact)
+                avail_rub = max(0, int(balance_account.balance_rub or 0))
+                candidate_bonus = min(avail_rub, original_amount_rub) if avail_rub > 0 else 0
+                if 0 < (original_amount_rub - candidate_bonus) < 10:
+                    candidate_bonus = max(0, original_amount_rub - 10)
+                if candidate_bonus > 0:
+                    debited_after = await _atomic_debit_web_balance(
+                        session,
+                        profile_token,
+                        amount_rub=candidate_bonus,
+                        kind="order_payment",
+                        description=f"Списано на оплату заказа {order_id}",
+                        source_id=order_id,
+                        contact=contact,
+                    )
+                    if debited_after is None:
+                        await session.rollback()
+                        return web.json_response(
+                            {"error": "Баланс изменился. Обновите страницу и повторите попытку."},
+                            status=409,
+                        )
+                    bonus_applied_rub = candidate_bonus
+                    bonus_spent_at = datetime.utcnow()
+                order = WebOrder(
+                    order_id=order_id,
+                    contact=contact,
+                    email=email,
+                    tariff_key=tariff_key,
+                    tariff_label=tariff["label"],
+                    days=tariff["days"],
+                    amount_rub=max(0, original_amount_rub - bonus_applied_rub),
+                    original_amount_rub=original_amount_rub,
+                    bonus_applied_rub=bonus_applied_rub,
+                    bonus_spent_at=bonus_spent_at,
+                    status="pending",
+                    ip_address=client_ip,
+                    ref_source=ref_source,
+                    referral_status="ready" if ref_source else None,
+                    profile_token=profile_token,
+                    purchase_action=purchase_action,
+                    target_order_id=target_order_id,
+                    target_snapshot_plan_uuid=target_snapshot_plan_uuid,
+                    target_snapshot_expires_at=target_snapshot_expires_at,
+                    target_snapshot_is_frozen=target_snapshot_is_frozen if purchase_action != "new" else None,
+                    entry_referrer=entry_referrer,
+                    entry_url=entry_url,
+                )
+                session.add(order)
+                await session.commit()
+        else:
+            if profile_token:
+                await _get_or_create_web_balance_account(session, profile_token, contact)
+            order = WebOrder(
+                order_id=order_id,
+                contact=contact,
+                email=email,
+                tariff_key=tariff_key,
+                tariff_label=tariff["label"],
+                days=tariff["days"],
+                amount_rub=max(0, original_amount_rub - bonus_applied_rub),
+                original_amount_rub=original_amount_rub,
+                bonus_applied_rub=bonus_applied_rub,
+                status="pending",
+                ip_address=client_ip,
+                ref_source=ref_source,
+                referral_status="ready" if ref_source else None,
+                profile_token=profile_token,
+                purchase_action=purchase_action,
+                target_order_id=target_order_id,
+                target_snapshot_plan_uuid=target_snapshot_plan_uuid,
+                target_snapshot_expires_at=target_snapshot_expires_at,
+                target_snapshot_is_frozen=target_snapshot_is_frozen if purchase_action != "new" else None,
+                entry_referrer=entry_referrer,
+                entry_url=entry_url,
+            )
+            session.add(order)
+            await session.commit()
     _web_plog(
         "WEB_ЗАКАЗ",
         order_id=order_id,
@@ -3435,6 +3703,12 @@ async def handle_create_order(request: web.Request) -> web.Response:
                 _sync_bot_db_subscription_on_fulfillment(db_order)
                 await _disable_web_balance_autodebit_after_tariff_purchase(session, db_order)
                 await _apply_order_bonus_spend(session, db_order)
+            elif _can_auto_refund_failed_bonus_order(db_order):
+                await _refund_order_reserved_bonus_if_needed(
+                    session,
+                    db_order,
+                    reason=f"fulfillment_failed:{db_order.failure_code}",
+                )
             await session.commit()
             if is_delivered:
                 bot_result = await _notify_bot_order_delivered(db_order, session=session)
@@ -3503,6 +3777,24 @@ async def handle_create_order(request: web.Request) -> web.Response:
 
     except Exception as e:
         logger.error("Failed to create YooKassa payment: %s", e)
+        if bonus_applied_rub > 0:
+            try:
+                async with _acquire_profile_lock(profile_token, timeout=10.0):
+                    async with async_session() as session:
+                        db_order = await session.scalar(
+                            select(WebOrder).where(WebOrder.order_id == order_id)
+                        )
+                        if db_order and db_order.status == "pending" and not db_order.yookassa_payment_id:
+                            db_order.status = "canceled"
+                            db_order.cancellation_confirmed = True
+                            await _refund_order_reserved_bonus_if_needed(
+                                session,
+                                db_order,
+                                reason="yookassa_create_failed",
+                            )
+                            await session.commit()
+            except Exception as refund_exc:
+                logger.error("Failed to refund reserved bonus after YooKassa create failure for %s: %s", order_id, refund_exc)
         return web.json_response(
             {"error": "Ошибка создания платежа. Попробуйте позже."},
             status=500,
@@ -3745,10 +4037,8 @@ async def handle_order_status(request: web.Request) -> web.Response:
             try:
                 payment = await fetch_yookassa_payment(order.yookassa_payment_id)
                 if payment.status == "canceled":
-                    order.status = "canceled"
-                    order.cancellation_confirmed = True
-                    order.last_reconciled_at = datetime.utcnow()
-                    await session.commit()
+                    await reconcile_yookassa_web_order(order.order_id, order.yookassa_payment_id, source="order_status_poll")
+                    await session.refresh(order)
                 elif payment.status == "succeeded" and payment.paid:
                     await reconcile_yookassa_web_order(order.order_id, order.yookassa_payment_id, source="order_status_poll")
                     await session.refresh(order)
@@ -4196,6 +4486,12 @@ async def attempt_fulfill_order(session, order: WebOrder) -> None:
             order.failure_reason = None
             order.failure_code = None
             _sync_bot_db_subscription_on_fulfillment(order)
+        elif _can_auto_refund_failed_bonus_order(order):
+            await _refund_order_reserved_bonus_if_needed(
+                session,
+                order,
+                reason=f"fulfillment_failed:{order.failure_code}",
+            )
         await session.commit()
 
 
@@ -6034,6 +6330,11 @@ async def reconcile_yookassa_web_order(
                     order.status = "canceled"
                     order.cancellation_confirmed = True
                     order.last_reconciled_at = datetime.utcnow()
+                    await _refund_order_reserved_bonus_if_needed(
+                        session,
+                        order,
+                        reason="yookassa_canceled",
+                    )
                     await session.commit()
                 return "canceled"
 
@@ -7087,6 +7388,12 @@ async def handle_cancel_order(request: web.Request) -> web.Response:
                 return web.json_response({"error": "Отменить можно только заказ в статусе «Ожидает оплаты»"}, status=400)
             order.status = "canceled"
             order.cancellation_confirmed = False if order.yookassa_payment_id else True
+            if order.cancellation_confirmed:
+                await _refund_order_reserved_bonus_if_needed(
+                    session,
+                    order,
+                    reason="user_canceled_pre_provider",
+                )
             await session.commit()
     return web.json_response({"ok": True})
 

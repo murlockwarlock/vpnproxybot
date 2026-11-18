@@ -192,6 +192,16 @@ async def _run_migrations() -> None:
                 "ON balance_topups (provider_payment_id) "
                 "WHERE provider = 'web_balance_migration' AND provider_payment_id LIKE 'wbtr_%'"
             ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_balance_tx_payment_discount "
+                "ON balance_transactions (user_id, source_type, source_id) "
+                "WHERE direction = 'DEBIT' AND source_type IN ('payment_discount', 'balance_payment') AND source_id IS NOT NULL"
+            ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_balance_tx_payment_refund "
+                "ON balance_transactions (user_id, source_type, source_id) "
+                "WHERE direction = 'CREDIT' AND source_type IN ('payment_refund', 'payment_discount_refund') AND source_id IS NOT NULL"
+            ),
         ]
         for sql in critical_index_sqls:
             try:

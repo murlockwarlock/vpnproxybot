@@ -56,3 +56,8 @@ jobs:
       - name: Run Webstore profile auth & IDOR security regressions
         run: |
           PYTHONPATH=tests:. pytest -v tests/test_webstore_session_security.py tests/test_webstore_email_auth.py tests/test_webstore_otp_auth.py tests/test_webstore_telegram_auth.py tests/test_support_account_recovery.py
+
+      - name: Run atomic balance and web referral regressions
+        run: |
+          pytest -v tests/test_atomic_balance_safety.py
+          pytest -q tests/test_yookassa_payment_safety.py tests/test_webstore_yookassa_reconciliation.py tests/test_webstore_email_auth.py
