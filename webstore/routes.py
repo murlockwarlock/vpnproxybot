@@ -7311,9 +7311,6 @@ async def handle_balance_toggle(request: web.Request) -> web.Response:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
     enabled = bool(body.get("enabled"))
-    if enabled:
-        return web.json_response({"error": "Самостоятельное включение ежедневных списаний недоступно"}, status=403)
-
     authenticated = (await _authenticated_profile(request)).strip()
     requested_token = str(body.get("token") or "").strip()
     if not authenticated and not requested_token:
@@ -7326,6 +7323,9 @@ async def handle_balance_toggle(request: web.Request) -> web.Response:
     if requested_token and requested_token != authenticated:
         return web.json_response({"error": "Войдите в профиль"}, status=403)
     token = authenticated
+
+    if enabled:
+        return web.json_response({"error": "Самостоятельное включение ежедневных списаний недоступно"}, status=403)
 
     async with async_session() as session:
         account_exists = await session.scalar(select(WebAccount.id).where(WebAccount.profile_token == token))

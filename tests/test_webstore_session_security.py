@@ -195,6 +195,9 @@ async def test_passwordless_and_telegram_profiles_reject_unauthenticated_access_
     )
     assert toggle_resp.status == 401
 
+    toggle_unauth_enable = await routes.handle_balance_toggle(_Request(_json_body={"enabled": True}))
+    assert toggle_unauth_enable.status in (400, 401)
+
     # Device list & delete must fail
     dev_list = await routes.handle_devices_list(
         _Request(query={"target": "order:501"}, cookies=forged_legacy)
